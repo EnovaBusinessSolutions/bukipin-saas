@@ -1,0 +1,12 @@
+{
+  "name": "bukipin-saas",
+  "version": "1.0.0",
+  "main": "backend/server.js",
+  "scripts": {
+    "dev": "node backend/server.js",
+    "start": "node backend/server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0"
+  }
+}
