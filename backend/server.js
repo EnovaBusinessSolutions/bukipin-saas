@@ -4,22 +4,55 @@ const express = require("express");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// 👉 Ahora apuntamos a /public/login
-const publicPath = path.join(__dirname, "..", "public", "login");
+// 📁 Carpeta raíz de estáticos (public/)
+const publicRoot = path.join(__dirname, "..", "public");
 
-// Servir archivos estáticos del build de Vite
-app.use(express.static(publicPath));
+// Servir todos los assets estáticos (CSS, JS, imágenes, etc.)
+app.use(express.static(publicRoot));
 
-// Ejemplo de ruta API
+/**
+ * Healthcheck para Render / monitoreo
+ * GET /api/health
+ */
 app.get("/api/health", (req, res) => {
-  res.json({ status: "ok", app: "bukipin-saas" });
+  res.json({
+    status: "ok",
+    app: "bukipin-saas",
+    time: new Date().toISOString(),
+  });
 });
 
-// Cualquier ruta devuelve index.html (SPA)
-app.get("*", (req, res) => {
-  res.sendFile(path.join(publicPath, "index.html"));
+/**
+ * LOGIN (SPA)
+ * /login y cualquier subruta devuelven el index del login
+ */
+app.get("/login*", (req, res) => {
+  res.sendFile(path.join(publicRoot, "login", "index.html"));
+});
+
+/**
+ * DASHBOARD (SPA)
+ * /dashboard y cualquier subruta devuelven el index del dashboard
+ */
+app.get("/dashboard*", (req, res) => {
+  res.sendFile(path.join(publicRoot, "dashboard", "index.html"));
+});
+
+/**
+ * Ruta raíz: redirigimos al login
+ */
+app.get("/", (req, res) => {
+  res.redirect("/login");
+});
+
+/**
+ * Catch-all para rutas no encontradas
+ * (si más adelante tienes otras SPAs, se pueden añadir arriba)
+ */
+app.use((req, res) => {
+  res.status(404).send("Ruta no encontrada");
 });
 
 app.listen(PORT, () => {
-  console.log(`Bukipin backend escuchando en puerto ${PORT}`);
+  console.log(`🚀 Bukipin backend escuchando en puerto ${PORT}`);
 });
