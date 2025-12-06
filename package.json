@@ -1,12 +1,17 @@
 {
   "name": "bukipin-saas",
   "version": "1.0.0",
+  "private": true,
   "main": "backend/server.js",
   "scripts": {
     "dev": "node backend/server.js",
     "start": "node backend/server.js",
 
-    "build": "cd bukipin-login-seamless && cd bukipin-dasboard && npm install && npm run build"
+    "build:login": "cd bukipin-login-seamless && npm run build",
+    "build:dashboard": "cd bukipin-dashboard && npm run build",
+    "build:all": "npm run build:login && npm run build:dashboard",
+
+    "bootstrap": "npm install --prefix bukipin-login-seamless && npm install --prefix bukipin-dashboard"
   },
   "dependencies": {
     "express": "^4.21.0"
