@@ -5,7 +5,7 @@
   "scripts": {
     "dev": "node backend/server.js",
     "start": "node backend/server.js",
-    "build": "cd bukipin-login-seamless && npm install && npm run build && cd .. && mkdir -p public/login && rm -rf public/login/* && cp -r bukipin-login-seamless/dist/* public/login/"
+    "build": "cd bukipin-login-seamless && npm install && npm run build"
   },
   "dependencies": {
     "express": "^4.21.0"
