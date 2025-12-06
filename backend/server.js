@@ -22,12 +22,24 @@ app.get("/api/health", (req, res) => {
   });
 });
 
+// Ruta común al index del SPA de landing + login
+const loginIndexPath = path.join(publicRoot, "login", "index.html");
+
+/**
+ * Ruta raíz "/"
+ * Muestra la landing (React se encarga de renderizar <Index /> en "/")
+ */
+app.get("/", (req, res) => {
+  res.sendFile(loginIndexPath);
+});
+
 /**
  * LOGIN (SPA)
- * /login y cualquier subruta devuelven el index del login
+ * /login y cualquier subruta devuelven el mismo index del login
+ * React Router decide si mostrar <Auth /> o NotFound
  */
 app.get("/login*", (req, res) => {
-  res.sendFile(path.join(publicRoot, "login", "index.html"));
+  res.sendFile(loginIndexPath);
 });
 
 /**
@@ -36,13 +48,6 @@ app.get("/login*", (req, res) => {
  */
 app.get("/dashboard*", (req, res) => {
   res.sendFile(path.join(publicRoot, "dashboard", "index.html"));
-});
-
-/**
- * Ruta raíz: redirigimos al login
- */
-app.get("/", (req, res) => {
-  res.redirect("/login");
 });
 
 /**
