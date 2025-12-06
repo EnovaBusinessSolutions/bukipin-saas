@@ -1,0 +1,3 @@
+[submodule "bukipin-login-seamless"]
+	path = bukipin-login-seamless
+	url = https://github.com/EnovaBusinessSolutions/bukipin-login-seamless.git
