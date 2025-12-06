@@ -47,7 +47,8 @@ app.get("/", (req, res) => {
 
 /**
  * Catch-all para rutas no encontradas
- * (si más adelante tienes otras SPAs, se pueden añadir arriba)
+ * (si más adelante tienes otras SPAs, se pueden añadir arriba
+ *  antes de este middleware)
  */
 app.use((req, res) => {
   res.status(404).send("Ruta no encontrada");
