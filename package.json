@@ -6,14 +6,18 @@
   "scripts": {
     "dev": "node backend/server.js",
     "start": "node backend/server.js",
-
-    "build:login": "cd bukipin-login-seamless && npm run build",
-    "build:dashboard": "cd bukipin-dashboard && npm run build",
-    "build:all": "npm run build:login && npm run build:dashboard",
-
+    "build:login": "cd bukipin-login-seamless && npm install && npm run build && cd .. && rm -rf public/login && mkdir -p public/login && cp -r bukipin-login-seamless/dist/* public/login",
+    "build:dashboard": "cd bukipin-dashboard && npm install && npm run build && cd .. && rm -rf public/dashboard && mkdir -p public/dashboard && cp -r bukipin-dashboard/dist/* public/dashboard",
+    "build": "npm run build:login && npm run build:dashboard",
     "bootstrap": "npm install --prefix bukipin-login-seamless && npm install --prefix bukipin-dashboard"
   },
   "dependencies": {
-    "express": "^4.21.0"
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.0",
+    "express": "^4.21.0",
+    "jsonwebtoken": "^9.0.2",
+    "mongoose": "^8.6.0",
+    "nodemailer": "^6.9.15"
   }
 }

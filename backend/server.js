@@ -1,14 +1,26 @@
+// backend/server.js
+require("dotenv").config();
 const path = require("path");
 const express = require("express");
+const connectDB = require("./config/db");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// 🔌 Conectar a Mongo Atlas
+connectDB();
+
+// 🧱 Middlewares base
+app.use(express.json()); // para leer JSON del body
 
 // 📁 Carpeta raíz de estáticos (public/)
 const publicRoot = path.join(__dirname, "..", "public");
 
 // Servir todos los assets estáticos (CSS, JS, imágenes, etc.)
 app.use(express.static(publicRoot));
+
+// 🧩 Rutas API (auth)
+app.use("/api/auth", require("./routes/auth"));
 
 /**
  * Healthcheck para Render / monitoreo
@@ -27,7 +39,7 @@ const loginIndexPath = path.join(publicRoot, "login", "index.html");
 
 /**
  * Ruta raíz "/"
- * Muestra la landing (React se encarga de renderizar <Index /> en "/")
+ * Muestra la landing/login (React se encarga del contenido)
  */
 app.get("/", (req, res) => {
   res.sendFile(loginIndexPath);
@@ -36,7 +48,6 @@ app.get("/", (req, res) => {
 /**
  * LOGIN (SPA)
  * /login y cualquier subruta devuelven el mismo index del login
- * React Router decide si mostrar <Auth /> o NotFound
  */
 app.get("/login*", (req, res) => {
   res.sendFile(loginIndexPath);
@@ -52,8 +63,6 @@ app.get("/dashboard*", (req, res) => {
 
 /**
  * Catch-all para rutas no encontradas
- * (si más adelante tienes otras SPAs, se pueden añadir arriba
- *  antes de este middleware)
  */
 app.use((req, res) => {
   res.status(404).send("Ruta no encontrada");
