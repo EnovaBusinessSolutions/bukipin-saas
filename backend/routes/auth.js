@@ -1,6 +1,7 @@
 // backend/routes/auth.js
 const express = require("express");
 const bcrypt = require("bcryptjs");
+const jwt = require("jsonwebtoken");
 const crypto = require("crypto");
 
 const User = require("../models/User");
@@ -8,32 +9,40 @@ const sendEmail = require("../utils/sendEmail");
 
 const router = express.Router();
 
+// Pequeño helper para normalizar la URL base del cliente
+function getClientUrl() {
+  const base = process.env.CLIENT_URL || "https://bukipin.com";
+  return base.replace(/\/$/, "");
+}
+
 /**
  * POST /api/auth/register
- * Registra usuario, guarda en Mongo y envía correo de verificación
+ * Crea usuario, genera token de verificación y envía correo
  */
 router.post("/register", async (req, res) => {
   try {
     const { name, email, password } = req.body;
 
     if (!name || !email || !password) {
-      return res
-        .status(400)
-        .json({ message: "Nombre, correo y contraseña son obligatorios." });
+      return res.status(400).json({
+        message: "Nombre, correo y contraseña son obligatorios.",
+      });
     }
 
     const existing = await User.findOne({ email });
     if (existing) {
       return res
         .status(400)
-        .json({ message: "Ya existe una cuenta con este correo." });
+        .json({ message: "Este correo ya está registrado." });
     }
 
+    // Hasheamos la contraseña
     const passwordHash = await bcrypt.hash(password, 10);
 
-    const verificationToken = crypto.randomBytes(32).toString("hex");
+    // Token de verificación
+    const verificationToken = crypto.randomBytes(40).toString("hex");
     const verificationTokenExpires = new Date(
-      Date.now() + 24 * 60 * 60 * 1000 // 24h
+      Date.now() + 1000 * 60 * 60 * 24 * 3 // 3 días
     );
 
     const user = await User.create({
@@ -45,55 +54,56 @@ router.post("/register", async (req, res) => {
       verificationTokenExpires,
     });
 
-    const appBaseUrl = process.env.APP_BASE_URL || "https://bukipin.com";
-    const verifyUrl = `${appBaseUrl}/api/auth/verify-email?token=${verificationToken}`;
+    // URL que irá en el correo (pega directo al backend)
+    const clientUrl = getClientUrl();
+    const verifyUrl = `${clientUrl}/api/auth/verify-email?token=${verificationToken}`;
 
     const html = `
-      <div style="font-family: system-ui, -apple-system, BlinkMacSystemFont,'Segoe UI',sans-serif; max-width: 480px; margin: 0 auto; padding: 24px;">
-        <h1 style="font-size: 24px; color: #003a5d;">Bienvenido a Bukipin, ${user.name} 👋</h1>
-        <p style="font-size: 14px; color: #444;">
-          Para activar tu cuenta, haz clic en el siguiente botón:
-        </p>
-        <p style="text-align: center; margin: 32px 0;">
-          <a href="${verifyUrl}"
-             style="background:#003a5d; color:#fff; text-decoration:none; padding:12px 24px; border-radius:999px; font-weight:600;">
-            Activar mi cuenta
-          </a>
-        </p>
-        <p style="font-size: 12px; color:#666;">
-          Si el botón no funciona, copia y pega este enlace en tu navegador:<br/>
-          <span style="word-break: break-all; color:#003a5d;">${verifyUrl}</span>
-        </p>
-        <p style="font-size: 12px; color:#999; margin-top:24px;">
-          Este enlace caduca en 24 horas.
-        </p>
-      </div>
+      <h1>Confirma tu correo en Bukipin</h1>
+      <p>Hola ${name},</p>
+      <p>Gracias por registrarte en <strong>Bukipin</strong>. Para activar tu cuenta haz clic en el siguiente enlace:</p>
+      <p><a href="${verifyUrl}" target="_blank">Verificar mi cuenta</a></p>
+      <p>Si tú no creaste esta cuenta, puedes ignorar este correo.</p>
     `;
 
-    await sendEmail({
-      to: email,
-      subject: "Activa tu cuenta en Bukipin",
-      html,
-    });
+    try {
+      await sendEmail({
+        to: email,
+        subject: "Confirma tu cuenta en Bukipin",
+        html,
+      });
+    } catch (emailErr) {
+      console.error("❌ Error enviando correo de verificación:", emailErr);
+
+      // Opción 1 (más segura): informar que no se pudo enviar el correo
+      return res.status(500).json({
+        message:
+          "Tu cuenta se creó, pero no pudimos enviar el correo de verificación. Intenta más tarde o contacta a soporte.",
+      });
+    }
 
     return res.status(201).json({
-      message: "Cuenta creada. Revisa tu correo para activar tu cuenta.",
+      message:
+        "Usuario registrado. Revisa tu bandeja de entrada para confirmar tu correo.",
     });
   } catch (err) {
-    console.error("Error en /register", err);
-    return res.status(500).json({ message: "Error al registrar usuario." });
+    console.error("❌ Error en /api/auth/register:", err);
+    return res
+      .status(500)
+      .json({ message: "Error inesperado al registrar tu cuenta." });
   }
 });
 
 /**
  * GET /api/auth/verify-email?token=...
- * Marca la cuenta como verificada y redirige al LOGIN (Versión 1)
+ * Marca al usuario como verificado y redirige al login
  */
 router.get("/verify-email", async (req, res) => {
   try {
     const { token } = req.query;
+
     if (!token) {
-      return res.status(400).send("Token inválido.");
+      return res.status(400).send("Token de verificación faltante.");
     }
 
     const user = await User.findOne({
@@ -102,9 +112,7 @@ router.get("/verify-email", async (req, res) => {
     });
 
     if (!user) {
-      return res
-        .status(400)
-        .send("El enlace de verificación no es válido o ha expirado.");
+      return res.status(400).send("Token inválido o expirado.");
     }
 
     user.isVerified = true;
@@ -112,23 +120,25 @@ router.get("/verify-email", async (req, res) => {
     user.verificationTokenExpires = undefined;
     await user.save();
 
-    const appBaseUrl = process.env.APP_BASE_URL || "https://bukipin.com";
-    // Versión 1: de vuelta al LOGIN
-    return res.redirect(`${appBaseUrl}/login?verified=1`);
+    const clientUrl = getClientUrl();
+    // Después de verificar, lo mandamos al login con un flag
+    return res.redirect(`${clientUrl}/login?verified=1`);
   } catch (err) {
-    console.error("Error en /verify-email", err);
-    return res.status(500).send("Error al verificar el correo.");
+    console.error("❌ Error en /api/auth/verify-email:", err);
+    return res
+      .status(500)
+      .send("Ocurrió un error al verificar tu correo. Intenta más tarde.");
   }
 });
 
 /**
  * POST /api/auth/login
- * Comprueba credenciales e isVerified.
- * Versión 1: sin JWT todavía, solo responde OK y el frontend redirige a /dashboard.
+ * Login clásico con email + password
  */
 router.post("/login", async (req, res) => {
   try {
     const { email, password } = req.body;
+
     if (!email || !password) {
       return res
         .status(400)
@@ -136,23 +146,29 @@ router.post("/login", async (req, res) => {
     }
 
     const user = await User.findOne({ email });
-    if (!user) {
-      return res.status(400).json({ message: "Credenciales incorrectas." });
+    if (!user || !user.passwordHash) {
+      return res.status(400).json({ message: "Credenciales inválidas." });
+    }
+
+    const ok = await bcrypt.compare(password, user.passwordHash);
+    if (!ok) {
+      return res.status(400).json({ message: "Credenciales inválidas." });
     }
 
     if (!user.isVerified) {
-      return res.status(403).json({
-        message: "Debes confirmar tu correo antes de iniciar sesión.",
-      });
+      return res
+        .status(403)
+        .json({ message: "Debes confirmar tu correo antes de iniciar sesión." });
     }
 
-    const isMatch = await bcrypt.compare(password, user.passwordHash);
-    if (!isMatch) {
-      return res.status(400).json({ message: "Credenciales incorrectas." });
-    }
+    const token = jwt.sign(
+      { id: user._id },
+      process.env.JWT_SECRET || "dev-secret",
+      { expiresIn: "7d" }
+    );
 
     return res.json({
-      message: "Login correcto.",
+      token,
       user: {
         id: user._id,
         name: user.name,
@@ -160,8 +176,10 @@ router.post("/login", async (req, res) => {
       },
     });
   } catch (err) {
-    console.error("Error en /login", err);
-    return res.status(500).json({ message: "Error al iniciar sesión." });
+    console.error("❌ Error en /api/auth/login:", err);
+    return res
+      .status(500)
+      .json({ message: "Error inesperado al iniciar sesión." });
   }
 });
 
