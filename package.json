@@ -7,13 +7,17 @@
     "dev": "node backend/server.js",
     "start": "node backend/server.js",
 
-    "build:login": "cd bukipin-login-seamless && npm install && npm run build && cd .. && rm -rf public/login && mkdir -p public/login && cp -r bukipin-login-seamless/dist/* public/login",
-    "build:dashboard": "cd bukipin-dashboard && npm install && npm run build && cd .. && rm -rf public/dashboard && mkdir -p public/dashboard && cp -r bukipin-dashboard/dist/* public/dashboard",
+    
+    "bootstrap": "npm install --prefix bukipin-login-seamless && npm install --prefix bukipin-dashboard",
 
-    "build:all": "npm run build:login && npm run build:dashboard",
-    "build": "npm run build:all",
+    
+    "build:login": "cd bukipin-login-seamless && npm run build",
 
-    "bootstrap": "npm install --prefix bukipin-login-seamless && npm install --prefix bukipin-dashboard"
+    
+    "build:dashboard": "cd bukipin-dashboard && npm run build",
+
+    
+    "build": "npm run bootstrap && npm run build:login && npm run build:dashboard"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
