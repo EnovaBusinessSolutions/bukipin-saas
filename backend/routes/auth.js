@@ -15,6 +15,17 @@ function getClientUrl() {
   return base.replace(/\/$/, "");
 }
 
+// Opciones para la cookie de sesión (JWT)
+function getJwtCookieOptions() {
+  return {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === "production",
+    sameSite: "lax",
+    maxAge: 7 * 24 * 60 * 60 * 1000, // 7 días
+    path: "/",
+  };
+}
+
 /**
  * Construye el HTML del correo de verificación con el look & feel de Bukipin
  */
@@ -69,7 +80,7 @@ function buildVerificationEmail({ name, verifyUrl }) {
                       <table role="presentation">
                         <tr>
                           <td valign="middle" style="padding-right:8px;">
-                            <!-- 👇 Cambia la URL del logo por la tuya -->
+                            <!-- 👇 Cambia la URL del logo por la tuya real -->
                             <img src="https://bukipin.com/logo-email.png" alt="Bukipin" width="40" height="40" style="border-radius:12px; background:#0f172a;" />
                           </td>
                           <td valign="middle">
@@ -206,7 +217,7 @@ router.post("/register", async (req, res) => {
       Date.now() + 1000 * 60 * 60 * 24 * 3 // 3 días
     );
 
-    const user = await User.create({
+    await User.create({
       name,
       email,
       passwordHash,
@@ -250,7 +261,7 @@ router.post("/register", async (req, res) => {
 
 /**
  * GET /api/auth/verify-email?token=...
- * Marca al usuario como verificado y redirige al login
+ * Marca al usuario como verificado, crea sesión y redirige al dashboard
  */
 router.get("/verify-email", async (req, res) => {
   try {
@@ -274,9 +285,18 @@ router.get("/verify-email", async (req, res) => {
     user.verificationTokenExpires = undefined;
     await user.save();
 
+    // 🔐 Auto-login: generamos JWT y lo guardamos en cookie
+    const jwtToken = jwt.sign(
+      { id: user._id },
+      process.env.JWT_SECRET || "dev-secret",
+      { expiresIn: "7d" }
+    );
+
+    res.cookie("bukipin_token", jwtToken, getJwtCookieOptions());
+
     const clientUrl = getClientUrl();
-    // Después de verificar, lo mandamos al login con un flag
-    return res.redirect(`${clientUrl}/login?verified=1`);
+    // Después de verificar, lo mandamos directo al dashboard
+    return res.redirect(`${clientUrl}/dashboard/`);
   } catch (err) {
     console.error("❌ Error en /api/auth/verify-email:", err);
     return res
@@ -321,8 +341,11 @@ router.post("/login", async (req, res) => {
       { expiresIn: "7d" }
     );
 
+    // Guardamos token en cookie (sesión)
+    res.cookie("bukipin_token", token, getJwtCookieOptions());
+
     return res.json({
-      token,
+      message: "Login exitoso",
       user: {
         id: user._id,
         name: user.name,
@@ -334,6 +357,28 @@ router.post("/login", async (req, res) => {
     return res
       .status(500)
       .json({ message: "Error inesperado al iniciar sesión." });
+  }
+});
+
+/**
+ * POST /api/auth/logout
+ * Limpia la cookie de sesión
+ */
+router.post("/logout", (req, res) => {
+  try {
+    res.clearCookie("bukipin_token", {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production",
+      sameSite: "lax",
+      path: "/",
+    });
+
+    return res.json({ message: "Sesión cerrada correctamente." });
+  } catch (err) {
+    console.error("❌ Error en /api/auth/logout:", err);
+    return res
+      .status(500)
+      .json({ message: "Error al cerrar sesión. Intenta nuevamente." });
   }
 });
 
