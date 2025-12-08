@@ -54,6 +54,15 @@ app.get("/login*", (req, res) => {
 });
 
 /**
+ * RECUPERACIÓN DE CONTRASEÑA (SPA)
+ * /recuperacion y cualquier subruta devuelven también el index del login
+ * para que React Router maneje la ruta /recuperacion en el frontend
+ */
+app.get("/recuperacion*", (req, res) => {
+  res.sendFile(loginIndexPath);
+});
+
+/**
  * DASHBOARD (SPA)
  * /dashboard y cualquier subruta devuelven el index del dashboard
  */
