@@ -1,0 +1,18 @@
+# Dependencias
+node_modules/
+
+# Build
+dist/
+build/
+
+# Archivos de entorno
+.env
+.env.local
+.env.development.local
+.env.production.local
+.env.*.local
+
+# Otros posibles
+backend/.env
+bukipin-dashboard/.env
+bukipin-login-seamless/.env
