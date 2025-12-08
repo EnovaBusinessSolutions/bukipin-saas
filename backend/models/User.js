@@ -19,12 +19,22 @@ const userSchema = new mongoose.Schema(
       type: String,
       required: true,
     },
+
+    // ✅ Estado de verificación de correo
     isVerified: {
       type: Boolean,
       default: false,
     },
     verificationToken: String,
     verificationTokenExpires: Date,
+
+    // ✅ Campos para recuperación de contraseña
+    resetPasswordToken: {
+      type: String,
+    },
+    resetPasswordTokenExpires: {
+      type: Date,
+    },
   },
   { timestamps: true }
 );
