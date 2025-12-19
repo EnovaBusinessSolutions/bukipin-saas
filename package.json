@@ -7,16 +7,11 @@
     "dev": "node backend/server.js",
     "start": "node backend/server.js",
 
-    
-    "bootstrap": "npm install --prefix bukipin-login-seamless && npm install --prefix bukipin-dashboard",
+    "bootstrap": "npm install --prefix bukipin-dashboard/bukipin-login-seamless && npm install --prefix bukipin-dashboard",
 
-    
-    "build:login": "cd bukipin-login-seamless && npm run build",
+    "build:login": "npm run build --prefix bukipin-dashboard/bukipin-login-seamless",
+    "build:dashboard": "npm run build --prefix bukipin-dashboard",
 
-    
-    "build:dashboard": "cd bukipin-dashboard && npm run build",
-
-    
     "build": "npm run bootstrap && npm run build:login && npm run build:dashboard"
   },
   "dependencies": {
