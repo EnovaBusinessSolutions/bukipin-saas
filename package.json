@@ -7,7 +7,9 @@
     "dev": "node backend/server.js",
     "start": "node backend/server.js",
 
-    "bootstrap": "npm install --prefix bukipin-login-seamless && npm install --prefix bukipin-dashboard",
+    "submodules": "git submodule update --init --recursive",
+
+    "bootstrap": "npm run submodules && npm ci --prefix bukipin-login-seamless && npm ci --prefix bukipin-dashboard",
 
     "build:login": "npm run build --prefix bukipin-login-seamless",
     "build:dashboard": "npm run build --prefix bukipin-dashboard",
