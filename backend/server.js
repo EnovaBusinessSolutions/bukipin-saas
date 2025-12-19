@@ -2,21 +2,28 @@
 require("dotenv").config();
 const path = require("path");
 const express = require("express");
+const cookieParser = require("cookie-parser");
+
 const connectDB = require("./config/db");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// ✅ IMPORTANTE en Render/Proxies (para cookies secure en producción)
+app.set("trust proxy", 1);
+
 // 🔌 Conectar a Mongo Atlas
 connectDB();
 
 // 🧱 Middlewares base
-app.use(express.json()); // para leer JSON del body
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// ✅ NECESARIO para que req.cookies exista
+app.use(cookieParser());
 
 // 📁 Carpeta raíz de estáticos (public/)
 const publicRoot = path.join(__dirname, "..", "public");
-
-// Servir todos los assets estáticos (CSS, JS, imágenes, etc.)
 app.use(express.static(publicRoot));
 
 // 🧩 Rutas API (auth)
@@ -39,7 +46,6 @@ const loginIndexPath = path.join(publicRoot, "login", "index.html");
 
 /**
  * Ruta raíz "/"
- * Muestra la landing/login (React se encarga del contenido)
  */
 app.get("/", (req, res) => {
   res.sendFile(loginIndexPath);
@@ -47,7 +53,6 @@ app.get("/", (req, res) => {
 
 /**
  * LOGIN (SPA)
- * /login y cualquier subruta devuelven el mismo index del login
  */
 app.get("/login*", (req, res) => {
   res.sendFile(loginIndexPath);
@@ -55,8 +60,6 @@ app.get("/login*", (req, res) => {
 
 /**
  * RECUPERACIÓN DE CONTRASEÑA (SPA)
- * /recuperacion y cualquier subruta devuelven también el index del login
- * para que React Router maneje la ruta /recuperacion en el frontend
  */
 app.get("/recuperacion*", (req, res) => {
   res.sendFile(loginIndexPath);
@@ -64,7 +67,6 @@ app.get("/recuperacion*", (req, res) => {
 
 /**
  * DASHBOARD (SPA)
- * /dashboard y cualquier subruta devuelven el index del dashboard
  */
 app.get("/dashboard*", (req, res) => {
   res.sendFile(path.join(publicRoot, "dashboard", "index.html"));

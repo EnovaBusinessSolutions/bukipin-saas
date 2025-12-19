@@ -6,6 +6,7 @@ const crypto = require("crypto");
 
 const User = require("../models/User");
 const sendEmail = require("../utils/sendEmail");
+const ensureAuth = require("../middleware/ensureAuth"); // ✅
 
 const router = express.Router();
 
@@ -26,12 +27,32 @@ function getJwtCookieOptions() {
   };
 }
 
+function signJwt(userId) {
+  return jwt.sign({ id: userId }, process.env.JWT_SECRET || "dev-secret", {
+    expiresIn: "7d",
+  });
+}
+
+function setSessionCookie(res, token) {
+  res.cookie("bukipin_token", token, getJwtCookieOptions());
+}
+
+function clearSessionCookie(res) {
+  // ✅ borrar con mismas opciones base (si no, a veces no se borra)
+  const opts = getJwtCookieOptions();
+  res.clearCookie("bukipin_token", {
+    httpOnly: opts.httpOnly,
+    secure: opts.secure,
+    sameSite: opts.sameSite,
+    path: opts.path,
+  });
+}
+
 /**
  * HEADER reutilizable (sin logo) para correos Bukipin
  */
 function emailHeader() {
   return `
-    <!-- Header -->
     <tr>
       <td style="padding:24px 28px 8px 28px; background:radial-gradient(circle at top left,#1d4ed8,#0b1120);">
         <table role="presentation" width="100%">
@@ -59,7 +80,6 @@ function emailHeader() {
  */
 function emailFooter() {
   return `
-    <!-- Footer -->
     <tr>
       <td style="padding:16px 28px 20px 28px; background-color:#020617; border-top:1px solid #111827;">
         <table role="presentation" width="100%">
@@ -95,21 +115,13 @@ function buildVerificationEmail({ name, verifyUrl }) {
     <style>
       body,table,td,p,a {
         font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-        margin: 0;
-        padding: 0;
+        margin: 0; padding: 0;
       }
-      a {
-        color: inherit;
-        text-decoration: none;
-      }
-      a[x-apple-data-detectors] {
-        color: inherit !important;
-        text-decoration: none !important;
-      }
+      a { color: inherit; text-decoration: none; }
+      a[x-apple-data-detectors] { color: inherit !important; text-decoration: none !important; }
     </style>
   </head>
   <body style="background-color:#0f172a; margin:0; padding:24px;">
-    <!-- Preheader -->
     <div style="display:none; max-height:0; overflow:hidden; opacity:0;">
       Activa tu cuenta en Bukipin con un solo clic.
     </div>
@@ -117,11 +129,10 @@ function buildVerificationEmail({ name, verifyUrl }) {
     <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;">
       <tr>
         <td align="center">
-          <!-- Card principal -->
-          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:560px; background-color:#0b1120; border-radius:24px; overflow:hidden; border:1px solid #1f2937;">
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0"
+                 style="max-width:560px; background-color:#0b1120; border-radius:24px; overflow:hidden; border:1px solid #1f2937;">
             ${emailHeader()}
 
-            <!-- Contenido -->
             <tr>
               <td style="padding:24px 28px 8px 28px; background-color:#020617;">
                 <h1 style="margin:0 0 12px 0; font-size:22px; line-height:1.3; color:#f9fafb; font-weight:700;">
@@ -133,16 +144,14 @@ function buildVerificationEmail({ name, verifyUrl }) {
                 </p>
 
                 <p style="margin:0 0 12px 0; font-size:14px; line-height:1.6; color:#9ca3af;">
-                  Gracias por registrarte en <strong style="color:#e5e7eb;">Bukipin</strong>. 
-                  Para activar tu cuenta y empezar a gestionar tus finanzas empresariales con mayor claridad,
-                  necesitamos que confirmes que este correo te pertenece.
+                  Gracias por registrarte en <strong style="color:#e5e7eb;">Bukipin</strong>.
+                  Para activar tu cuenta, confirma que este correo te pertenece.
                 </p>
 
                 <p style="margin:0 0 20px 0; font-size:14px; line-height:1.6; color:#9ca3af;">
                   Haz clic en el siguiente botón para verificar tu cuenta:
                 </p>
 
-                <!-- Botón principal -->
                 <table role="presentation" cellspacing="0" cellpadding="0" style="margin:0 0 18px 0;">
                   <tr>
                     <td>
@@ -156,19 +165,15 @@ function buildVerificationEmail({ name, verifyUrl }) {
                   </tr>
                 </table>
 
-                <!-- Fallback link plano -->
                 <p style="margin:0 0 16px 0; font-size:12px; line-height:1.6; color:#6b7280;">
                   Si el botón no funciona, copia y pega este enlace en tu navegador:
                 </p>
                 <p style="margin:0 0 24px 0; font-size:11px; line-height:1.6; color:#9ca3af; word-break:break-all;">
-                  <a href="${verifyUrl}" style="color:#38bdf8; text-decoration:underline;">
-                    ${verifyUrl}
-                  </a>
+                  <a href="${verifyUrl}" style="color:#38bdf8; text-decoration:underline;">${verifyUrl}</a>
                 </p>
 
                 <p style="margin:0 0 8px 0; font-size:12px; line-height:1.6; color:#6b7280;">
-                  Si tú no creaste esta cuenta, puedes ignorar este correo. Tu dirección de correo
-                  no será asociada a ningún perfil en Bukipin.
+                  Si tú no creaste esta cuenta, puedes ignorar este correo.
                 </p>
               </td>
             </tr>
@@ -176,11 +181,8 @@ function buildVerificationEmail({ name, verifyUrl }) {
             ${emailFooter()}
           </table>
 
-          <!-- Nota inferior -->
           <div style="max-width:560px; margin-top:16px; font-size:11px; line-height:1.5; color:#6b7280;">
-            Estás recibiendo este mensaje porque se registró una cuenta en Bukipin
-            utilizando esta dirección de correo. Si no reconoces esta acción, 
-            puedes ignorar este correo de forma segura.
+            Estás recibiendo este mensaje porque se registró una cuenta en Bukipin usando esta dirección de correo.
           </div>
         </td>
       </tr>
@@ -206,21 +208,13 @@ function buildResetPasswordEmail({ name, resetUrl }) {
     <style>
       body,table,td,p,a {
         font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-        margin: 0;
-        padding: 0;
+        margin: 0; padding: 0;
       }
-      a {
-        color: inherit;
-        text-decoration: none;
-      }
-      a[x-apple-data-detectors] {
-        color: inherit !important;
-        text-decoration: none !important;
-      }
+      a { color: inherit; text-decoration: none; }
+      a[x-apple-data-detectors] { color: inherit !important; text-decoration: none !important; }
     </style>
   </head>
   <body style="background-color:#0f172a; margin:0; padding:24px;">
-    <!-- Preheader -->
     <div style="display:none; max-height:0; overflow:hidden; opacity:0;">
       Crea una nueva contraseña para tu cuenta de Bukipin.
     </div>
@@ -228,11 +222,10 @@ function buildResetPasswordEmail({ name, resetUrl }) {
     <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-collapse:collapse;">
       <tr>
         <td align="center">
-          <!-- Card principal -->
-          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:560px; background-color:#0b1120; border-radius:24px; overflow:hidden; border:1px solid #1f2937;">
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0"
+                 style="max-width:560px; background-color:#0b1120; border-radius:24px; overflow:hidden; border:1px solid #1f2937;">
             ${emailHeader()}
 
-            <!-- Contenido -->
             <tr>
               <td style="padding:24px 28px 8px 28px; background-color:#020617;">
                 <h1 style="margin:0 0 12px 0; font-size:22px; line-height:1.3; color:#f9fafb; font-weight:700;">
@@ -244,7 +237,7 @@ function buildResetPasswordEmail({ name, resetUrl }) {
                 </p>
 
                 <p style="margin:0 0 12px 0; font-size:14px; line-height:1.6; color:#9ca3af;">
-                  Hemos recibido una solicitud para restablecer la contraseña de tu cuenta en 
+                  Hemos recibido una solicitud para restablecer la contraseña de tu cuenta en
                   <strong style="color:#e5e7eb;">Bukipin</strong>. Si fuiste tú, crea una nueva contraseña usando el siguiente botón.
                 </p>
 
@@ -252,7 +245,6 @@ function buildResetPasswordEmail({ name, resetUrl }) {
                   Este enlace tiene una vigencia limitada por motivos de seguridad.
                 </p>
 
-                <!-- Botón principal -->
                 <table role="presentation" cellspacing="0" cellpadding="0" style="margin:0 0 18px 0;">
                   <tr>
                     <td>
@@ -266,19 +258,15 @@ function buildResetPasswordEmail({ name, resetUrl }) {
                   </tr>
                 </table>
 
-                <!-- Fallback link plano -->
                 <p style="margin:0 0 16px 0; font-size:12px; line-height:1.6; color:#6b7280;">
                   Si el botón no funciona, copia y pega este enlace en tu navegador:
                 </p>
                 <p style="margin:0 0 24px 0; font-size:11px; line-height:1.6; color:#9ca3af; word-break:break-all;">
-                  <a href="${resetUrl}" style="color:#38bdf8; text-decoration:underline;">
-                    ${resetUrl}
-                  </a>
+                  <a href="${resetUrl}" style="color:#38bdf8; text-decoration:underline;">${resetUrl}</a>
                 </p>
 
                 <p style="margin:0 0 8px 0; font-size:12px; line-height:1.6; color:#6b7280;">
-                  Si tú no solicitaste este cambio, puedes ignorar este correo.
-                  Tu contraseña actual seguirá siendo válida.
+                  Si tú no solicitaste este cambio, puedes ignorar este correo. Tu contraseña actual seguirá siendo válida.
                 </p>
               </td>
             </tr>
@@ -286,10 +274,8 @@ function buildResetPasswordEmail({ name, resetUrl }) {
             ${emailFooter()}
           </table>
 
-          <!-- Nota inferior -->
           <div style="max-width:560px; margin-top:16px; font-size:11px; line-height:1.5; color:#6b7280;">
-            Estás recibiendo este mensaje porque se solicitó el restablecimiento
-            de contraseña de una cuenta de Bukipin asociada a esta dirección de correo.
+            Estás recibiendo este mensaje porque se solicitó el restablecimiento de contraseña de una cuenta Bukipin.
           </div>
         </td>
       </tr>
@@ -301,11 +287,14 @@ function buildResetPasswordEmail({ name, resetUrl }) {
 
 /**
  * POST /api/auth/register
- * Crea usuario, genera token de verificación y envía correo
  */
 router.post("/register", async (req, res) => {
   try {
-    const { name, email, password } = req.body;
+    let { name, email, password } = req.body;
+
+    name = (name || "").trim();
+    email = (email || "").trim().toLowerCase();
+    password = password || "";
 
     if (!name || !email || !password) {
       return res.status(400).json({
@@ -315,19 +304,13 @@ router.post("/register", async (req, res) => {
 
     const existing = await User.findOne({ email });
     if (existing) {
-      return res
-        .status(400)
-        .json({ message: "Este correo ya está registrado." });
+      return res.status(400).json({ message: "Este correo ya está registrado." });
     }
 
-    // Hasheamos la contraseña
     const passwordHash = await bcrypt.hash(password, 10);
 
-    // Token de verificación
     const verificationToken = crypto.randomBytes(40).toString("hex");
-    const verificationTokenExpires = new Date(
-      Date.now() + 1000 * 60 * 60 * 24 * 3 // 3 días
-    );
+    const verificationTokenExpires = new Date(Date.now() + 1000 * 60 * 60 * 24 * 3);
 
     await User.create({
       name,
@@ -338,7 +321,6 @@ router.post("/register", async (req, res) => {
       verificationTokenExpires,
     });
 
-    // URL que irá en el correo (backend expone /api/auth/verify-email)
     const clientUrl = getClientUrl();
     const verifyUrl = `${clientUrl}/api/auth/verify-email?token=${verificationToken}`;
 
@@ -352,7 +334,6 @@ router.post("/register", async (req, res) => {
       });
     } catch (emailErr) {
       console.error("❌ Error enviando correo de verificación:", emailErr);
-
       return res.status(500).json({
         message:
           "Tu cuenta se creó, pero no pudimos enviar el correo de verificación. Intenta más tarde o contacta a soporte.",
@@ -360,78 +341,62 @@ router.post("/register", async (req, res) => {
     }
 
     return res.status(201).json({
-      message:
-        "Usuario registrado. Revisa tu bandeja de entrada para confirmar tu correo.",
+      message: "Usuario registrado. Revisa tu bandeja de entrada para confirmar tu correo.",
     });
   } catch (err) {
     console.error("❌ Error en /api/auth/register:", err);
-    return res
-      .status(500)
-      .json({ message: "Error inesperado al registrar tu cuenta." });
+    return res.status(500).json({ message: "Error inesperado al registrar tu cuenta." });
   }
 });
 
 /**
  * GET /api/auth/verify-email?token=...
- * Marca al usuario como verificado, crea sesión y redirige al dashboard
  */
 router.get("/verify-email", async (req, res) => {
   try {
     const { token } = req.query;
 
-    if (!token) {
-      return res.status(400).send("Token de verificación faltante.");
-    }
+    if (!token) return res.status(400).send("Token de verificación faltante.");
 
     const user = await User.findOne({
       verificationToken: token,
       verificationTokenExpires: { $gt: new Date() },
     });
 
-    if (!user) {
-      return res.status(400).send("Token inválido o expirado.");
-    }
+    if (!user) return res.status(400).send("Token inválido o expirado.");
 
     user.isVerified = true;
     user.verificationToken = undefined;
     user.verificationTokenExpires = undefined;
     await user.save();
 
-    // 🔐 Auto-login: generamos JWT y lo guardamos en cookie
-    const jwtToken = jwt.sign(
-      { id: user._id },
-      process.env.JWT_SECRET || "dev-secret",
-      { expiresIn: "7d" }
-    );
-
-    res.cookie("bukipin_token", jwtToken, getJwtCookieOptions());
+    const jwtToken = signJwt(user._id);
+    setSessionCookie(res, jwtToken);
 
     const clientUrl = getClientUrl();
-    // Después de verificar, lo mandamos directo al dashboard
     return res.redirect(`${clientUrl}/dashboard/`);
   } catch (err) {
     console.error("❌ Error en /api/auth/verify-email:", err);
-    return res
-      .status(500)
-      .send("Ocurrió un error al verificar tu correo. Intenta más tarde.");
+    return res.status(500).send("Ocurrió un error al verificar tu correo. Intenta más tarde.");
   }
 });
 
 /**
  * POST /api/auth/login
- * Login clásico con email + password
  */
 router.post("/login", async (req, res) => {
   try {
-    const { email, password } = req.body;
+    let { email, password } = req.body;
+
+    email = (email || "").trim().toLowerCase();
+    password = password || "";
 
     if (!email || !password) {
-      return res
-        .status(400)
-        .json({ message: "Correo y contraseña son obligatorios." });
+      return res.status(400).json({ message: "Correo y contraseña son obligatorios." });
     }
 
-    const user = await User.findOne({ email });
+    // ✅ IMPORTANTE: si en el modelo pones passwordHash select:false, esto evita que se rompa
+    const user = await User.findOne({ email }).select("+passwordHash");
     if (!user || !user.passwordHash) {
       return res.status(400).json({ message: "Credenciales inválidas." });
     }
@@ -442,75 +407,54 @@ router.post("/login", async (req, res) => {
     }
 
     if (!user.isVerified) {
-      return res
-        .status(403)
-        .json({ message: "Debes confirmar tu correo antes de iniciar sesión." });
+      return res.status(403).json({
+        message: "Debes confirmar tu correo antes de iniciar sesión.",
+      });
     }
 
-    const token = jwt.sign(
-      { id: user._id },
-      process.env.JWT_SECRET || "dev-secret",
-      { expiresIn: "7d" }
-    );
-
-    // Guardamos token en cookie (sesión)
-    res.cookie("bukipin_token", token, getJwtCookieOptions());
+    const token = signJwt(user._id);
+    setSessionCookie(res, token);
 
     return res.json({
       message: "Login exitoso",
-      user: {
-        id: user._id,
-        name: user.name,
-        email: user.email,
-      },
+      user: { id: user._id, name: user.name, email: user.email },
     });
   } catch (err) {
     console.error("❌ Error en /api/auth/login:", err);
-    return res
-      .status(500)
-      .json({ message: "Error inesperado al iniciar sesión." });
+    return res.status(500).json({ message: "Error inesperado al iniciar sesión." });
   }
 });
 
 /**
  * POST /api/auth/forgot-password
- * Envía correo de recuperación si el email existe
  */
 router.post("/forgot-password", async (req, res) => {
   try {
-    const { email } = req.body;
+    let { email } = req.body;
+    email = (email || "").trim().toLowerCase();
 
     if (!email) {
-      return res
-        .status(400)
-        .json({ message: "El correo electrónico es obligatorio." });
+      return res.status(400).json({ message: "El correo electrónico es obligatorio." });
     }
 
     const user = await User.findOne({ email });
     if (!user) {
-      // 👇 mensaje explícito como pediste
       return res.status(404).json({
         message: "No tenemos ese correo registrado en nuestra base de datos.",
       });
     }
 
     const resetToken = crypto.randomBytes(40).toString("hex");
-    const resetPasswordTokenExpires = new Date(
-      Date.now() + 1000 * 60 * 60 // 1 hora
-    );
+    const resetPasswordTokenExpires = new Date(Date.now() + 1000 * 60 * 60);
 
     user.resetPasswordToken = resetToken;
     user.resetPasswordTokenExpires = resetPasswordTokenExpires;
     await user.save();
 
     const clientUrl = getClientUrl();
-    // 👉 Página de React: /recuperacion?token=...
     const resetUrl = `${clientUrl}/recuperacion?token=${resetToken}`;
 
-    const html = buildResetPasswordEmail({
-      name: user.name,
-      resetUrl,
-    });
+    const html = buildResetPasswordEmail({ name: user.name, resetUrl });
 
     try {
       await sendEmail({
@@ -527,20 +471,16 @@ router.post("/forgot-password", async (req, res) => {
     }
 
     return res.json({
-      message:
-        "Te hemos enviado un correo con instrucciones para restablecer tu contraseña.",
+      message: "Te hemos enviado un correo con instrucciones para restablecer tu contraseña.",
     });
   } catch (err) {
     console.error("❌ Error en /api/auth/forgot-password:", err);
-    return res
-      .status(500)
-      .json({ message: "Error inesperado al solicitar la recuperación." });
+    return res.status(500).json({ message: "Error inesperado al solicitar la recuperación." });
   }
 });
 
 /**
  * GET /api/auth/reset-password?token=...
- * Valida el token y devuelve el email (para prellenar en /recuperacion)
  */
 router.get("/reset-password", async (req, res) => {
   try {
@@ -556,34 +496,39 @@ router.get("/reset-password", async (req, res) => {
     });
 
     if (!user) {
-      return res
-        .status(400)
-        .json({ message: "El enlace de recuperación no es válido o ha expirado." });
+      return res.status(400).json({
+        message: "El enlace de recuperación no es válido o ha expirado.",
+      });
     }
 
-    return res.json({
-      email: user.email,
-    });
+    return res.json({ email: user.email });
   } catch (err) {
     console.error("❌ Error en GET /api/auth/reset-password:", err);
-    return res
-      .status(500)
-      .json({ message: "Error al validar el enlace de recuperación." });
+    return res.status(500).json({ message: "Error al validar el enlace de recuperación." });
   }
 });
 
 /**
  * POST /api/auth/reset-password
- * Actualiza la contraseña usando el token
  */
 router.post("/reset-password", async (req, res) => {
   try {
-    const { token, password } = req.body;
+    let { token, password } = req.body;
+
+    token = token || "";
+    password = password || "";
 
     if (!token || !password) {
-      return res
-        .status(400)
-        .json({ message: "Token y nueva contraseña son obligatorios." });
+      return res.status(400).json({
+        message: "Token y nueva contraseña son obligatorios.",
+      });
+    }
+
+    // ✅ mínimo recomendado (ajústalo si quieres más estricto)
+    if (password.length < 8) {
+      return res.status(400).json({
+        message: "La contraseña debe tener al menos 8 caracteres.",
+      });
     }
 
     const user = await User.findOne({
@@ -592,9 +537,9 @@ router.post("/reset-password", async (req, res) => {
     });
 
     if (!user) {
-      return res
-        .status(400)
-        .json({ message: "El enlace de recuperación no es válido o ha expirado." });
+      return res.status(400).json({
+        message: "El enlace de recuperación no es válido o ha expirado.",
+      });
     }
 
     const passwordHash = await bcrypt.hash(password, 10);
@@ -609,32 +554,37 @@ router.post("/reset-password", async (req, res) => {
     });
   } catch (err) {
     console.error("❌ Error en POST /api/auth/reset-password:", err);
-    return res
-      .status(500)
-      .json({ message: "Error inesperado al cambiar la contraseña." });
+    return res.status(500).json({ message: "Error inesperado al cambiar la contraseña." });
   }
 });
 
 /**
  * POST /api/auth/logout
- * Limpia la cookie de sesión
  */
 router.post("/logout", (req, res) => {
   try {
-    res.clearCookie("bukipin_token", {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === "production",
-      sameSite: "lax",
-      path: "/",
-    });
-
+    clearSessionCookie(res);
     return res.json({ message: "Sesión cerrada correctamente." });
   } catch (err) {
     console.error("❌ Error en /api/auth/logout:", err);
-    return res
-      .status(500)
-      .json({ message: "Error al cerrar sesión. Intenta nuevamente." });
+    return res.status(500).json({ message: "Error al cerrar sesión. Intenta nuevamente." });
   }
+});
+
+/**
+ * ✅ GET /api/auth/me
+ * Útil para validar cookie y obtener userId en frontend.
+ */
+router.get("/me", ensureAuth, (req, res) => {
+  return res.json({
+    ok: true,
+    user: {
+      id: req.user._id,
+      name: req.user.name,
+      email: req.user.email,
+      isVerified: req.user.isVerified,
+    },
+  });
 });
 
 module.exports = router;
