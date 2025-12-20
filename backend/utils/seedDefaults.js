@@ -1,6 +1,11 @@
 // backend/utils/seedDefaults.js
+const mongoose = require("mongoose");
 const Account = require("../models/Account");
 
+/**
+ * Cuentas contables base por usuario (multi-tenant).
+ * Importante: cada documento SIEMPRE lleva owner = userId
+ */
 const DEFAULT_ACCOUNTS = [
   { code: "1001", name: "Caja", type: "activo" },
   { code: "1002", name: "Bancos", type: "activo" },
@@ -19,26 +24,34 @@ const DEFAULT_ACCOUNTS = [
 ];
 
 async function seedDefaultsForUser(userId) {
+  if (!userId) {
+    throw new Error("seedDefaultsForUser: userId es requerido");
+  }
+
+  // Normaliza a ObjectId si llega como string
+  const owner = typeof userId === "string" ? new mongoose.Types.ObjectId(userId) : userId;
+
   // Upsert por (owner, code) para evitar duplicados
   const ops = DEFAULT_ACCOUNTS.map((a) => ({
     updateOne: {
-      filter: { owner: userId, code: a.code },
-      update: { $setConfirm: { ...a, owner: userId, isDefault: true, isActive: true } },
+      filter: { owner, code: a.code },
+      update: {
+        $set: {
+          ...a,
+          owner,
+          isDefault: true,
+          isActive: true,
+        },
+        // Si quieres marcar la primera creación con createdAt, déjalo al schema timestamps
+        $setOnInsert: {
+          createdAt: new Date(),
+        },
+      },
       upsert: true,
     },
   }));
 
-  // Nota: $setConfirm no existe, era para explicar intención.
-  // Usamos $set:
-  const fixedOps = DEFAULT_ACCOUNTS.map((a) => ({
-    updateOne: {
-      filter: { owner: userId, code: a.code },
-      update: { $set: { ...a, owner: userId, isDefault: true, isActive: true } },
-      upsert: true,
-    },
-  }));
-
-  await Account.bulkWrite(fixedOps, { ordered: false });
+  await Account.bulkWrite(ops, { ordered: false });
 }
 
 module.exports = { seedDefaultsForUser };

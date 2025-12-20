@@ -7,6 +7,8 @@ const crypto = require("crypto");
 const User = require("../models/User");
 const sendEmail = require("../utils/sendEmail");
 const ensureAuth = require("../middleware/ensureAuth"); // ✅
+const { seedDefaultsForUser } = require("../utils/seedDefaults");
+
 
 const router = express.Router();
 
