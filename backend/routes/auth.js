@@ -370,6 +370,13 @@ router.get("/verify-email", async (req, res) => {
     user.verificationTokenExpires = undefined;
     await user.save();
 
+    // ✅ sembrar defaults por usuario
+try {
+  await seedDefaultsForUser(user._id);
+} catch (e) {
+  console.error("❌ seedDefaultsForUser error:", e);
+}
+
     const jwtToken = signJwt(user._id);
     setSessionCookie(res, jwtToken);
 
