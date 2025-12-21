@@ -50,7 +50,7 @@ function toYMD(d) {
 
 /**
  * Detecta si JournalEntry.lines usa accountId (ObjectId) o accountCodigo (string).
- * OJO: Tu modelo JournalEntry (según screenshot) usa accountCodigo.
+ * Tu modelo (según screenshot) usa accountCodigo.
  */
 function journalLineMode() {
   const schema = JournalEntry?.schema;
@@ -60,15 +60,12 @@ function journalLineMode() {
     schema.path("lines.accountId") ||
     schema.path("lines.$.accountId") ||
     schema.path("lines.0.accountId");
-
   if (hasAccountId) return "id";
 
-  // ✅ preferimos accountCodigo (tu modelo)
   const hasAccountCodigo =
     schema.path("lines.accountCodigo") ||
     schema.path("lines.$.accountCodigo") ||
     schema.path("lines.0.accountCodigo");
-
   if (hasAccountCodigo) return "code";
 
   // fallback legacy
@@ -120,7 +117,7 @@ async function buildLine(owner, { code, debit = 0, credit = 0, memo = "" }) {
 }
 
 /**
- * Mapeo de JournalEntry a la forma que el front legacy suele esperar
+ * Mapeo de JournalEntry a la forma legacy que tu UI suele esperar
  */
 function mapEntryForUI(entry) {
   const detalle_asientos = (entry.lines || []).map((l) => ({
@@ -149,7 +146,7 @@ function mapEntryForUI(entry) {
 }
 
 /**
- * Aplanar asientos a "detalles" contables (UI de analítica lo usa mucho)
+ * Aplanar asientos a "detalles" contables (analítica lo usa mucho)
  */
 function flattenDetalles(entries) {
   const detalles = [];
@@ -172,7 +169,6 @@ function flattenDetalles(entries) {
 
 /**
  * GET /api/ingresos/clientes-min?q=...&limit=200
- * (si existe modelo Client)
  */
 router.get("/clientes-min", ensureAuth, async (req, res) => {
   try {
@@ -210,8 +206,8 @@ router.get("/clientes-min", ensureAuth, async (req, res) => {
 });
 
 /**
- * ✅ GET /api/ingresos/asientos?start=YYYY-MM-DD&end=YYYY-MM-DD
- * Devuelve asientos agrupados con detalle_asientos (lo que el UI suele necesitar)
+ * GET /api/ingresos/asientos?start=YYYY-MM-DD&end=YYYY-MM-DD
+ * Devuelve asientos con detalle_asientos
  */
 router.get("/asientos", ensureAuth, async (req, res) => {
   try {
@@ -249,9 +245,8 @@ router.get("/asientos", ensureAuth, async (req, res) => {
 });
 
 /**
- * ✅ GET /api/ingresos/detalles?start=YYYY-MM-DD&end=YYYY-MM-DD
- * IMPORTANTE: para E2E con analítica, devolvemos "detalles" contables aplanados.
- * (y opcionalmente también devolvemos items/resumen por compat)
+ * GET /api/ingresos/detalles?start=YYYY-MM-DD&end=YYYY-MM-DD
+ * Devuelve detalles contables aplanados + items/resumen (compat)
  */
 router.get("/detalles", ensureAuth, async (req, res) => {
   try {
@@ -267,7 +262,7 @@ router.get("/detalles", ensureAuth, async (req, res) => {
       });
     }
 
-    // 1) Asientos (para detalles contables)
+    // 1) Asientos para detalles contables
     const entries = await JournalEntry.find({
       owner,
       date: { $gte: start, $lte: end },
@@ -278,7 +273,7 @@ router.get("/detalles", ensureAuth, async (req, res) => {
 
     const detalles = flattenDetalles(entries);
 
-    // 2) Transacciones (por si tu UI también lo usa en otra pestaña)
+    // 2) Transacciones (por si la UI las usa también)
     const items = await IncomeTransaction.find({
       owner,
       fecha: { $gte: start, $lte: end },
@@ -286,7 +281,10 @@ router.get("/detalles", ensureAuth, async (req, res) => {
       .sort({ fecha: -1, createdAt: -1 })
       .lean();
 
-    const total = items.reduce((acc, it) => acc + num(it.montoNeto ?? it.montoTotal ?? 0), 0);
+    const total = items.reduce(
+      (acc, it) => acc + num(it.montoNeto ?? it.montoTotal ?? 0),
+      0
+    );
 
     return res.json({
       ok: true,
@@ -295,7 +293,10 @@ router.get("/detalles", ensureAuth, async (req, res) => {
         items,
         resumen: { total, count: items.length },
       },
-      detalles, // compat legacy (muchas UIs lo buscan plano)
+      // compat legacy
+      detalles,
+      items,
+      resumen: { total, count: items.length },
     });
   } catch (err) {
     console.error("GET /api/ingresos/detalles error:", err);
@@ -304,8 +305,8 @@ router.get("/detalles", ensureAuth, async (req, res) => {
 });
 
 /**
- * ✅ GET /api/ingresos/asientos-directos?limit=300
- * Asientos sin transacción ligada (sourceId null). Acepta start/end opcional.
+ * GET /api/ingresos/asientos-directos?limit=300
+ * Asientos sin transacción ligada (sourceId null). start/end opcional.
  */
 router.get("/asientos-directos", ensureAuth, async (req, res) => {
   try {
@@ -354,7 +355,7 @@ router.get("/recientes", ensureAuth, async (req, res) => {
       .limit(limit)
       .lean();
 
-    return res.json({ ok: true, data: items });
+    return res.json({ ok: true, data: items, items });
   } catch (err) {
     console.error("GET /api/ingresos/recientes error:", err);
     return res.status(500).json({ ok: false, message: "Error cargando ingresos recientes" });
@@ -362,9 +363,8 @@ router.get("/recientes", ensureAuth, async (req, res) => {
 });
 
 /**
- * ✅ POST /api/ingresos/:id/cancelar
- * Para compat con UI legacy (edge function cancelar-ingreso).
- * Borra la transacción y sus asientos ligados.
+ * POST /api/ingresos/:id/cancelar
+ * Compat con UI legacy: borra la transacción y su asiento ligado.
  */
 router.post("/:id/cancelar", ensureAuth, async (req, res) => {
   try {
@@ -374,10 +374,23 @@ router.post("/:id/cancelar", ensureAuth, async (req, res) => {
     const tx = await IncomeTransaction.findOne({ _id: id, owner });
     if (!tx) return res.status(404).json({ ok: false, message: "Ingreso no encontrado." });
 
+    // Encuentra asientos ligados para devolver "numeroAsientoCancelado"
+    const linked = await JournalEntry.findOne({
+      owner,
+      source: "ingreso",
+      sourceId: tx._id,
+    }).select("_id").lean();
+
+    const numeroAsientoCancelado = linked ? String(linked._id) : null;
+
     await JournalEntry.deleteMany({ owner, source: "ingreso", sourceId: tx._id });
     await IncomeTransaction.deleteOne({ _id: tx._id, owner });
 
-    return res.json({ ok: true });
+    return res.json({
+      ok: true,
+      numeroAsientoCancelado,
+      data: { numeroAsientoCancelado },
+    });
   } catch (err) {
     console.error("POST /api/ingresos/:id/cancelar error:", err);
     return res.status(500).json({ ok: false, message: "Error cancelando ingreso" });
@@ -388,13 +401,14 @@ router.post("/:id/cancelar", ensureAuth, async (req, res) => {
  * POST /api/ingresos
  * Crea transacción + asiento contable.
  *
- * Acepta llaves "legacy" y "nuevas":
+ * Acepta llaves legacy y nuevas:
+ * - tipoIngreso (precargados|inventariados|general|otros)
  * - descripcion
- * - montoTotal
- * - montoDescuento
+ * - montoTotal / total
+ * - montoDescuento / descuento
  * - metodoPago: efectivo|bancos
  * - tipoPago: contado|parcial|credito
- * - montoPagado
+ * - montoPagado / pagado
  * - cuentaCodigo OR cuentaPrincipalCodigo (default 4001)
  * - subcuentaId (opcional)
  * - fecha (opcional)
@@ -404,6 +418,7 @@ router.post("/", ensureAuth, async (req, res) => {
   try {
     const owner = req.user._id;
 
+    const tipoIngreso = String(req.body?.tipoIngreso || "general"); // UI lo manda
     const descripcion = String(req.body?.descripcion || "Ingreso").trim();
 
     const total = num(req.body?.montoTotal ?? req.body?.total, 0);
@@ -442,34 +457,39 @@ router.post("/", ensureAuth, async (req, res) => {
       return res.status(400).json({ ok: false, message: "montoPagado debe estar entre 0 y montoNeto." });
     }
 
-    // Normalización de pagado / pendiente (sin requerir saldoPendiente en el modelo)
+    // Normalización de pagado / pendiente
     const montoPagado =
       tipoPago === "contado" ? neto : Math.min(Math.max(montoPagadoRaw, 0), neto);
-
-    const saldoPendiente =
-      tipoPago === "contado" ? 0 : Math.max(0, neto - montoPagado);
+    const saldoPendiente = tipoPago === "contado" ? 0 : Math.max(0, neto - montoPagado);
 
     // Códigos base (ajústalos a tu seed real)
     const COD_CAJA = "1001";
     const COD_BANCOS = "1002";
     const COD_CLIENTES = "1101";
     const COD_DESCUENTOS = "4002";
-
     const codCobro = metodoPago === "bancos" ? COD_BANCOS : COD_CAJA;
 
     // Armar transacción
     const txPayload = {
       owner,
+      fecha,
+      tipoIngreso, // ✅
       descripcion,
+
       montoTotal: total,
       montoDescuento: descuento,
       montoNeto: neto,
+
       metodoPago,
       tipoPago,
       montoPagado,
+
       cuentaCodigo,
       subcuentaId,
-      fecha,
+
+      // Si tu schema NO tiene saldoPendiente, Mongoose lo ignorará (si strict true).
+      // Si lo tiene, lo guardará.
+      saldoPendiente,
     };
 
     const clienteId = req.body?.clienteId ?? req.body?.clientId ?? null;
@@ -547,16 +567,25 @@ router.post("/", ensureAuth, async (req, res) => {
       lines,
     });
 
+    // ✅ LO QUE ARREGLA "Asiento undefined"
+    const asiento = mapEntryForUI(entry);
+    const numeroAsiento = String(entry._id);
+
     return res.status(201).json({
       ok: true,
-      data: { transaction: tx, journalEntry: entry },
+      numeroAsiento, // ✅ legacy UI
+      asiento, // ✅ legacy UI (detalle_asientos)
+      data: {
+        transaction: tx,
+        journalEntry: entry,
+        asiento,
+        numeroAsiento,
+      },
     });
   } catch (err) {
     const status = err?.statusCode || 500;
     console.error("POST /api/ingresos error:", err);
-    return res
-      .status(status)
-      .json({ ok: false, message: err?.message || "Error creando ingreso" });
+    return res.status(status).json({ ok: false, message: err?.message || "Error creando ingreso" });
   }
 });
 

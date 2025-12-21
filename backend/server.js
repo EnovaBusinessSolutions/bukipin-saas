@@ -39,6 +39,7 @@ app.use("/api/clientes", require("./routes/clientes"));
 app.use("/api/ingresos", require("./routes/ingresos"));
 app.use("/api/transacciones", require("./routes/transacciones"));
 app.use("/api/inventario", require("./routes/inventario"));
+app.use("/api/contabilidad", require("./routes/contabilidad"));
 
 // ✅ Placeholders temporales (para que el dashboard no reviente con 404 mientras migras)
 app.use("/api", require("./routes/placeholders"));
