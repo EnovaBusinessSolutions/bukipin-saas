@@ -32,13 +32,13 @@ app.use(express.static(publicRoot));
 app.use("/api/auth", require("./routes/auth"));
 
 // Registros / Catálogos (rutas en español)
-app.use("/api", require("./routes/cuentas"));
-app.use("/api", require("./routes/subcuentas"));
-app.use("/api", require("./routes/productos"));
-app.use("/api", require("./routes/clientes"));
-app.use("/api", require("./routes/ingresos"));
-app.use("/api", require("./routes/transacciones"));
-app.use("/api", require("./routes/inventario"));
+app.use("/api/cuentas", require("./routes/cuentas"));
+app.use("/api/subcuentas", require("./routes/subcuentas"));
+app.use("/api/productos", require("./routes/productos"));
+app.use("/api/clientes", require("./routes/clientes"));
+app.use("/api/ingresos", require("./routes/ingresos"));
+app.use("/api/transacciones", require("./routes/transacciones"));
+app.use("/api/inventario", require("./routes/inventario"));
 
 // ✅ Placeholders temporales (para que el dashboard no reviente con 404 mientras migras)
 app.use("/api", require("./routes/placeholders"));
