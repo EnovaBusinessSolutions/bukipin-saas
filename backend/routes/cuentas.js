@@ -5,13 +5,23 @@ const router = express.Router();
 const ensureAuth = require("../middleware/ensureAuth");
 const Account = require("../models/Account");
 
+const ALLOWED_TYPES = new Set(["activo", "pasivo", "capital", "ingreso", "gasto", "orden"]);
+
+function normStr(v) {
+  return String(v ?? "").trim();
+}
+
+function isDigits(str) {
+  return /^\d+$/.test(str);
+}
+
 /**
  * GET /api/cuentas
  * Lista cuentas contables del usuario (owner)
  * Query opcional:
  *  - active=true|false (filtra por isActive)
  */
-router.get("/", ensureAuth, async (req, res) => {
+router.get("/cuentas", ensureAuth, async (req, res) => {
   try {
     const owner = req.user._id;
 
@@ -20,16 +30,30 @@ router.get("/", ensureAuth, async (req, res) => {
       q.isActive = String(req.query.active) === "true";
     }
 
-    // Orden por code (ej: "4001", "1001", etc.)
     const items = await Account.find(q).sort({ code: 1 }).lean();
-
     return res.json({ ok: true, data: items });
   } catch (err) {
     console.error("GET /api/cuentas error:", err);
-    return res.status(500).json({
-      ok: false,
-      message: "Error cargando cuentas",
-    });
+    return res.status(500).json({ ok: false, message: "Error cargando cuentas" });
+  }
+});
+
+/**
+ * GET /api/cuentas/:id
+ * Devuelve una cuenta del usuario
+ */
+router.get("/cuentas/:id", ensureAuth, async (req, res) => {
+  try {
+    const owner = req.user._id;
+    const { id } = req.params;
+
+    const doc = await Account.findOne({ _id: id, owner }).lean();
+    if (!doc) return res.status(404).json({ ok: false, message: "Cuenta no encontrada." });
+
+    return res.json({ ok: true, data: doc });
+  } catch (err) {
+    console.error("GET /api/cuentas/:id error:", err);
+    return res.status(500).json({ ok: false, message: "Error cargando cuenta" });
   }
 });
 
@@ -43,37 +67,57 @@ router.get("/", ensureAuth, async (req, res) => {
  *  - category?: string
  *  - parentCode?: string|null
  */
-router.post("/", ensureAuth, async (req, res) => {
+router.post("/cuentas", ensureAuth, async (req, res) => {
   try {
     const owner = req.user._id;
 
-    const { code, name, type, category, parentCode } = req.body || {};
+    const code = normStr(req.body?.code);
+    const name = normStr(req.body?.name);
+    const type = normStr(req.body?.type);
+    const category = normStr(req.body?.category) || "general";
+    const parentCodeRaw = req.body?.parentCode;
 
-    // Validaciones mínimas
-    if (!code || !String(code).trim()) {
-      return res.status(400).json({ ok: false, message: "Falta 'code'." });
+    if (!code) return res.status(400).json({ ok: false, message: "Falta 'code'." });
+    if (!isDigits(code)) {
+      return res.status(400).json({ ok: false, message: "'code' debe contener solo dígitos (ej: 4001)." });
     }
-    if (!name || !String(name).trim()) {
-      return res.status(400).json({ ok: false, message: "Falta 'name'." });
+
+    if (!name) return res.status(400).json({ ok: false, message: "Falta 'name'." });
+
+    if (!type) return res.status(400).json({ ok: false, message: "Falta 'type'." });
+    if (!ALLOWED_TYPES.has(type)) {
+      return res.status(400).json({
+        ok: false,
+        message: `Tipo inválido. Usa: ${Array.from(ALLOWED_TYPES).join(", ")}.`,
+      });
     }
-    if (!type || !String(type).trim()) {
-      return res.status(400).json({ ok: false, message: "Falta 'type'." });
+
+    const parentCode = parentCodeRaw ? normStr(parentCodeRaw) : null;
+
+    // Si mandan parentCode, validamos que exista y sea del mismo owner
+    if (parentCode) {
+      if (!isDigits(parentCode)) {
+        return res.status(400).json({ ok: false, message: "'parentCode' debe contener solo dígitos." });
+      }
+      const parent = await Account.findOne({ owner, code: parentCode }).lean();
+      if (!parent) {
+        return res.status(400).json({ ok: false, message: "parentCode no existe para este usuario." });
+      }
     }
 
     const doc = await Account.create({
       owner,
-      code: String(code).trim(),
-      name: String(name).trim(),
-      type: String(type).trim(),
-      category: category ? String(category).trim() : "general",
-      parentCode: parentCode ? String(parentCode).trim() : null,
+      code,
+      name,
+      type,
+      category,
+      parentCode,
       isDefault: false,
       isActive: true,
     });
 
     return res.status(201).json({ ok: true, data: doc });
   } catch (err) {
-    // Manejo de duplicados por índice unique {owner, code}
     if (err && err.code === 11000) {
       return res.status(409).json({
         ok: false,
@@ -82,18 +126,16 @@ router.post("/", ensureAuth, async (req, res) => {
     }
 
     console.error("POST /api/cuentas error:", err);
-    return res.status(500).json({
-      ok: false,
-      message: "Error creando cuenta",
-    });
+    return res.status(500).json({ ok: false, message: "Error creando cuenta" });
   }
 });
 
 /**
  * PUT /api/cuentas/:id
  * Actualiza una cuenta del usuario (owner)
+ * Nota: no permitimos modificar isDefault aquí.
  */
-router.put("/:id", ensureAuth, async (req, res) => {
+router.put("/cuentas/:id", ensureAuth, async (req, res) => {
   try {
     const owner = req.user._id;
     const { id } = req.params;
@@ -105,12 +147,45 @@ router.put("/:id", ensureAuth, async (req, res) => {
       if (typeof req.body?.[k] !== "undefined") patch[k] = req.body[k];
     }
 
-    if (typeof patch.code !== "undefined") patch.code = String(patch.code).trim();
-    if (typeof patch.name !== "undefined") patch.name = String(patch.name).trim();
-    if (typeof patch.type !== "undefined") patch.type = String(patch.type).trim();
-    if (typeof patch.category !== "undefined") patch.category = String(patch.category).trim();
+    if (typeof patch.code !== "undefined") {
+      patch.code = normStr(patch.code);
+      if (!patch.code) return res.status(400).json({ ok: false, message: "'code' no puede ir vacío." });
+      if (!isDigits(patch.code)) {
+        return res.status(400).json({ ok: false, message: "'code' debe contener solo dígitos." });
+      }
+    }
+
+    if (typeof patch.name !== "undefined") {
+      patch.name = normStr(patch.name);
+      if (!patch.name) return res.status(400).json({ ok: false, message: "'name' no puede ir vacío." });
+    }
+
+    if (typeof patch.type !== "undefined") {
+      patch.type = normStr(patch.type);
+      if (!ALLOWED_TYPES.has(patch.type)) {
+        return res.status(400).json({
+          ok: false,
+          message: `Tipo inválido. Usa: ${Array.from(ALLOWED_TYPES).join(", ")}.`,
+        });
+      }
+    }
+
+    if (typeof patch.category !== "undefined") {
+      patch.category = normStr(patch.category) || "general";
+    }
+
     if (typeof patch.parentCode !== "undefined") {
-      patch.parentCode = patch.parentCode ? String(patch.parentCode).trim() : null;
+      patch.parentCode = patch.parentCode ? normStr(patch.parentCode) : null;
+
+      if (patch.parentCode) {
+        if (!isDigits(patch.parentCode)) {
+          return res.status(400).json({ ok: false, message: "'parentCode' debe contener solo dígitos." });
+        }
+        const parent = await Account.findOne({ owner, code: patch.parentCode }).lean();
+        if (!parent) {
+          return res.status(400).json({ ok: false, message: "parentCode no existe para este usuario." });
+        }
+      }
     }
 
     const updated = await Account.findOneAndUpdate(
@@ -119,9 +194,7 @@ router.put("/:id", ensureAuth, async (req, res) => {
       { new: true }
     ).lean();
 
-    if (!updated) {
-      return res.status(404).json({ ok: false, message: "Cuenta no encontrada." });
-    }
+    if (!updated) return res.status(404).json({ ok: false, message: "Cuenta no encontrada." });
 
     return res.json({ ok: true, data: updated });
   } catch (err) {
@@ -140,18 +213,24 @@ router.put("/:id", ensureAuth, async (req, res) => {
 /**
  * DELETE /api/cuentas/:id
  * Elimina una cuenta del usuario (owner)
- * (Nota: si después quieres integridad contable, aquí se cambia a soft-delete)
+ * Recomendación: evitar borrar cuentas default (sembradas)
  */
-router.delete("/:id", ensureAuth, async (req, res) => {
+router.delete("/cuentas/:id", ensureAuth, async (req, res) => {
   try {
     const owner = req.user._id;
     const { id } = req.params;
 
-    const deleted = await Account.findOneAndDelete({ _id: id, owner }).lean();
-    if (!deleted) {
-      return res.status(404).json({ ok: false, message: "Cuenta no encontrada." });
+    const doc = await Account.findOne({ _id: id, owner }).lean();
+    if (!doc) return res.status(404).json({ ok: false, message: "Cuenta no encontrada." });
+
+    if (doc.isDefault) {
+      return res.status(400).json({
+        ok: false,
+        message: "No puedes eliminar una cuenta del sistema (isDefault=true). Desactívala en su lugar.",
+      });
     }
 
+    await Account.deleteOne({ _id: id, owner });
     return res.json({ ok: true });
   } catch (err) {
     console.error("DELETE /api/cuentas/:id error:", err);
