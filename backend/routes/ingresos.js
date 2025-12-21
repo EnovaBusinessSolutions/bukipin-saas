@@ -7,9 +7,30 @@ const IncomeTransaction = require("../models/IncomeTransaction");
 const JournalEntry = require("../models/JournalEntry");
 const Account = require("../models/Account");
 
-function parseDate(s) {
+// Opcional (si existe en tu proyecto)
+let Client = null;
+try {
+  Client = require("../models/Client");
+} catch (_) {}
+
+/**
+ * Fechas (MUY IMPORTANTE):
+ * new Date("YYYY-MM-DD") se interpreta como UTC y rompe rangos en MX.
+ * Usamos "T00:00:00" (local) y para end usamos fin de día.
+ */
+function parseStartDate(s) {
   if (!s) return null;
-  const d = new Date(String(s));
+  const str = String(s).trim();
+  const isDateOnly = /^\d{4}-\d{2}-\d{2}$/.test(str);
+  const d = new Date(isDateOnly ? `${str}T00:00:00` : str);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function parseEndDate(s) {
+  if (!s) return null;
+  const str = String(s).trim();
+  const isDateOnly = /^\d{4}-\d{2}-\d{2}$/.test(str);
+  const d = new Date(isDateOnly ? `${str}T23:59:59.999` : str);
   return Number.isNaN(d.getTime()) ? null : d;
 }
 
@@ -18,20 +39,23 @@ function num(v, def = 0) {
   return Number.isFinite(n) ? n : def;
 }
 
-function isTrue(v) {
-  if (typeof v === "undefined") return false;
-  const s = String(v).toLowerCase();
-  return s === "true" || s === "1" || s === "yes";
+function toYMD(d) {
+  const dt = new Date(d);
+  if (Number.isNaN(dt.getTime())) return null;
+  const y = dt.getFullYear();
+  const m = String(dt.getMonth() + 1).padStart(2, "0");
+  const day = String(dt.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
 }
 
 /**
- * Detecta si JournalEntry.lines usa accountId (ObjectId) o accountCode/accountCodigo (string).
+ * Detecta si JournalEntry.lines usa accountId (ObjectId) o accountCodigo (string).
+ * OJO: Tu modelo JournalEntry (según screenshot) usa accountCodigo.
  */
 function journalLineMode() {
   const schema = JournalEntry?.schema;
   if (!schema) return "code";
 
-  // Intentos típicos (depende de tu schema real)
   const hasAccountId =
     schema.path("lines.accountId") ||
     schema.path("lines.$.accountId") ||
@@ -39,25 +63,36 @@ function journalLineMode() {
 
   if (hasAccountId) return "id";
 
+  // ✅ preferimos accountCodigo (tu modelo)
+  const hasAccountCodigo =
+    schema.path("lines.accountCodigo") ||
+    schema.path("lines.$.accountCodigo") ||
+    schema.path("lines.0.accountCodigo");
+
+  if (hasAccountCodigo) return "code";
+
+  // fallback legacy
   const hasAccountCode =
     schema.path("lines.accountCode") ||
-    schema.path("lines.accountCodigo") ||
     schema.path("lines.$.accountCode") ||
-    schema.path("lines.$.accountCodigo");
+    schema.path("lines.0.accountCode");
 
   return hasAccountCode ? "code" : "code";
 }
 
-/**
- * Devuelve un accountId buscando por code+owner (si existe).
- */
 async function accountIdByCode(owner, code) {
-  const acc = await Account.findOne({ owner, code: String(code).trim() }).select("_id code name").lean();
+  const acc = await Account.findOne({
+    owner,
+    code: String(code).trim(),
+  })
+    .select("_id code name")
+    .lean();
   return acc?._id || null;
 }
 
 /**
- * Construye una línea de asiento compatible con tu schema (accountId o accountCode)
+ * Construye una línea de asiento compatible con tu schema.
+ * Importante: si tu schema requiere accountId y no existe la cuenta, fallamos con mensaje claro.
  */
 async function buildLine(owner, { code, debit = 0, credit = 0, memo = "" }) {
   const mode = journalLineMode();
@@ -70,63 +105,236 @@ async function buildLine(owner, { code, debit = 0, credit = 0, memo = "" }) {
 
   if (mode === "id") {
     const id = await accountIdByCode(owner, code);
-    return {
-      ...base,
-      accountId: id, // puede ser null si no existe; ideal que tu seed lo tenga
-    };
+    if (!id) {
+      const err = new Error(
+        `No existe la cuenta contable con code="${String(code).trim()}" para este usuario. Asegúrate de que el seed la haya creado.`
+      );
+      err.statusCode = 400;
+      throw err;
+    }
+    return { ...base, accountId: id };
   }
 
-  // mode === "code"
+  // ✅ Tu JournalEntry usa accountCodigo
+  return { ...base, accountCodigo: String(code).trim() };
+}
+
+/**
+ * Mapeo de JournalEntry a la forma que el front legacy suele esperar
+ */
+function mapEntryForUI(entry) {
+  const detalle_asientos = (entry.lines || []).map((l) => ({
+    cuenta_codigo: l.accountCodigo ?? l.accountCode ?? null,
+    debe: num(l.debit, 0),
+    haber: num(l.credit, 0),
+    memo: l.memo ?? "",
+  }));
+
   return {
-    ...base,
-    accountCode: String(code).trim(),
+    id: String(entry._id),
+    _id: entry._id,
+
+    asiento_fecha: toYMD(entry.date),
+    fecha: entry.date,
+
+    concepto: entry.concept ?? "",
+    source: entry.source ?? "",
+    transaccion_ingreso_id: entry.sourceId ? String(entry.sourceId) : null,
+
+    detalle_asientos,
+
+    created_at: entry.createdAt,
+    updated_at: entry.updatedAt,
   };
 }
 
 /**
- * GET /api/ingresos/detalles?start=YYYY-MM-DD&end=YYYY-MM-DD
- * (soporta también from/to)
+ * Aplanar asientos a "detalles" contables (UI de analítica lo usa mucho)
+ */
+function flattenDetalles(entries) {
+  const detalles = [];
+  for (const e of entries) {
+    const asientoFecha = toYMD(e.date);
+    for (const l of e.lines || []) {
+      detalles.push({
+        cuenta_codigo: l.accountCodigo ?? l.accountCode ?? null,
+        debe: num(l.debit, 0),
+        haber: num(l.credit, 0),
+        asiento_fecha: asientoFecha,
+        asiento_id: String(e._id),
+        concepto: e.concept ?? "",
+        transaccion_ingreso_id: e.sourceId ? String(e.sourceId) : null,
+      });
+    }
+  }
+  return detalles;
+}
+
+/**
+ * GET /api/ingresos/clientes-min?q=...&limit=200
+ * (si existe modelo Client)
+ */
+router.get("/clientes-min", ensureAuth, async (req, res) => {
+  try {
+    if (!Client) return res.json({ ok: true, data: [] });
+
+    const owner = req.user._id;
+    const q = (req.query.q ? String(req.query.q) : "").trim();
+    const limit = Math.min(2000, Number(req.query.limit || 200));
+
+    const filter = { owner };
+    if (q) {
+      filter.$or = [
+        { nombre: { $regex: q, $options: "i" } },
+        { name: { $regex: q, $options: "i" } },
+        { rfc: { $regex: q, $options: "i" } },
+      ];
+    }
+
+    const items = await Client.find(filter)
+      .select("_id nombre name")
+      .sort({ nombre: 1, name: 1 })
+      .limit(limit)
+      .lean();
+
+    const data = items.map((c) => ({
+      id: String(c._id),
+      nombre: c.nombre ?? c.name ?? "Sin nombre",
+    }));
+
+    return res.json({ ok: true, data });
+  } catch (err) {
+    console.error("GET /api/ingresos/clientes-min error:", err);
+    return res.status(500).json({ ok: false, message: "Error cargando clientes" });
+  }
+});
+
+/**
+ * ✅ GET /api/ingresos/asientos?start=YYYY-MM-DD&end=YYYY-MM-DD
+ * Devuelve asientos agrupados con detalle_asientos (lo que el UI suele necesitar)
+ */
+router.get("/asientos", ensureAuth, async (req, res) => {
+  try {
+    const owner = req.user._id;
+
+    const start = parseStartDate(req.query.start || req.query.from);
+    const end = parseEndDate(req.query.end || req.query.to);
+
+    if (!start || !end) {
+      return res.status(400).json({
+        ok: false,
+        message: "start/end (o from/to) son requeridos.",
+      });
+    }
+
+    const entries = await JournalEntry.find({
+      owner,
+      date: { $gte: start, $lte: end },
+      source: { $in: ["ingreso", "ingreso_directo"] },
+    })
+      .sort({ date: -1, createdAt: -1 })
+      .lean();
+
+    const asientos = entries.map(mapEntryForUI);
+
+    return res.json({
+      ok: true,
+      data: { asientos },
+      asientos, // compat legacy
+    });
+  } catch (err) {
+    console.error("GET /api/ingresos/asientos error:", err);
+    return res.status(500).json({ ok: false, message: "Error cargando asientos" });
+  }
+});
+
+/**
+ * ✅ GET /api/ingresos/detalles?start=YYYY-MM-DD&end=YYYY-MM-DD
+ * IMPORTANTE: para E2E con analítica, devolvemos "detalles" contables aplanados.
+ * (y opcionalmente también devolvemos items/resumen por compat)
  */
 router.get("/detalles", ensureAuth, async (req, res) => {
   try {
     const owner = req.user._id;
 
-    const start = parseDate(req.query.start || req.query.from);
-    const end = parseDate(req.query.end || req.query.to);
+    const start = parseStartDate(req.query.start || req.query.from);
+    const end = parseEndDate(req.query.end || req.query.to);
 
     if (!start || !end) {
-      return res.status(400).json({ ok: false, message: "start/end (o from/to) son requeridos." });
+      return res.status(400).json({
+        ok: false,
+        message: "start/end (o from/to) son requeridos.",
+      });
     }
 
+    // 1) Asientos (para detalles contables)
+    const entries = await JournalEntry.find({
+      owner,
+      date: { $gte: start, $lte: end },
+      source: { $in: ["ingreso", "ingreso_directo"] },
+    })
+      .sort({ date: -1, createdAt: -1 })
+      .lean();
+
+    const detalles = flattenDetalles(entries);
+
+    // 2) Transacciones (por si tu UI también lo usa en otra pestaña)
     const items = await IncomeTransaction.find({
       owner,
       fecha: { $gte: start, $lte: end },
     })
-      .sort({ fecha: -1 })
+      .sort({ fecha: -1, createdAt: -1 })
       .lean();
 
-    return res.json({ ok: true, data: items });
+    const total = items.reduce((acc, it) => acc + num(it.montoNeto ?? it.montoTotal ?? 0), 0);
+
+    return res.json({
+      ok: true,
+      data: {
+        detalles,
+        items,
+        resumen: { total, count: items.length },
+      },
+      detalles, // compat legacy (muchas UIs lo buscan plano)
+    });
   } catch (err) {
     console.error("GET /api/ingresos/detalles error:", err);
-    return res.status(500).json({ ok: false, message: "Error cargando ingresos" });
+    return res.status(500).json({ ok: false, message: "Error cargando detalles" });
   }
 });
 
 /**
- * GET /api/ingresos/asientos-directos?limit=300
- * Devuelve asientos relacionados a ingresos (source: "ingreso")
+ * ✅ GET /api/ingresos/asientos-directos?limit=300
+ * Asientos sin transacción ligada (sourceId null). Acepta start/end opcional.
  */
 router.get("/asientos-directos", ensureAuth, async (req, res) => {
   try {
     const owner = req.user._id;
     const limit = Math.min(2000, Number(req.query.limit || 300));
 
-    const items = await JournalEntry.find({ owner, source: "ingreso" })
-      .sort({ date: -1 })
+    const start = parseStartDate(req.query.start || req.query.from);
+    const end = parseEndDate(req.query.end || req.query.to);
+
+    const filter = {
+      owner,
+      source: { $in: ["ingreso", "ingreso_directo"] },
+      $or: [{ sourceId: null }, { sourceId: { $exists: false } }],
+    };
+
+    if (start && end) filter.date = { $gte: start, $lte: end };
+
+    const entries = await JournalEntry.find(filter)
+      .sort({ date: -1, createdAt: -1 })
       .limit(limit)
       .lean();
 
-    return res.json({ ok: true, data: items });
+    const asientos = entries.map(mapEntryForUI);
+
+    return res.json({
+      ok: true,
+      data: { asientos },
+      asientos,
+    });
   } catch (err) {
     console.error("GET /api/ingresos/asientos-directos error:", err);
     return res.status(500).json({ ok: false, message: "Error cargando asientos" });
@@ -135,7 +343,6 @@ router.get("/asientos-directos", ensureAuth, async (req, res) => {
 
 /**
  * GET /api/ingresos/recientes?limit=1000
- * Útil para widgets/tabla rápida
  */
 router.get("/recientes", ensureAuth, async (req, res) => {
   try {
@@ -143,7 +350,7 @@ router.get("/recientes", ensureAuth, async (req, res) => {
     const limit = Math.min(2000, Number(req.query.limit || 1000));
 
     const items = await IncomeTransaction.find({ owner })
-      .sort({ fecha: -1 })
+      .sort({ fecha: -1, createdAt: -1 })
       .limit(limit)
       .lean();
 
@@ -155,19 +362,43 @@ router.get("/recientes", ensureAuth, async (req, res) => {
 });
 
 /**
+ * ✅ POST /api/ingresos/:id/cancelar
+ * Para compat con UI legacy (edge function cancelar-ingreso).
+ * Borra la transacción y sus asientos ligados.
+ */
+router.post("/:id/cancelar", ensureAuth, async (req, res) => {
+  try {
+    const owner = req.user._id;
+    const { id } = req.params;
+
+    const tx = await IncomeTransaction.findOne({ _id: id, owner });
+    if (!tx) return res.status(404).json({ ok: false, message: "Ingreso no encontrado." });
+
+    await JournalEntry.deleteMany({ owner, source: "ingreso", sourceId: tx._id });
+    await IncomeTransaction.deleteOne({ _id: tx._id, owner });
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error("POST /api/ingresos/:id/cancelar error:", err);
+    return res.status(500).json({ ok: false, message: "Error cancelando ingreso" });
+  }
+});
+
+/**
  * POST /api/ingresos
  * Crea transacción + asiento contable.
  *
- * Body recomendado (flexible):
+ * Acepta llaves "legacy" y "nuevas":
  * - descripcion
  * - montoTotal
- * - montoDescuento (opcional)
+ * - montoDescuento
  * - metodoPago: efectivo|bancos
  * - tipoPago: contado|parcial|credito
- * - montoPagado (opcional)
- * - cuentaCodigo (ingreso) default 4001
+ * - montoPagado
+ * - cuentaCodigo OR cuentaPrincipalCodigo (default 4001)
+ * - subcuentaId (opcional)
  * - fecha (opcional)
- * - clientId / productoId (opcionales si tu modelo los maneja)
+ * - clienteId/clientId (opcional)
  */
 router.post("/", ensureAuth, async (req, res) => {
   try {
@@ -175,17 +406,25 @@ router.post("/", ensureAuth, async (req, res) => {
 
     const descripcion = String(req.body?.descripcion || "Ingreso").trim();
 
-    const total = num(req.body?.montoTotal, 0);
-    const descuento = num(req.body?.montoDescuento, 0);
+    const total = num(req.body?.montoTotal ?? req.body?.total, 0);
+    const descuento = num(req.body?.montoDescuento ?? req.body?.descuento, 0);
     const neto = Math.max(0, total - Math.max(0, descuento));
 
     const metodoPago = String(req.body?.metodoPago || "efectivo"); // efectivo|bancos
     const tipoPago = String(req.body?.tipoPago || "contado"); // contado|parcial|credito
 
-    const montoPagado = num(req.body?.montoPagado, 0);
-    const cuentaCodigo = String(req.body?.cuentaCodigo || "4001").trim(); // ingresos
+    const cuentaCodigo = String(
+      req.body?.cuentaCodigo || req.body?.cuentaPrincipalCodigo || "4001"
+    ).trim();
+
+    const subcuentaId = req.body?.subcuentaId ?? null;
 
     const fecha = req.body?.fecha ? new Date(req.body.fecha) : new Date();
+    if (Number.isNaN(fecha.getTime())) {
+      return res.status(400).json({ ok: false, message: "fecha inválida." });
+    }
+
+    const montoPagadoRaw = num(req.body?.montoPagado ?? req.body?.pagado, 0);
 
     if (!total || total <= 0) {
       return res.status(400).json({ ok: false, message: "montoTotal debe ser > 0." });
@@ -199,33 +438,26 @@ router.post("/", ensureAuth, async (req, res) => {
     if (!["contado", "parcial", "credito"].includes(tipoPago)) {
       return res.status(400).json({ ok: false, message: "tipoPago inválido (contado|parcial|credito)." });
     }
-    if (tipoPago === "contado" && montoPagado && Math.abs(montoPagado - neto) > 0.01) {
-      // no bloqueamos por completo, pero avisamos con normalización
-      // (hay UIs que mandan montoPagado aunque sea contado)
-    }
-    if (tipoPago === "parcial" && (montoPagado < 0 || montoPagado > neto)) {
+    if (tipoPago === "parcial" && (montoPagadoRaw < 0 || montoPagadoRaw > neto)) {
       return res.status(400).json({ ok: false, message: "montoPagado debe estar entre 0 y montoNeto." });
     }
-    if (tipoPago === "credito" && montoPagado > 0.01) {
-      // crédito normalmente es 0 pagado al inicio; no bloqueamos por UI,
-      // pero lo tratamos como “parcial” si viene pagado
-    }
+
+    // Normalización de pagado / pendiente (sin requerir saldoPendiente en el modelo)
+    const montoPagado =
+      tipoPago === "contado" ? neto : Math.min(Math.max(montoPagadoRaw, 0), neto);
+
+    const saldoPendiente =
+      tipoPago === "contado" ? 0 : Math.max(0, neto - montoPagado);
 
     // Códigos base (ajústalos a tu seed real)
     const COD_CAJA = "1001";
     const COD_BANCOS = "1002";
     const COD_CLIENTES = "1101";
-    const COD_DESCUENTOS = "4002"; // (si tu catálogo usa otro, cámbialo)
+    const COD_DESCUENTOS = "4002";
 
-    // Determinar cuentas Debe según tipoPago/metodoPago
     const codCobro = metodoPago === "bancos" ? COD_BANCOS : COD_CAJA;
 
-    let saldoPendiente = 0;
-    if (tipoPago === "contado") saldoPendiente = 0;
-    else if (tipoPago === "credito") saldoPendiente = neto;
-    else saldoPendiente = Math.max(0, neto - montoPagado);
-
-    // Guardar transacción (owner)
+    // Armar transacción
     const txPayload = {
       owner,
       descripcion,
@@ -234,62 +466,77 @@ router.post("/", ensureAuth, async (req, res) => {
       montoNeto: neto,
       metodoPago,
       tipoPago,
-      montoPagado: tipoPago === "contado" ? neto : montoPagado,
-      saldoPendiente,
+      montoPagado,
       cuentaCodigo,
+      subcuentaId,
       fecha,
     };
 
-    // Si tu modelo soporta clientId/productId, los pasamos sin romper
-    if (req.body?.clientId) txPayload.clientId = req.body.clientId;
-    if (req.body?.productoId) txPayload.productoId = req.body.productoId;
-    if (req.body?.productId) txPayload.productId = req.body.productId;
+    const clienteId = req.body?.clienteId ?? req.body?.clientId ?? null;
+    if (clienteId) txPayload.clienteId = clienteId;
 
     const tx = await IncomeTransaction.create(txPayload);
 
     /**
-     * Crear asiento contable:
-     * - Haber: Ventas (cuentaCodigo) por TOTAL (o NETO si no quieres separar descuento)
-     * - Debe:
-     *   - Contado: Caja/Bancos por NETO
-     *   - Crédito: Clientes por NETO
-     *   - Parcial: Caja/Bancos por pagado + Clientes por pendiente
-     * - Si descuento > 0: Debe "Descuentos" por descuento y Haber Ventas por total (cuadra)
+     * Crear asiento:
+     * - Debe: Caja/Bancos y/o Clientes
+     * - Debe: Descuentos (si aplica)
+     * - Haber: Ingresos (cuentaCodigo)
      */
     const lines = [];
 
-    // Descuento (Debe)
     if (descuento > 0) {
-      lines.push(await buildLine(owner, { code: COD_DESCUENTOS, debit: descuento, credit: 0, memo: "Descuento" }));
+      lines.push(
+        await buildLine(owner, {
+          code: COD_DESCUENTOS,
+          debit: descuento,
+          credit: 0,
+          memo: "Descuento",
+        })
+      );
     }
 
     if (tipoPago === "contado") {
-      lines.push(await buildLine(owner, { code: codCobro, debit: neto, credit: 0, memo: "Cobro contado" }));
-    } else if (tipoPago === "credito") {
-      // si vino montoPagado > 0, lo tratamos como parcial
-      if (montoPagado > 0.01) {
-        const pagado = Math.min(montoPagado, neto);
-        const pendiente = Math.max(0, neto - pagado);
-
-        lines.push(await buildLine(owner, { code: codCobro, debit: pagado, credit: 0, memo: "Cobro inicial" }));
-        if (pendiente > 0) {
-          lines.push(await buildLine(owner, { code: COD_CLIENTES, debit: pendiente, credit: 0, memo: "Saldo pendiente" }));
-        }
-      } else {
-        lines.push(await buildLine(owner, { code: COD_CLIENTES, debit: neto, credit: 0, memo: "Venta a crédito" }));
-      }
+      lines.push(
+        await buildLine(owner, {
+          code: codCobro,
+          debit: neto,
+          credit: 0,
+          memo: "Cobro contado",
+        })
+      );
     } else {
-      // parcial
-      const pagado = Math.min(montoPagado, neto);
-      const pendiente = Math.max(0, neto - pagado);
-
-      if (pagado > 0) lines.push(await buildLine(owner, { code: codCobro, debit: pagado, credit: 0, memo: "Cobro parcial" }));
-      if (pendiente > 0) lines.push(await buildLine(owner, { code: COD_CLIENTES, debit: pendiente, credit: 0, memo: "Saldo pendiente" }));
+      if (montoPagado > 0) {
+        lines.push(
+          await buildLine(owner, {
+            code: codCobro,
+            debit: montoPagado,
+            credit: 0,
+            memo: "Cobro",
+          })
+        );
+      }
+      if (saldoPendiente > 0) {
+        lines.push(
+          await buildLine(owner, {
+            code: COD_CLIENTES,
+            debit: saldoPendiente,
+            credit: 0,
+            memo: "Saldo pendiente",
+          })
+        );
+      }
     }
 
-    // Haber ingresos: si hay descuento separado, haberes por TOTAL; si no, por NETO
     const haberIngresos = descuento > 0 ? total : neto;
-    lines.push(await buildLine(owner, { code: cuentaCodigo, debit: 0, credit: haberIngresos, memo: "Ingreso" }));
+    lines.push(
+      await buildLine(owner, {
+        code: cuentaCodigo,
+        debit: 0,
+        credit: haberIngresos,
+        memo: "Ingreso",
+      })
+    );
 
     const entry = await JournalEntry.create({
       owner,
@@ -300,10 +547,16 @@ router.post("/", ensureAuth, async (req, res) => {
       lines,
     });
 
-    return res.status(201).json({ ok: true, data: { transaction: tx, journalEntry: entry } });
+    return res.status(201).json({
+      ok: true,
+      data: { transaction: tx, journalEntry: entry },
+    });
   } catch (err) {
+    const status = err?.statusCode || 500;
     console.error("POST /api/ingresos error:", err);
-    return res.status(500).json({ ok: false, message: "Error creando ingreso" });
+    return res
+      .status(status)
+      .json({ ok: false, message: err?.message || "Error creando ingreso" });
   }
 });
 
