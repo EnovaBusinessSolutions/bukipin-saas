@@ -5,47 +5,49 @@ const router = express.Router();
 const ensureAuth = require("../middleware/ensureAuth");
 const Account = require("../models/Account");
 
+function normalizeAccountOut(doc) {
+  return {
+    id: doc._id,
+    codigo: doc.codigo ?? doc.code ?? null,
+    nombre: doc.nombre ?? doc.name ?? null,
+    type: doc.type ?? null,
+    category: doc.category ?? "general",
+    parentCode: doc.parentCode ?? null,
+    isActive: typeof doc.isActive === "boolean" ? doc.isActive : true,
+    isDefault: typeof doc.isDefault === "boolean" ? doc.isDefault : false,
+    createdAt: doc.createdAt,
+    updatedAt: doc.updatedAt,
+  };
+}
+
+// Soporta montajes:
+//  - app.use("/api/subcuentas", router) => GET /
+//  - app.use("/api", router)           => GET /subcuentas
+const GET_PATHS = ["/", "/subcuentas"];
+
 /**
  * GET /api/subcuentas
  * Query opcional:
- *  - parentCode=XXXX (o parent_code=XXXX)
- *  - active=true|false (o activo=true|false)
+ *  - parentCode=XXXX  -> filtra subcuentas de una cuenta padre
+ *  - active=true|false -> filtra por isActive
  */
-router.get("/", ensureAuth, async (req, res) => {
+router.get(GET_PATHS, ensureAuth, async (req, res) => {
   try {
     const owner = req.user._id;
-
-    const parentCodeParam = req.query.parentCode ?? req.query.parent_code;
 
     const q = {
       owner,
       parentCode: { $exists: true, $ne: null },
     };
 
-    if (parentCodeParam) {
-      q.parentCode = String(parentCodeParam).trim();
+    if (req.query.parentCode) q.parentCode = String(req.query.parentCode).trim();
+
+    if (typeof req.query.active !== "undefined") {
+      q.isActive = String(req.query.active) === "true";
     }
 
-    const activeParam =
-      typeof req.query.active !== "undefined"
-        ? req.query.active
-        : typeof req.query.activo !== "undefined"
-          ? req.query.activo
-          : undefined;
-
-    if (typeof activeParam !== "undefined") {
-      q.isActive = String(activeParam) === "true";
-    }
-
-    const items = await Account.find(q).sort({ code: 1 }).lean();
-
-    const data = items.map((a) => ({
-      ...a,
-      codigo: a.code,
-      nombre: a.name,
-    }));
-
-    return res.json({ ok: true, data });
+    const items = await Account.find(q).sort({ codigo: 1, code: 1 }).lean();
+    return res.json({ ok: true, data: items.map(normalizeAccountOut) });
   } catch (err) {
     console.error("GET /api/subcuentas error:", err);
     return res.status(500).json({ ok: false, message: "Error cargando subcuentas" });
