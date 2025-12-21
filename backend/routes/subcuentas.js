@@ -8,6 +8,39 @@ const Account = require("../models/Account");
 // Helper: normaliza strings
 const s = (v) => (typeof v === "string" ? v.trim() : v);
 
+function pad(n, size = 2) {
+  return String(n).padStart(size, "0");
+}
+
+async function findParentAccount({ owner, parentCode }) {
+  // Soporta esquemas con code/codigo
+  return Account.findOne({
+    owner,
+    $or: [{ code: parentCode }, { codigo: parentCode }],
+    parentCode: { $in: [null, undefined] }, // cuenta madre no debe tener parentCode
+  }).lean();
+}
+
+async function generateNextSubaccountCode({ owner, parentCode }) {
+  // Códigos tipo: 4001-01, 4001-02, ...
+  const existing = await Account.find({ owner, parentCode })
+    .select({ code: 1, codigo: 1 })
+    .lean();
+
+  const used = new Set(
+    existing
+      .map((x) => String(x.code || x.codigo || "").trim())
+      .filter(Boolean)
+  );
+
+  for (let i = 1; i <= 999; i++) {
+    const candidate = `${parentCode}-${pad(i, 2)}`;
+    if (!used.has(candidate)) return candidate;
+  }
+
+  throw new Error("No hay códigos disponibles para subcuentas (límite alcanzado).");
+}
+
 /**
  * GET /api/subcuentas
  * Query opcional:
@@ -38,30 +71,32 @@ router.get("/", ensureAuth, async (req, res) => {
 
 /**
  * POST /api/subcuentas
- * Body:
- *  - code: string
- *  - name: string
- *  - type: string (ej "ingreso"|"gasto"|...)
- *  - parentCode: string (obligatorio)
- *  - category?: string
+ * ✅ E2E para tu UI: NO exige code.
+ * Body (acepta variantes):
+ *  - nombre | name (requerido)
+ *  - parentCode (requerido)
+ *  - type (opcional) -> si no viene, se hereda de la cuenta madre
+ *  - category (opcional) -> si no viene, se hereda de la cuenta madre
+ *  - code (opcional) -> si viene, lo respeta; si no, lo genera
  */
 router.post("/", ensureAuth, async (req, res) => {
   try {
     const owner = req.user._id;
 
-    const code = s(String(req.body?.code || ""));
-    const name = s(String(req.body?.name || ""));
-    const type = s(String(req.body?.type || ""));
-    const parentCode = s(String(req.body?.parentCode || ""));
-    const category = req.body?.category ? s(String(req.body.category)) : "general";
+    // 🔎 Tip de debug (déjalo unos minutos si quieres confirmar que pega aquí)
+    // console.log("POST /api/subcuentas body =", req.body);
 
-    if (!code) return res.status(400).json({ ok: false, message: "Falta 'code'." });
-    if (!name) return res.status(400).json({ ok: false, message: "Falta 'name'." });
-    if (!type) return res.status(400).json({ ok: false, message: "Falta 'type'." });
+    const name = s(String(req.body?.nombre || req.body?.name || ""));
+    const parentCode = s(String(req.body?.parentCode || req.body?.cuentaCodigo || ""));
+    const incomingCode = s(String(req.body?.code || req.body?.codigo || ""));
+    const incomingType = s(String(req.body?.type || ""));
+    const incomingCategory = req.body?.category ? s(String(req.body.category)) : "";
+
+    if (!name) return res.status(400).json({ ok: false, message: "Falta 'nombre'." });
     if (!parentCode) return res.status(400).json({ ok: false, message: "Falta 'parentCode'." });
 
-    // Validar que exista la cuenta padre del mismo usuario
-    const parent = await Account.findOne({ owner, code: parentCode }).lean();
+    // Validar que exista la cuenta padre del mismo usuario (por code o codigo)
+    const parent = await findParentAccount({ owner, parentCode });
     if (!parent) {
       return res.status(404).json({
         ok: false,
@@ -69,10 +104,20 @@ router.post("/", ensureAuth, async (req, res) => {
       });
     }
 
+    // Si el frontend no manda code (caso real), lo generamos
+    const code = incomingCode || (await generateNextSubaccountCode({ owner, parentCode }));
+
+    // Heredar type/category si no vienen
+    const type = incomingType || parent.type || "general";
+    const category = incomingCategory || parent.category || "general";
+
     const created = await Account.create({
       owner,
+      // soporta ambos esquemas
       code,
+      codigo: code,
       name,
+      nombre: name,
       type,
       category,
       parentCode,
@@ -101,22 +146,36 @@ router.put("/:id", ensureAuth, async (req, res) => {
     const owner = req.user._id;
     const { id } = req.params;
 
-    const allowed = ["code", "name", "type", "category", "parentCode", "isActive"];
+    const allowed = ["code", "codigo", "name", "nombre", "type", "category", "parentCode", "isActive"];
     const patch = {};
 
     for (const k of allowed) {
       if (typeof req.body?.[k] !== "undefined") patch[k] = req.body[k];
     }
 
-    if (typeof patch.code !== "undefined") patch.code = s(String(patch.code));
-    if (typeof patch.name !== "undefined") patch.name = s(String(patch.name));
+    // Normaliza y mantiene espejos (code/codigo y name/nombre)
+    if (typeof patch.code !== "undefined" || typeof patch.codigo !== "undefined") {
+      const nextCode = s(String(patch.code || patch.codigo || ""));
+      patch.code = nextCode;
+      patch.codigo = nextCode;
+    }
+
+    if (typeof patch.name !== "undefined" || typeof patch.nombre !== "undefined") {
+      const nextName = s(String(patch.name || patch.nombre || ""));
+      patch.name = nextName;
+      patch.nombre = nextName;
+    }
+
     if (typeof patch.type !== "undefined") patch.type = s(String(patch.type));
     if (typeof patch.category !== "undefined") patch.category = s(String(patch.category));
-    if (typeof patch.parentCode !== "undefined") patch.parentCode = patch.parentCode ? s(String(patch.parentCode)) : null;
 
-    // Si te cambian parentCode, valida que exista
+    if (typeof patch.parentCode !== "undefined") {
+      patch.parentCode = patch.parentCode ? s(String(patch.parentCode)) : null;
+    }
+
+    // Si te cambian parentCode, valida que exista (por code o codigo)
     if (typeof patch.parentCode !== "undefined" && patch.parentCode) {
-      const parent = await Account.findOne({ owner, code: patch.parentCode }).lean();
+      const parent = await findParentAccount({ owner, parentCode: patch.parentCode });
       if (!parent) {
         return res.status(404).json({
           ok: false,
@@ -151,7 +210,6 @@ router.put("/:id", ensureAuth, async (req, res) => {
 
 /**
  * DELETE /api/subcuentas/:id
- * (Luego lo podemos convertir a soft-delete si lo necesitas)
  */
 router.delete("/:id", ensureAuth, async (req, res) => {
   try {

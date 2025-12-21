@@ -6,9 +6,13 @@ const ensureAuth = require("../middleware/ensureAuth");
 const Account = require("../models/Account");
 
 // Helpers
+const s = (v) => (typeof v === "string" ? v.trim() : v);
+
 function toStr(v) {
-  return typeof v === "string" ? v.trim() : String(v || "").trim();
+  if (v === null || typeof v === "undefined") return "";
+  return String(v).trim();
 }
+
 function toBool(v) {
   if (typeof v === "boolean") return v;
   if (typeof v === "number") return v === 1;
@@ -17,28 +21,52 @@ function toBool(v) {
 }
 
 /**
- * Normaliza una cuenta a un SOLO formato de salida (ES):
- *  - codigo
- *  - nombre
- *  - type
- *  - category
- *  - parentCode
- *  - isActive
- *  - isDefault
+ * Normaliza una cuenta a un formato seguro (ES + EN) para compatibilidad:
+ * - id y _id
+ * - codigo y code
+ * - nombre y name
  */
 function normalizeAccountOut(doc) {
+  const codigo = doc.codigo ?? doc.code ?? null;
+  const nombre = doc.nombre ?? doc.name ?? null;
+
   return {
     id: doc._id,
-    codigo: doc.codigo ?? doc.code ?? null,
-    nombre: doc.nombre ?? doc.name ?? null,
+    _id: doc._id,
+
+    // canonical
+    codigo,
+    nombre,
+
+    // alias compat
+    code: codigo,
+    name: nombre,
+
     type: doc.type ?? null,
     category: doc.category ?? "general",
     parentCode: doc.parentCode ?? null,
+
     isActive: typeof doc.isActive === "boolean" ? doc.isActive : true,
     isDefault: typeof doc.isDefault === "boolean" ? doc.isDefault : false,
+
     createdAt: doc.createdAt,
     updatedAt: doc.updatedAt,
   };
+}
+
+/**
+ * Determina si una cuenta "doc" es cuenta madre:
+ * parentCode == null/undefined
+ */
+function isParentAccount(doc) {
+  return !doc.parentCode;
+}
+
+/**
+ * Revisa si existen subcuentas hijas de un codigo (parentCode)
+ */
+async function hasChildren({ owner, parentCode }) {
+  return !!(await Account.exists({ owner, parentCode }));
 }
 
 // Soporta montajes:
@@ -52,8 +80,27 @@ router.get(GET_PATHS, ensureAuth, async (req, res) => {
     const owner = req.user._id;
 
     const q = { owner };
+
+    // active=true|false
     if (typeof req.query.active !== "undefined") {
       q.isActive = String(req.query.active) === "true";
+    }
+
+    /**
+     * Por defecto: SOLO cuentas madre
+     * - includeSubcuentas=true => incluye todo
+     * - onlySubcuentas=true    => sólo subcuentas
+     */
+    const includeSubcuentas = String(req.query.includeSubcuentas || "false") === "true";
+    const onlySubcuentas = String(req.query.onlySubcuentas || "false") === "true";
+
+    if (!includeSubcuentas) {
+      if (onlySubcuentas) {
+        q.parentCode = { $exists: true, $ne: null };
+      } else {
+        // cuentas madre
+        q.$or = [{ parentCode: null }, { parentCode: { $exists: false } }];
+      }
     }
 
     const items = await Account.find(q)
@@ -79,30 +126,40 @@ router.post(POST_PATHS, ensureAuth, async (req, res) => {
     const parentCodeRaw = req.body?.parentCode ?? null;
     const parentCode = parentCodeRaw ? toStr(parentCodeRaw) : null;
 
+    // Esta ruta es para CUENTAS MADRE. Si te mandan parentCode, mejor guiar.
+    if (parentCode) {
+      return res.status(400).json({
+        ok: false,
+        message: "Para crear subcuentas usa POST /api/subcuentas (no /api/cuentas).",
+      });
+    }
+
     if (!codigo) return res.status(400).json({ ok: false, message: "Falta 'codigo'." });
     if (!nombre) return res.status(400).json({ ok: false, message: "Falta 'nombre'." });
     if (!type) return res.status(400).json({ ok: false, message: "Falta 'type'." });
 
-    // Guardamos en ES como canonical,
-    // y dejamos alias EN por compatibilidad (si tu schema lo permite).
+    // Canonical ES + alias EN
     const created = await Account.create({
       owner,
-      // Canonical ES:
+
       codigo,
       nombre,
-      // Alias EN (si existen en tu schema, no estorban; si no existen, Mongoose los ignora si strict=true)
+
       code: codigo,
       name: nombre,
 
       type,
       category,
-      parentCode,
 
+      parentCode: null,
       isDefault: false,
       isActive: true,
     });
 
-    return res.status(201).json({ ok: true, data: normalizeAccountOut(created.toObject?.() || created) });
+    return res.status(201).json({
+      ok: true,
+      data: normalizeAccountOut(created.toObject?.() || created),
+    });
   } catch (err) {
     if (err && err.code === 11000) {
       return res.status(409).json({
@@ -117,8 +174,7 @@ router.post(POST_PATHS, ensureAuth, async (req, res) => {
 
 // Soporta montajes:
 //  - /api/cuentas/:id
-//  - /api/cuentas/cuentas/:id (si montas raro)
-//  - /api/cuentas/:id si montas en /api y ruta /cuentas/:id
+//  - /api/cuentas/cuentas/:id
 const PUT_PATHS = ["/:id", "/cuentas/:id"];
 const DELETE_PATHS = ["/:id", "/cuentas/:id"];
 
@@ -127,26 +183,59 @@ router.put(PUT_PATHS, ensureAuth, async (req, res) => {
     const owner = req.user._id;
     const { id } = req.params;
 
-    // Acepta parches ES o EN y normaliza a ES
+    const current = await Account.findOne({ _id: id, owner }).lean();
+    if (!current) return res.status(404).json({ ok: false, message: "Cuenta no encontrada." });
+
+    // Acepta parches ES o EN y normaliza a ES+EN
     const patch = {};
 
-    if (typeof req.body?.codigo !== "undefined" || typeof req.body?.code !== "undefined") {
-      const v = toStr(req.body?.codigo ?? req.body?.code);
-      patch.codigo = v;
-      patch.code = v; // alias
+    const nextCodigo =
+      typeof req.body?.codigo !== "undefined" || typeof req.body?.code !== "undefined"
+        ? toStr(req.body?.codigo ?? req.body?.code)
+        : null;
+
+    if (nextCodigo !== null) {
+      // Si es cuenta madre y cambia el código, no permitir si tiene subcuentas
+      const currentCodigo = String(current.codigo ?? current.code ?? "").trim();
+      if (isParentAccount(current) && nextCodigo && nextCodigo !== currentCodigo) {
+        const children = await hasChildren({ owner, parentCode: currentCodigo });
+        if (children) {
+          return res.status(409).json({
+            ok: false,
+            message:
+              "No puedes cambiar el código de esta cuenta porque tiene subcuentas asociadas. Elimina/migra subcuentas primero.",
+          });
+        }
+      }
+
+      patch.codigo = nextCodigo;
+      patch.code = nextCodigo;
     }
 
-    if (typeof req.body?.nombre !== "undefined" || typeof req.body?.name !== "undefined") {
-      const v = toStr(req.body?.nombre ?? req.body?.name);
-      patch.nombre = v;
-      patch.name = v; // alias
+    const nextNombre =
+      typeof req.body?.nombre !== "undefined" || typeof req.body?.name !== "undefined"
+        ? toStr(req.body?.nombre ?? req.body?.name)
+        : null;
+
+    if (nextNombre !== null) {
+      patch.nombre = nextNombre;
+      patch.name = nextNombre;
     }
 
     if (typeof req.body?.type !== "undefined") patch.type = toStr(req.body.type);
     if (typeof req.body?.category !== "undefined") patch.category = toStr(req.body.category);
 
+    // Esta ruta NO debe convertir una cuenta madre en subcuenta.
     if (typeof req.body?.parentCode !== "undefined") {
-      patch.parentCode = req.body.parentCode ? toStr(req.body.parentCode) : null;
+      const requested = req.body.parentCode ? toStr(req.body.parentCode) : null;
+      if (requested) {
+        return res.status(400).json({
+          ok: false,
+          message:
+            "No se permite asignar parentCode desde /api/cuentas. Para subcuentas usa /api/subcuentas.",
+        });
+      }
+      patch.parentCode = null;
     }
 
     if (typeof req.body?.isActive !== "undefined") patch.isActive = toBool(req.body.isActive);
@@ -156,8 +245,6 @@ router.put(PUT_PATHS, ensureAuth, async (req, res) => {
       { $set: patch },
       { new: true }
     ).lean();
-
-    if (!updated) return res.status(404).json({ ok: false, message: "Cuenta no encontrada." });
 
     return res.json({ ok: true, data: normalizeAccountOut(updated) });
   } catch (err) {
@@ -177,9 +264,23 @@ router.delete(DELETE_PATHS, ensureAuth, async (req, res) => {
     const owner = req.user._id;
     const { id } = req.params;
 
-    const deleted = await Account.findOneAndDelete({ _id: id, owner }).lean();
-    if (!deleted) return res.status(404).json({ ok: false, message: "Cuenta no encontrada." });
+    const current = await Account.findOne({ _id: id, owner }).lean();
+    if (!current) return res.status(404).json({ ok: false, message: "Cuenta no encontrada." });
 
+    // Si es cuenta madre, no permitir borrar si tiene subcuentas
+    if (isParentAccount(current)) {
+      const currentCodigo = String(current.codigo ?? current.code ?? "").trim();
+      const children = await hasChildren({ owner, parentCode: currentCodigo });
+      if (children) {
+        return res.status(409).json({
+          ok: false,
+          message:
+            "No puedes eliminar esta cuenta porque tiene subcuentas asociadas. Elimina subcuentas primero.",
+        });
+      }
+    }
+
+    const deleted = await Account.findOneAndDelete({ _id: id, owner }).lean();
     return res.json({ ok: true });
   } catch (err) {
     console.error("DELETE /api/cuentas/:id error:", err);
