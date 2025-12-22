@@ -34,6 +34,22 @@ function parseEndDate(s) {
   return Number.isNaN(d.getTime()) ? null : d;
 }
 
+/**
+ * ✅ NUEVO (mínimo y necesario):
+ * Parse seguro para fecha de transacción (si viene YYYY-MM-DD, lo tratamos como local).
+ * Esto corrige la hora/día que se ve mal en “Detalle de transacción”.
+ */
+function parseTxDate(s) {
+  if (!s) return null;
+  const str = String(s).trim();
+  if (!str) return null;
+
+  const isDateOnly = /^\d{4}-\d{2}-\d{2}$/.test(str);
+  const d = new Date(isDateOnly ? `${str}T00:00:00` : str);
+
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
 function num(v, def = 0) {
   const n = Number(v);
   return Number.isFinite(n) ? n : def;
@@ -449,13 +465,9 @@ router.post("/", ensureAuth, async (req, res) => {
     const descuento = num(req.body?.montoDescuento ?? req.body?.descuento, 0);
     const neto = Math.max(0, total - Math.max(0, descuento));
 
-    // ✅ AQUÍ ESTÁ LA SOLUCIÓN E2E: normalizar valores que manda la UI
+    // ✅ normalizar valores que manda la UI
     const metodoPago = normalizeMetodoPago(req.body?.metodoPago); // efectivo|bancos (tarjeta=>bancos)
     const tipoPago = normalizeTipoPago(req.body?.tipoPago); // contado|parcial|credito
-
-    // (Opcional) dejarlo normalizado para debugging
-    req.body.metodoPago = metodoPago;
-    req.body.tipoPago = tipoPago;
 
     const cuentaCodigo = String(
       req.body?.cuentaCodigo || req.body?.cuentaPrincipalCodigo || "4001"
@@ -463,9 +475,15 @@ router.post("/", ensureAuth, async (req, res) => {
 
     const subcuentaId = req.body?.subcuentaId ?? null;
 
-    const fecha = req.body?.fecha ? new Date(req.body.fecha) : new Date();
-    if (Number.isNaN(fecha.getTime())) {
-      return res.status(400).json({ ok: false, message: "fecha inválida." });
+    // ✅ CAMBIO MÍNIMO: parse robusto de fecha (corrige hora incorrecta en detalle)
+    let fecha = null;
+    if (req.body?.fecha) {
+      fecha = parseTxDate(req.body.fecha);
+      if (!fecha) {
+        return res.status(400).json({ ok: false, message: "fecha inválida." });
+      }
+    } else {
+      fecha = new Date();
     }
 
     const montoPagadoRaw = num(req.body?.montoPagado ?? req.body?.pagado, 0);
@@ -477,7 +495,6 @@ router.post("/", ensureAuth, async (req, res) => {
       return res.status(400).json({ ok: false, message: "montoDescuento no puede ser negativo." });
     }
 
-    // ✅ ahora esto ya no truena cuando UI manda "tarjeta"
     if (!["efectivo", "bancos"].includes(metodoPago)) {
       return res.status(400).json({
         ok: false,
@@ -513,22 +530,20 @@ router.post("/", ensureAuth, async (req, res) => {
     const txPayload = {
       owner,
       fecha,
-      tipoIngreso, // ✅
+      tipoIngreso,
       descripcion,
 
       montoTotal: total,
       montoDescuento: descuento,
       montoNeto: neto,
 
-      metodoPago, // ✅ normalizado
-      tipoPago, // ✅ normalizado
+      metodoPago,
+      tipoPago,
       montoPagado,
 
       cuentaCodigo,
       subcuentaId,
 
-      // Si tu schema NO tiene saldoPendiente, Mongoose lo ignorará (si strict true).
-      // Si lo tiene, lo guardará.
       saldoPendiente,
     };
 
@@ -607,14 +622,13 @@ router.post("/", ensureAuth, async (req, res) => {
       lines,
     });
 
-    // ✅ LO QUE ARREGLA "Asiento undefined"
     const asiento = mapEntryForUI(entry);
     const numeroAsiento = String(entry._id);
 
     return res.status(201).json({
       ok: true,
-      numeroAsiento, // ✅ legacy UI
-      asiento, // ✅ legacy UI (detalle_asientos)
+      numeroAsiento,
+      asiento,
       data: {
         transaction: tx,
         journalEntry: entry,
