@@ -66,6 +66,7 @@ app.use("/api/inventario", require("./routes/inventario"));
 app.use("/api/contabilidad", require("./routes/contabilidad"));
 app.use("/api/movimientos-inventario", require("./routes/movimientosInventario"));
 app.use("/api/asientos", require("./routes/asientos"));
+app.use("/api/productos-egresos", require("./routes/productosEgresos"));
 
 
 
