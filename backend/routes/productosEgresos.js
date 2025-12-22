@@ -4,66 +4,8 @@ const router = express.Router();
 const mongoose = require("mongoose");
 const ensureAuth = require("../middleware/ensureAuth");
 
-/**
- * ✅ Objetivo:
- * - GET por defecto devuelve ARRAY (para que la UI haga .filter()).
- * - Si pasas ?wrap=1 => regresa { ok, data, items, costos, gastos } (legacy/compat).
- * - POST/PATCH/DELETE habilitados para que el catálogo funcione E2E.
- *
- * ✅ Persistencia:
- * - Si existe un modelo real ../models/ProductoEgreso lo usamos.
- * - Si NO existe, creamos un schema mínimo (collection: productos_egresos).
- */
-
-let ProductoEgreso = null;
-
-function getProductoEgresoModel() {
-  if (ProductoEgreso) return ProductoEgreso;
-
-  // 1) Intenta usar un modelo real si lo tienes
-  try {
-    ProductoEgreso = require("../models/ProductoEgreso");
-    return ProductoEgreso;
-  } catch (_) {}
-
-  // 2) Fallback: modelo mínimo para que funcione E2E hoy
-  const schema = new mongoose.Schema(
-    {
-      owner: {
-        type: mongoose.Schema.Types.ObjectId,
-        ref: "User",
-        index: true,
-        required: true,
-      },
-
-      nombre: { type: String, required: true, trim: true },
-
-      // UI manda "Costo"/"Gasto" -> normalizamos a "costo"/"gasto"
-      tipo: {
-        type: String,
-        required: true,
-        enum: ["costo", "gasto"],
-        index: true,
-      },
-
-      descripcion: { type: String, default: "" },
-
-      // Ej: 5001 (Costos) / 5101 (Gastos)
-      cuentaCodigo: { type: String, default: "" },
-
-      // Por compat, lo guardamos como string (puede venir id o nombre)
-      subcuentaId: { type: String, default: null },
-
-      activo: { type: Boolean, default: true, index: true },
-    },
-    { timestamps: true, collection: "productos_egresos" }
-  );
-
-  ProductoEgreso =
-    mongoose.models.ProductoEgreso || mongoose.model("ProductoEgreso", schema);
-
-  return ProductoEgreso;
-}
+const ExpenseProduct = require("../models/ExpenseProduct");
+const ExpenseTransaction = require("../models/ExpenseTransaction");
 
 function asBool(v, def = null) {
   if (v === undefined || v === null || v === "") return def;
@@ -78,11 +20,27 @@ function normalizeTipo(raw) {
   if (!v) return "";
   if (["costo", "costos"].includes(v)) return "costo";
   if (["gasto", "gastos"].includes(v)) return "gasto";
-  return v; // si llega raro, lo validamos arriba
+  return v;
 }
 
-function mapForUI(doc) {
+function toNum(v, def = 0) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : def;
+}
+
+function toObjectIdOrNull(v) {
+  if (v === undefined || v === null) return null;
+  const s = String(v).trim();
+  if (!s) return null;
+  return mongoose.Types.ObjectId.isValid(s) ? new mongoose.Types.ObjectId(s) : null;
+}
+
+function mapForUI(doc, stats = null) {
   const d = doc?.toObject ? doc.toObject() : doc;
+
+  const transacciones = stats?.transacciones ? Number(stats.transacciones) : 0;
+  const precioPromedio = stats?.precioPromedio ? toNum(stats.precioPromedio, 0) : 0;
+  const ultimaCompra = stats?.ultimaCompra ? new Date(stats.ultimaCompra).toISOString() : null;
 
   const item = {
     id: String(d._id),
@@ -97,13 +55,22 @@ function mapForUI(doc) {
 
     activo: !!d.activo,
 
+    // ✅ métricas (la UI las muestra en cards)
+    transacciones,
+    precioPromedio,
+    variacionPrecio: 0, // (luego la calculamos real cuando ya haya transacciones)
+    ultimaCompra,
+
     created_at: d.createdAt,
     updated_at: d.updatedAt,
   };
 
-  // compat snake_case (por si la UI lo usa en algún lado)
+  // compat snake_case (por si en algún lado Lovable lo usa)
   item.cuenta_codigo = item.cuentaCodigo;
   item.subcuenta_id = item.subcuentaId;
+  item.precio_promedio = item.precioPromedio;
+  item.variacion_precio = item.variacionPrecio;
+  item.ultima_compra = item.ultimaCompra;
 
   return item;
 }
@@ -113,11 +80,15 @@ function mapForUI(doc) {
  *
  * ✅ Por defecto: regresa ARRAY (items[])
  * ✅ Si ?wrap=1: regresa wrapper {ok,data,items,costos,gastos}
+ *
+ * Incluye métricas desde ExpenseTransaction:
+ * - transacciones
+ * - precioPromedio
+ * - ultimaCompra
  */
 router.get("/", ensureAuth, async (req, res) => {
   try {
     const wrap = String(req.query.wrap || "").trim() === "1";
-    const Model = getProductoEgresoModel();
     const owner = req.user._id;
 
     const activo = asBool(req.query.activo, null);
@@ -127,25 +98,40 @@ router.get("/", ensureAuth, async (req, res) => {
     if (activo !== null) filter.activo = activo;
     if (tipo && ["costo", "gasto"].includes(tipo)) filter.tipo = tipo;
 
-    const docs = await Model.find(filter).sort({ createdAt: -1 }).lean();
-    const items = docs.map(mapForUI);
+    const docs = await ExpenseProduct.find(filter).sort({ createdAt: -1 }).lean();
+    if (!docs.length) {
+      if (!wrap) return res.json([]);
+      return res.json({ ok: true, data: [], items: [], costos: [], gastos: [] });
+    }
 
-    // ✅ Forma que tu UI (Lovable) suele necesitar: ARRAY directo
+    const ids = docs.map((d) => d._id);
+
+    // métricas agrupadas por productoId
+    const statsAgg = await ExpenseTransaction.aggregate([
+      { $match: { owner, productoId: { $in: ids } } },
+      {
+        $group: {
+          _id: "$productoId",
+          transacciones: { $sum: 1 },
+          precioPromedio: { $avg: "$precioUnitario" },
+          ultimaCompra: { $max: "$fecha" },
+        },
+      },
+    ]);
+
+    const statsById = new Map(statsAgg.map((s) => [String(s._id), s]));
+
+    const items = docs.map((d) => mapForUI(d, statsById.get(String(d._id))));
+
     if (!wrap) {
+      // ✅ Forma que tu UI necesita: ARRAY directo
       return res.json(items);
     }
 
-    // ✅ Wrapper opcional
     const costos = items.filter((x) => x.tipo === "costo");
     const gastos = items.filter((x) => x.tipo === "gasto");
 
-    return res.json({
-      ok: true,
-      data: items,
-      items,
-      costos,
-      gastos,
-    });
+    return res.json({ ok: true, data: items, items, costos, gastos });
   } catch (err) {
     console.error("GET /api/productos-egresos error:", err);
     return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
@@ -154,47 +140,32 @@ router.get("/", ensureAuth, async (req, res) => {
 
 /**
  * POST /api/productos-egresos
- * ✅ Esto corrige el error que viste al “Agregar Gasto/Costo” (POST 404).
+ * Crea item del catálogo (costo/gasto)
  */
 router.post("/", ensureAuth, async (req, res) => {
   try {
-    const Model = getProductoEgresoModel();
     const owner = req.user._id;
 
     const nombre = String(req.body?.nombre ?? "").trim();
     const tipo = normalizeTipo(req.body?.tipo);
 
     if (!nombre) {
-      return res.status(400).json({
-        ok: false,
-        error: "VALIDATION",
-        message: "nombre es requerido.",
-      });
+      return res.status(400).json({ ok: false, error: "VALIDATION", message: "nombre es requerido." });
     }
-
     if (!["costo", "gasto"].includes(tipo)) {
-      return res.status(400).json({
-        ok: false,
-        error: "VALIDATION",
-        message: "tipo inválido. Usa 'costo' o 'gasto'.",
-      });
+      return res.status(400).json({ ok: false, error: "VALIDATION", message: "tipo inválido. Usa 'costo' o 'gasto'." });
     }
 
     const descripcion = String(req.body?.descripcion ?? "").trim();
-    const cuentaCodigo = req.body?.cuentaCodigo
-      ? String(req.body.cuentaCodigo).trim()
-      : "";
+    const cuentaCodigo = req.body?.cuentaCodigo ? String(req.body.cuentaCodigo).trim() : "";
 
-    const subcuentaId =
-      req.body?.subcuentaId !== undefined &&
-      req.body?.subcuentaId !== null &&
-      String(req.body.subcuentaId).trim() !== ""
-        ? String(req.body.subcuentaId).trim()
-        : null;
+    // subcuentaId en tu modelo es ObjectId ref Account
+    // si viene algo raro, lo guardamos null para no romper
+    const subcuentaId = toObjectIdOrNull(req.body?.subcuentaId);
 
     const activo = asBool(req.body?.activo, true);
 
-    const created = await Model.create({
+    const created = await ExpenseProduct.create({
       owner,
       nombre,
       tipo,
@@ -204,13 +175,7 @@ router.post("/", ensureAuth, async (req, res) => {
       activo,
     });
 
-    const item = mapForUI(created);
-
-    return res.status(201).json({
-      ok: true,
-      data: item,
-      item,
-    });
+    return res.status(201).json({ ok: true, data: mapForUI(created) });
   } catch (err) {
     console.error("POST /api/productos-egresos error:", err);
     return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
@@ -219,11 +184,9 @@ router.post("/", ensureAuth, async (req, res) => {
 
 /**
  * PATCH /api/productos-egresos/:id
- * (edición / activar / desactivar)
  */
 router.patch("/:id", ensureAuth, async (req, res) => {
   try {
-    const Model = getProductoEgresoModel();
     const owner = req.user._id;
     const id = String(req.params.id || "").trim();
 
@@ -233,31 +196,34 @@ router.patch("/:id", ensureAuth, async (req, res) => {
     if (req.body?.tipo !== undefined) patch.tipo = normalizeTipo(req.body.tipo);
     if (req.body?.descripcion !== undefined) patch.descripcion = String(req.body.descripcion || "").trim();
     if (req.body?.cuentaCodigo !== undefined) patch.cuentaCodigo = String(req.body.cuentaCodigo || "").trim();
+
     if (req.body?.subcuentaId !== undefined) {
-      patch.subcuentaId =
-        req.body.subcuentaId === null || String(req.body.subcuentaId).trim() === ""
-          ? null
-          : String(req.body.subcuentaId).trim();
+      patch.subcuentaId = toObjectIdOrNull(req.body.subcuentaId);
     }
+
     if (req.body?.activo !== undefined) patch.activo = asBool(req.body.activo, true);
 
     if (patch.tipo && !["costo", "gasto"].includes(patch.tipo)) {
-      return res.status(400).json({
-        ok: false,
-        error: "VALIDATION",
-        message: "tipo inválido.",
-      });
+      return res.status(400).json({ ok: false, error: "VALIDATION", message: "tipo inválido." });
     }
 
-    const updated = await Model.findOneAndUpdate(
-      { _id: id, owner },
-      patch,
-      { new: true }
-    ).lean();
-
+    const updated = await ExpenseProduct.findOneAndUpdate({ _id: id, owner }, patch, { new: true }).lean();
     if (!updated) return res.status(404).json({ ok: false, error: "NOT_FOUND" });
 
-    return res.json({ ok: true, data: mapForUI(updated) });
+    // recalcular métricas de ese producto
+    const stats = await ExpenseTransaction.aggregate([
+      { $match: { owner, productoId: updated._id } },
+      {
+        $group: {
+          _id: "$productoId",
+          transacciones: { $sum: 1 },
+          precioPromedio: { $avg: "$precioUnitario" },
+          ultimaCompra: { $max: "$fecha" },
+        },
+      },
+    ]);
+
+    return res.json({ ok: true, data: mapForUI(updated, stats[0] || null) });
   } catch (err) {
     console.error("PATCH /api/productos-egresos/:id error:", err);
     return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
@@ -266,15 +232,17 @@ router.patch("/:id", ensureAuth, async (req, res) => {
 
 /**
  * DELETE /api/productos-egresos/:id
+ * Borra producto del catálogo y también sus transacciones ligadas.
  */
 router.delete("/:id", ensureAuth, async (req, res) => {
   try {
-    const Model = getProductoEgresoModel();
     const owner = req.user._id;
     const id = String(req.params.id || "").trim();
 
-    const deleted = await Model.findOneAndDelete({ _id: id, owner }).lean();
+    const deleted = await ExpenseProduct.findOneAndDelete({ _id: id, owner }).lean();
     if (!deleted) return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+
+    await ExpenseTransaction.deleteMany({ owner, productoId: deleted._id });
 
     return res.json({ ok: true, data: { id } });
   } catch (err) {
