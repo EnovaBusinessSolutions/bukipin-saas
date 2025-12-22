@@ -35,9 +35,9 @@ function parseEndDate(s) {
 }
 
 /**
- * ✅ NUEVO (mínimo y necesario):
- * Parse seguro para fecha de transacción (si viene YYYY-MM-DD, lo tratamos como local).
- * Esto corrige la hora/día que se ve mal en “Detalle de transacción”.
+ * ✅ Parse seguro para fecha de transacción
+ * - Si viene YYYY-MM-DD => se trata como fecha LOCAL (00:00 local).
+ * - Si viene ISO completo => se respeta.
  */
 function parseTxDate(s) {
   if (!s) return null;
@@ -46,7 +46,6 @@ function parseTxDate(s) {
 
   const isDateOnly = /^\d{4}-\d{2}-\d{2}$/.test(str);
   const d = new Date(isDateOnly ? `${str}T00:00:00` : str);
-
   return Number.isNaN(d.getTime()) ? null : d;
 }
 
@@ -65,8 +64,40 @@ function toYMD(d) {
 }
 
 /**
+ * ✅ Mapeo mínimo COMPAT para transacciones (NO toca DB)
+ * Ayuda a UI Lovable que a veces espera snake_case / campos extra
+ */
+function mapTxForUI(tx) {
+  const fecha = tx.fecha ? new Date(tx.fecha) : null;
+
+  return {
+    ...tx,
+    id: tx._id ? String(tx._id) : tx.id,
+
+    // camelCase canonical
+    fecha,
+    fecha_ymd: fecha ? toYMD(fecha) : null,
+
+    // aliases snake_case (compat)
+    monto_total: tx.montoTotal ?? tx.monto_total ?? 0,
+    monto_descuento: tx.montoDescuento ?? tx.monto_descuento ?? 0,
+    monto_neto: tx.montoNeto ?? tx.monto_neto ?? 0,
+    monto_pagado: tx.montoPagado ?? tx.monto_pagado ?? 0,
+    saldo_pendiente: tx.saldoPendiente ?? tx.saldo_pendiente ?? 0,
+
+    metodo_pago: tx.metodoPago ?? tx.metodo_pago ?? null,
+    tipo_pago: tx.tipoPago ?? tx.tipo_pago ?? null,
+
+    cuenta_codigo: tx.cuentaCodigo ?? tx.cuenta_codigo ?? null,
+
+    created_at: tx.createdAt ?? tx.created_at ?? null,
+    updated_at: tx.updatedAt ?? tx.updated_at ?? null,
+  };
+}
+
+/**
  * Detecta si JournalEntry.lines usa accountId (ObjectId) o accountCodigo (string).
- * Tu modelo (según screenshot) usa accountCodigo.
+ * Tu modelo usa accountCodigo.
  */
 function journalLineMode() {
   const schema = JournalEntry?.schema;
@@ -84,7 +115,6 @@ function journalLineMode() {
     schema.path("lines.0.accountCodigo");
   if (hasAccountCodigo) return "code";
 
-  // fallback legacy
   const hasAccountCode =
     schema.path("lines.accountCode") ||
     schema.path("lines.$.accountCode") ||
@@ -105,7 +135,6 @@ async function accountIdByCode(owner, code) {
 
 /**
  * Construye una línea de asiento compatible con tu schema.
- * Importante: si tu schema requiere accountId y no existe la cuenta, fallamos con mensaje claro.
  */
 async function buildLine(owner, { code, debit = 0, credit = 0, memo = "" }) {
   const mode = journalLineMode();
@@ -128,7 +157,6 @@ async function buildLine(owner, { code, debit = 0, credit = 0, memo = "" }) {
     return { ...base, accountId: id };
   }
 
-  // ✅ Tu JournalEntry usa accountCodigo
   return { ...base, accountCodigo: String(code).trim() };
 }
 
@@ -189,14 +217,11 @@ function flattenDetalles(entries) {
 function normalizeMetodoPago(raw) {
   let v = typeof raw === "string" ? raw.trim().toLowerCase() : "";
 
-  // UI suele mandar "tarjeta" pero el backend trabaja con "bancos"
   if (["tarjeta", "transferencia", "spei", "banco", "bancos"].includes(v)) return "bancos";
   if (["efectivo", "cash", "caja"].includes(v)) return "efectivo";
 
-  // Si viene vacío, cae a efectivo (default)
   if (!v) return "efectivo";
-
-  return v; // lo validaremos después
+  return v;
 }
 
 function normalizeTipoPago(raw) {
@@ -245,7 +270,6 @@ router.get("/clientes-min", ensureAuth, async (req, res) => {
 
 /**
  * GET /api/ingresos/asientos?start=YYYY-MM-DD&end=YYYY-MM-DD
- * Devuelve asientos con detalle_asientos
  */
 router.get("/asientos", ensureAuth, async (req, res) => {
   try {
@@ -274,7 +298,7 @@ router.get("/asientos", ensureAuth, async (req, res) => {
     return res.json({
       ok: true,
       data: { asientos },
-      asientos, // compat legacy
+      asientos,
     });
   } catch (err) {
     console.error("GET /api/ingresos/asientos error:", err);
@@ -284,7 +308,6 @@ router.get("/asientos", ensureAuth, async (req, res) => {
 
 /**
  * GET /api/ingresos/detalles?start=YYYY-MM-DD&end=YYYY-MM-DD
- * Devuelve detalles contables aplanados + items/resumen (compat)
  */
 router.get("/detalles", ensureAuth, async (req, res) => {
   try {
@@ -300,7 +323,6 @@ router.get("/detalles", ensureAuth, async (req, res) => {
       });
     }
 
-    // 1) Asientos para detalles contables
     const entries = await JournalEntry.find({
       owner,
       date: { $gte: start, $lte: end },
@@ -311,27 +333,28 @@ router.get("/detalles", ensureAuth, async (req, res) => {
 
     const detalles = flattenDetalles(entries);
 
-    // 2) Transacciones (por si la UI las usa también)
-    const items = await IncomeTransaction.find({
+    const itemsRaw = await IncomeTransaction.find({
       owner,
       fecha: { $gte: start, $lte: end },
     })
       .sort({ fecha: -1, createdAt: -1 })
       .lean();
 
-    const total = items.reduce((acc, it) => acc + num(it.montoNeto ?? it.montoTotal ?? 0), 0);
+    // ✅ Compat seguro: devolvemos items normalizados para la UI
+    const items = itemsRaw.map(mapTxForUI);
+
+    const total = itemsRaw.reduce((acc, it) => acc + num(it.montoNeto ?? it.montoTotal ?? 0), 0);
 
     return res.json({
       ok: true,
       data: {
         detalles,
         items,
-        resumen: { total, count: items.length },
+        resumen: { total, count: itemsRaw.length },
       },
-      // compat legacy
       detalles,
       items,
-      resumen: { total, count: items.length },
+      resumen: { total, count: itemsRaw.length },
     });
   } catch (err) {
     console.error("GET /api/ingresos/detalles error:", err);
@@ -341,7 +364,6 @@ router.get("/detalles", ensureAuth, async (req, res) => {
 
 /**
  * GET /api/ingresos/asientos-directos?limit=300
- * Asientos sin transacción ligada (sourceId null). start/end opcional.
  */
 router.get("/asientos-directos", ensureAuth, async (req, res) => {
   try {
@@ -385,10 +407,12 @@ router.get("/recientes", ensureAuth, async (req, res) => {
     const owner = req.user._id;
     const limit = Math.min(2000, Number(req.query.limit || 1000));
 
-    const items = await IncomeTransaction.find({ owner })
+    const itemsRaw = await IncomeTransaction.find({ owner })
       .sort({ fecha: -1, createdAt: -1 })
       .limit(limit)
       .lean();
+
+    const items = itemsRaw.map(mapTxForUI);
 
     return res.json({ ok: true, data: items, items });
   } catch (err) {
@@ -399,10 +423,6 @@ router.get("/recientes", ensureAuth, async (req, res) => {
 
 /**
  * POST /api/ingresos/:id/cancelar
- * Compat con UI legacy: hoy tu UI muestra "reversión", pero si tu modelo no soporta estado,
- * mantenemos compat: borramos transacción + asiento ligado y devolvemos numeroAsientoCancelado.
- *
- * (Si quieres que cree reversión y marque cancelada, lo hacemos en un siguiente paso con tu schema real.)
  */
 router.post("/:id/cancelar", ensureAuth, async (req, res) => {
   try {
@@ -412,7 +432,6 @@ router.post("/:id/cancelar", ensureAuth, async (req, res) => {
     const tx = await IncomeTransaction.findOne({ _id: id, owner });
     if (!tx) return res.status(404).json({ ok: false, message: "Ingreso no encontrado." });
 
-    // Encuentra asientos ligados para devolver "numeroAsientoCancelado"
     const linked = await JournalEntry.findOne({
       owner,
       source: "ingreso",
@@ -440,34 +459,20 @@ router.post("/:id/cancelar", ensureAuth, async (req, res) => {
 /**
  * POST /api/ingresos
  * Crea transacción + asiento contable.
- *
- * Acepta llaves legacy y nuevas:
- * - tipoIngreso (precargados|inventariados|general|otros)
- * - descripcion
- * - montoTotal / total
- * - montoDescuento / descuento
- * - metodoPago: efectivo|bancos  (✅ acepta "tarjeta" y lo normaliza a "bancos")
- * - tipoPago: contado|parcial|credito
- * - montoPagado / pagado
- * - cuentaCodigo OR cuentaPrincipalCodigo (default 4001)
- * - subcuentaId (opcional)
- * - fecha (opcional)
- * - clienteId/clientId (opcional)
  */
 router.post("/", ensureAuth, async (req, res) => {
   try {
     const owner = req.user._id;
 
-    const tipoIngreso = String(req.body?.tipoIngreso || "general"); // UI lo manda
+    const tipoIngreso = String(req.body?.tipoIngreso || "general");
     const descripcion = String(req.body?.descripcion || "Ingreso").trim();
 
     const total = num(req.body?.montoTotal ?? req.body?.total, 0);
     const descuento = num(req.body?.montoDescuento ?? req.body?.descuento, 0);
     const neto = Math.max(0, total - Math.max(0, descuento));
 
-    // ✅ normalizar valores que manda la UI
-    const metodoPago = normalizeMetodoPago(req.body?.metodoPago); // efectivo|bancos (tarjeta=>bancos)
-    const tipoPago = normalizeTipoPago(req.body?.tipoPago); // contado|parcial|credito
+    const metodoPago = normalizeMetodoPago(req.body?.metodoPago);
+    const tipoPago = normalizeTipoPago(req.body?.tipoPago);
 
     const cuentaCodigo = String(
       req.body?.cuentaCodigo || req.body?.cuentaPrincipalCodigo || "4001"
@@ -475,7 +480,7 @@ router.post("/", ensureAuth, async (req, res) => {
 
     const subcuentaId = req.body?.subcuentaId ?? null;
 
-    // ✅ CAMBIO MÍNIMO: parse robusto de fecha (corrige hora incorrecta en detalle)
+    // ✅ CAMBIO MÍNIMO: parse robusto de fecha (corrige hora incorrecta)
     let fecha = null;
     if (req.body?.fecha) {
       fecha = parseTxDate(req.body.fecha);
@@ -496,37 +501,25 @@ router.post("/", ensureAuth, async (req, res) => {
     }
 
     if (!["efectivo", "bancos"].includes(metodoPago)) {
-      return res.status(400).json({
-        ok: false,
-        message: "metodoPago inválido (efectivo|bancos).",
-      });
+      return res.status(400).json({ ok: false, message: "metodoPago inválido (efectivo|bancos)." });
     }
     if (!["contado", "parcial", "credito"].includes(tipoPago)) {
-      return res.status(400).json({
-        ok: false,
-        message: "tipoPago inválido (contado|parcial|credito).",
-      });
+      return res.status(400).json({ ok: false, message: "tipoPago inválido (contado|parcial|credito)." });
     }
     if (tipoPago === "parcial" && (montoPagadoRaw < 0 || montoPagadoRaw > neto)) {
-      return res.status(400).json({
-        ok: false,
-        message: "montoPagado debe estar entre 0 y montoNeto.",
-      });
+      return res.status(400).json({ ok: false, message: "montoPagado debe estar entre 0 y montoNeto." });
     }
 
-    // Normalización de pagado / pendiente
     const montoPagado =
       tipoPago === "contado" ? neto : Math.min(Math.max(montoPagadoRaw, 0), neto);
     const saldoPendiente = tipoPago === "contado" ? 0 : Math.max(0, neto - montoPagado);
 
-    // Códigos base (ajústalos a tu seed real)
     const COD_CAJA = "1001";
     const COD_BANCOS = "1002";
     const COD_CLIENTES = "1101";
     const COD_DESCUENTOS = "4002";
     const codCobro = metodoPago === "bancos" ? COD_BANCOS : COD_CAJA;
 
-    // Armar transacción
     const txPayload = {
       owner,
       fecha,
@@ -543,7 +536,6 @@ router.post("/", ensureAuth, async (req, res) => {
 
       cuentaCodigo,
       subcuentaId,
-
       saldoPendiente,
     };
 
@@ -552,12 +544,6 @@ router.post("/", ensureAuth, async (req, res) => {
 
     const tx = await IncomeTransaction.create(txPayload);
 
-    /**
-     * Crear asiento:
-     * - Debe: Caja/Bancos y/o Clientes
-     * - Debe: Descuentos (si aplica)
-     * - Haber: Ingresos (cuentaCodigo)
-     */
     const lines = [];
 
     if (descuento > 0) {
@@ -625,12 +611,16 @@ router.post("/", ensureAuth, async (req, res) => {
     const asiento = mapEntryForUI(entry);
     const numeroAsiento = String(entry._id);
 
+    // ✅ devolvemos transaction también “compat” (esto ayuda al modal)
+    const txUI = mapTxForUI(tx.toObject ? tx.toObject() : tx);
+
     return res.status(201).json({
       ok: true,
       numeroAsiento,
       asiento,
+      transaction: txUI, // compat extra
       data: {
-        transaction: tx,
+        transaction: txUI,
         journalEntry: entry,
         asiento,
         numeroAsiento,
@@ -639,9 +629,7 @@ router.post("/", ensureAuth, async (req, res) => {
   } catch (err) {
     const status = err?.statusCode || 500;
     console.error("POST /api/ingresos error:", err);
-    return res
-      .status(status)
-      .json({ ok: false, message: err?.message || "Error creando ingreso" });
+    return res.status(status).json({ ok: false, message: err?.message || "Error creando ingreso" });
   }
 });
 
