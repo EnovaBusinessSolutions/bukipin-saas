@@ -42,13 +42,24 @@ function normalizeTipoPago(v) {
   if (["parcial", "parciales"].includes(s)) return "parcial";
   return s;
 }
+
+/**
+ * ✅ Canonical FE/BE:
+ * - efectivo
+ * - bancos
+ * - tarjeta_credito_<id>
+ *
+ * Compat:
+ * - tarjeta-transferencia => bancos
+ * - transferencia => bancos
+ */
 function normalizeMetodoPago(v) {
   const s = asTrim(v).toLowerCase();
-  // frontend usa: efectivo | tarjeta-transferencia | tarjeta_credito_<id>
   if (!s) return "";
-  if (s === "bancos" || s === "transferencia" || s === "tarjeta-transferencia") return "tarjeta-transferencia";
+  if (s === "bancos" || s === "transferencia" || s === "tarjeta-transferencia") return "bancos";
   return s;
 }
+
 function toObjectIdOrNull(v) {
   if (v === undefined || v === null) return null;
   if (v instanceof mongoose.Types.ObjectId) return v;
@@ -56,12 +67,23 @@ function toObjectIdOrNull(v) {
   if (!s) return null;
   return mongoose.Types.ObjectId.isValid(s) ? new mongoose.Types.ObjectId(s) : null;
 }
+
+/**
+ * ✅ Evita bugs de timezone con YYYY-MM-DD
+ * - Si viene YYYY-MM-DD => interpretamos local "T00:00:00"
+ * - Si viene ISO => Date(ISO)
+ */
 function isoDateOrNull(v) {
   const s = asTrim(v);
   if (!s) return null;
-  // soporta YYYY-MM-DD o ISO
+
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
+    const d = new Date(`${s}T00:00:00`);
+    if (Number.isNaN(d.getTime())) return null;
+    return d;
+  }
+
   const d = new Date(s);
-  // invalid date
   if (Number.isNaN(d.getTime())) return null;
   return d;
 }
@@ -92,7 +114,11 @@ function mapTxForUI(doc) {
     descripcion: d.descripcion ?? "",
 
     cuenta_codigo: d.cuentaCodigo ?? d.cuenta_codigo ?? "",
-    subcuenta_id: d.subcuentaId ? String(d.subcuentaId) : (d.subcuenta_id ? String(d.subcuenta_id) : null),
+    subcuenta_id: d.subcuentaId
+      ? String(d.subcuentaId)
+      : d.subcuenta_id
+      ? String(d.subcuenta_id)
+      : null,
 
     monto_total: toNum(d.montoTotal ?? d.monto_total, 0),
     cantidad: toNum(d.cantidad, 0),
@@ -104,12 +130,14 @@ function mapTxForUI(doc) {
     monto_pagado: toNum(d.montoPagado ?? d.monto_pagado, 0),
     monto_pendiente: toNum(d.montoPendiente ?? d.monto_pendiente, 0),
 
-    fecha: d.fecha ? new Date(d.fecha).toISOString() : (d.createdAt ? new Date(d.createdAt).toISOString() : null),
+    fecha: d.fecha ? new Date(d.fecha).toISOString() : d.createdAt ? new Date(d.createdAt).toISOString() : null,
     fecha_vencimiento: d.fechaVencimiento
       ? new Date(d.fechaVencimiento).toISOString()
-      : (d.fecha_vencimiento ? new Date(d.fecha_vencimiento).toISOString() : null),
+      : d.fecha_vencimiento
+      ? new Date(d.fecha_vencimiento).toISOString()
+      : null,
 
-    proveedor_id: d.proveedorId ? String(d.proveedorId) : (d.proveedor_id ? String(d.proveedor_id) : null),
+    proveedor_id: d.proveedorId ? String(d.proveedorId) : d.proveedor_id ? String(d.proveedor_id) : null,
     proveedor_nombre: d.proveedorNombre ?? d.proveedor_nombre ?? null,
     proveedor_telefono: d.proveedorTelefono ?? d.proveedor_telefono ?? null,
     proveedor_email: d.proveedorEmail ?? d.proveedor_email ?? null,
@@ -117,7 +145,13 @@ function mapTxForUI(doc) {
 
     producto_egreso_id: d.productoEgresoId
       ? String(d.productoEgresoId)
-      : (d.producto_egreso_id ? String(d.producto_egreso_id) : (d.productoId ? String(d.productoId) : (d.productId ? String(d.productId) : null))),
+      : d.producto_egreso_id
+      ? String(d.producto_egreso_id)
+      : d.productoId
+      ? String(d.productoId)
+      : d.productId
+      ? String(d.productId)
+      : null,
 
     comentarios: d.comentarios ?? null,
 
@@ -127,7 +161,7 @@ function mapTxForUI(doc) {
     updated_at: d.updatedAt ?? d.updated_at ?? null,
   };
 
-  // espejo camelCase por compat (si lo necesitas)
+  // espejo camelCase por compat
   item.tipoEgreso = item.tipo_egreso;
   item.subtipoEgreso = item.subtipo_egreso;
   item.cuentaCodigo = item.cuenta_codigo;
@@ -135,7 +169,7 @@ function mapTxForUI(doc) {
   item.montoTotal = item.monto_total;
   item.precioUnitario = item.precio_unitario;
   item.tipoPago = item.tipo_pago;
-  item.metodoPago = item.metodo_pago;
+  item.metodoPago = item.metodo_pago; // ya canonical ("bancos"/"efectivo"/"tarjeta_credito_*")
   item.montoPagado = item.monto_pagado;
   item.montoPendiente = item.monto_pendiente;
   item.fechaVencimiento = item.fecha_vencimiento;
@@ -161,19 +195,16 @@ function genNumeroAsiento(ownerId) {
  * Ajusta estos códigos a tu catálogo contable real si ya lo tienes.
  */
 function resolveCreditAccountByMetodoPago(metodoPago) {
-  // Defaults (puedes moverlos a ENV):
   const CASH = process.env.CTA_EFECTIVO || "1001";
   const BANK = process.env.CTA_BANCOS || "1002";
-  const CXP = process.env.CTA_CXP || "2001"; // Cuentas por pagar / Proveedores
+  const CXP = process.env.CTA_CXP || "2001"; // no se usa aquí directo pero queda documentado
 
   if (!metodoPago) return { tipo: "unknown", cuentaCodigo: BANK, meta: {} };
 
   if (metodoPago === "efectivo") return { tipo: "cash", cuentaCodigo: CASH, meta: {} };
-  if (metodoPago === "tarjeta-transferencia") return { tipo: "bank", cuentaCodigo: BANK, meta: {} };
+  if (metodoPago === "bancos") return { tipo: "bank", cuentaCodigo: BANK, meta: {} };
 
-  // tarjeta_credito_<id>
   if (metodoPago.startsWith("tarjeta_credito_")) {
-    // Puedes mapear a una cuenta puente o “tarjetas por pagar”
     const CC = process.env.CTA_TARJETAS_CREDITO || "2101";
     return { tipo: "credit_card", cuentaCodigo: CC, meta: { tarjetaId: metodoPago.replace("tarjeta_credito_", "") } };
   }
@@ -184,15 +215,12 @@ function resolveCreditAccountByMetodoPago(metodoPago) {
 /**
  * POST /api/transacciones/egresos
  * Crea la transacción de egreso y (si existe el modelo) su asiento contable.
- *
- * Devuelve:
- * { ok:true, egreso_id, numero_asiento, data:{...} }
  */
 router.post("/", ensureAuth, async (req, res) => {
   try {
     const owner = req.user._id;
 
-    // Acepta snake_case (frontend) y camelCase (por compat)
+    // Acepta snake_case y camelCase
     const tipoEgreso = normalizeTipoEgreso(req.body?.tipo_egreso ?? req.body?.tipoEgreso);
     const subtipoEgreso = asTrim(req.body?.subtipo_egreso ?? req.body?.subtipoEgreso ?? "precargado");
     const descripcion = asTrim(req.body?.descripcion);
@@ -219,12 +247,13 @@ router.post("/", ensureAuth, async (req, res) => {
     const proveedorEmail = asTrim(req.body?.proveedor_email ?? req.body?.proveedorEmail ?? "");
     const proveedorRfc = asTrim(req.body?.proveedor_rfc ?? req.body?.proveedorRfc ?? "");
 
-    const productoEgresoIdRaw = req.body?.producto_egreso_id ?? req.body?.productoEgresoId ?? req.body?.productoId ?? req.body?.productId;
+    const productoEgresoIdRaw =
+      req.body?.producto_egreso_id ?? req.body?.productoEgresoId ?? req.body?.productoId ?? req.body?.productId;
     const productoEgresoId = toObjectIdOrNull(productoEgresoIdRaw);
 
     const comentarios = asTrim(req.body?.comentarios ?? "");
 
-    // ✅ Validaciones “E2E”
+    // ✅ Validaciones principales (sin tocar tu lógica existente más de lo necesario)
     if (!["costo", "gasto"].includes(tipoEgreso)) {
       return res.status(400).json({ ok: false, error: "VALIDATION", message: "tipo_egreso inválido (usa costo|gasto)." });
     }
@@ -251,10 +280,6 @@ router.post("/", ensureAuth, async (req, res) => {
       if (!metodoPago) {
         return res.status(400).json({ ok: false, error: "VALIDATION", message: "metodo_pago es requerido para contado." });
       }
-      // En contado pagas todo
-      if (Math.abs(montoPagado - montoTotal) > 0.01 && montoPagado !== 0) {
-        // Permitimos que venga 0 y lo corregimos; si viene distinto, lo normalizamos
-      }
     }
 
     if (tipoPago === "parcial") {
@@ -268,11 +293,6 @@ router.post("/", ensureAuth, async (req, res) => {
           message: "En parcial, monto_pagado debe ser > 0 y < monto_total.",
         });
       }
-    }
-
-    if (tipoPago === "credito") {
-      // crédito: normalmente no hay pago inicial
-      // due date recomendado pero no obligatorio
     }
 
     // ✅ Validar que el producto exista y pertenezca al owner (si viene)
@@ -289,15 +309,14 @@ router.post("/", ensureAuth, async (req, res) => {
     }
 
     // ✅ Normalizaciones finales
-    const fixedMontoPagado =
-      tipoPago === "contado" ? montoTotal : tipoPago === "parcial" ? montoPagado : 0;
+    const fixedMontoPagado = tipoPago === "contado" ? montoTotal : tipoPago === "parcial" ? montoPagado : 0;
 
     const fixedMontoPendiente =
       tipoPago === "contado" ? 0 : tipoPago === "parcial" ? Math.max(0, montoTotal - fixedMontoPagado) : montoTotal;
 
     const numeroAsiento = genNumeroAsiento(owner);
 
-    // ✅ Construcción del documento según tu schema real (camelCase como canonical)
+    // ✅ Construcción del documento (camelCase canonical)
     const txPayload = {
       owner,
 
@@ -313,13 +332,13 @@ router.post("/", ensureAuth, async (req, res) => {
       precioUnitario,
 
       tipoPago,
-      metodoPago: metodoPago || null,
+      metodoPago: metodoPago || null, // canonical: efectivo | bancos | tarjeta_credito_*
 
       montoPagado: fixedMontoPagado,
       montoPendiente: fixedMontoPendiente,
 
       fecha,
-      fechaVencimiento: (tipoPago === "credito" || tipoPago === "parcial") ? (fechaVencimiento || null) : null,
+      fechaVencimiento: tipoPago === "credito" || tipoPago === "parcial" ? fechaVencimiento || null : null,
 
       proveedorId,
       proveedorNombre: proveedorNombre || null,
@@ -341,12 +360,6 @@ router.post("/", ensureAuth, async (req, res) => {
     const created = await ExpenseTransaction.create(txPayload);
 
     // ✅ Crear asiento contable (si existe modelo)
-    // Reglas:
-    // - Debe (debit): cuenta del gasto/costo por montoTotal
-    // - Haber (credit):
-    //   - contado: caja/banco/tarjeta por montoTotal
-    //   - crédito: CXP por montoTotal
-    //   - parcial: caja/banco/tarjeta por montoPagado + CXP por montoPendiente
     let asiento = null;
     if (JournalEntry) {
       const CXP = process.env.CTA_CXP || "2001";
@@ -403,8 +416,6 @@ router.post("/", ensureAuth, async (req, res) => {
         }
       }
 
-      // Guardar asiento (adaptable)
-      // Nota: si tu schema de JournalEntry es diferente, ajusta keys aquí.
       asiento = await JournalEntry.create({
         owner,
         fuente: "egreso",
@@ -439,7 +450,7 @@ router.post("/", ensureAuth, async (req, res) => {
       asiento_id: asiento ? String(asiento._id) : null,
       data: item,
       item,
-      ...item, // root (por compat con tu frontend que a veces lee root)
+      ...item, // root (compat)
     });
   } catch (err) {
     console.error("POST /api/transacciones/egresos error:", err);
@@ -465,7 +476,6 @@ router.get("/", ensureAuth, async (req, res) => {
       filter.fecha = {};
       if (start) filter.fecha.$gte = start;
       if (end) {
-        // end inclusivo si viene YYYY-MM-DD
         const e = new Date(end);
         e.setHours(23, 59, 59, 999);
         filter.fecha.$lte = e;
