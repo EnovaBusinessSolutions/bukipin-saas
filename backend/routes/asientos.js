@@ -1,7 +1,7 @@
 const express = require("express");
 const router = express.Router();
 const JournalEntry = require("../models/JournalEntry"); // ajusta ruta/nombre si difiere
-const ensureAuthenticated = require("../middleware/ensureAuthenticated"); // ajusta si se llama distinto
+const ensureAuthenticated = require("../middleware/ensureAuth"); // ajusta si se llama distinto
 
 // GET /api/asientos/by-transaccion?source=ingresos&id=XXXXXXXX
 router.get("/by-transaccion", ensureAuthenticated, async (req, res) => {
