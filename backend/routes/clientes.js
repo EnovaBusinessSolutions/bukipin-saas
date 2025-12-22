@@ -5,16 +5,50 @@ const router = express.Router();
 const ensureAuth = require("../middleware/ensureAuth");
 const Client = require("../models/Client");
 
-function boolFromQuery(v) {
-  if (typeof v === "undefined") return undefined;
-  const s = String(v).toLowerCase();
-  return s === "true" || s === "1" || s === "yes";
+function boolFromAny(v, defaultValue = undefined) {
+  if (typeof v === "undefined" || v === null) return defaultValue;
+  if (typeof v === "boolean") return v;
+
+  const s = String(v).toLowerCase().trim();
+  if (["true", "1", "yes", "y", "si", "sí"].includes(s)) return true;
+  if (["false", "0", "no", "n"].includes(s)) return false;
+
+  return defaultValue;
+}
+
+function cleanStr(v) {
+  const s = (v ?? "").toString().trim();
+  return s ? s : undefined;
+}
+
+// ✅ Normaliza respuesta para que el frontend tenga SIEMPRE alias en español
+function normalizeCliente(doc) {
+  if (!doc) return doc;
+
+  const nombre = doc.name || "";
+  const telefono = doc.phone || "";
+  const activo = typeof doc.isActive !== "undefined" ? doc.isActive : true;
+
+  return {
+    ...doc,
+
+    // Canónicos (schema real)
+    name: doc.name,
+    email: doc.email,
+    phone: doc.phone,
+    isActive: doc.isActive,
+
+    // Aliases para compat con UI Lovable
+    nombre,
+    telefono,
+    activo,
+  };
 }
 
 /**
  * GET /api/clientes
  * Query opcional:
- * - q=texto (busca por nombre/email/rfc)
+ * - q=texto (busca por nombre/email/phone)
  * - activo=true|false
  * - limit=500
  */
@@ -23,32 +57,31 @@ router.get("/", ensureAuth, async (req, res) => {
     const owner = req.user._id;
 
     const qText = req.query.q ? String(req.query.q).trim() : "";
-    const activo = boolFromQuery(req.query.activo);
+    const activo = boolFromAny(req.query.activo, undefined);
     const limit = Math.min(2000, Number(req.query.limit || 500));
 
     const q = { owner };
 
+    // ✅ En schema real solo existe isActive
     if (typeof activo !== "undefined") {
-      // soporta activo o isActive dependiendo de tu schema
-      q.$or = [{ activo }, { isActive: activo }];
+      q.isActive = activo;
     }
 
     if (qText) {
       q.$and = q.$and || [];
       q.$and.push({
         $or: [
-          { nombre: { $regex: qText, $options: "i" } },
           { name: { $regex: qText, $options: "i" } },
           { email: { $regex: qText, $options: "i" } },
-          { rfc: { $regex: qText, $options: "i" } },
-          { telefono: { $regex: qText, $options: "i" } },
           { phone: { $regex: qText, $options: "i" } },
         ],
       });
     }
 
     const items = await Client.find(q).sort({ createdAt: -1 }).limit(limit).lean();
-    return res.json({ ok: true, data: items });
+    const data = (items || []).map(normalizeCliente);
+
+    return res.json({ ok: true, data });
   } catch (err) {
     console.error("GET /api/clientes error:", err);
     return res.status(500).json({ ok: false, message: "Error cargando clientes" });
@@ -58,43 +91,40 @@ router.get("/", ensureAuth, async (req, res) => {
 /**
  * POST /api/clientes
  * Body mínimo:
- * - nombre
+ * - nombre o name
  * Opcional:
- * - email, rfc, telefono, direccion, activo
+ * - email, telefono/phone, activo/isActive
  */
 router.post("/", ensureAuth, async (req, res) => {
   try {
     const owner = req.user._id;
 
-    const nombre = (req.body?.nombre ?? req.body?.name ?? "").toString().trim();
-    const email = (req.body?.email ?? "").toString().trim();
-    const rfc = (req.body?.rfc ?? "").toString().trim();
-    const telefono = (req.body?.telefono ?? req.body?.phone ?? "").toString().trim();
-    const direccion = (req.body?.direccion ?? req.body?.address ?? "").toString();
+    const name = (req.body?.name ?? req.body?.nombre ?? "").toString().trim();
+    const email = cleanStr(req.body?.email);
+    const phone = cleanStr(req.body?.phone ?? req.body?.telefono);
+    const isActive = boolFromAny(req.body?.isActive ?? req.body?.activo, true);
 
-    const activoRaw = req.body?.activo ?? req.body?.isActive;
-    const activo = typeof activoRaw === "undefined" ? true : Boolean(activoRaw);
-
-    if (!nombre) {
-      return res.status(400).json({ ok: false, message: "El nombre es requerido." });
+    if (!name) {
+      return res.status(400).json({ ok: false, message: "El nombre del cliente es requerido." });
     }
 
+    // ✅ Guarda SOLO campos existentes en el schema
     const created = await Client.create({
       owner,
-      nombre,
+      name,
       email,
-      rfc,
-      telefono,
-      direccion,
-      activo,
+      phone,
+      isActive,
     });
 
-    return res.status(201).json({ ok: true, data: created });
+    const createdLean = created.toObject ? created.toObject() : created;
+    return res.status(201).json({ ok: true, data: normalizeCliente(createdLean) });
   } catch (err) {
     if (err && err.code === 11000) {
       return res.status(409).json({
         ok: false,
-        message: "Ya existe un cliente con ese RFC/email para este usuario.",
+        message: "Ya existe un cliente duplicado para este usuario.",
+        key: err.keyValue || undefined,
       });
     }
     console.error("POST /api/clientes error:", err);
@@ -104,23 +134,33 @@ router.post("/", ensureAuth, async (req, res) => {
 
 /**
  * PUT /api/clientes/:id
+ * Permite actualizar con español/inglés pero guarda canónico
  */
 router.put("/:id", ensureAuth, async (req, res) => {
   try {
     const owner = req.user._id;
     const { id } = req.params;
 
-    const allowed = ["nombre", "email", "rfc", "telefono", "direccion", "activo"];
     const patch = {};
 
-    for (const k of allowed) {
-      if (typeof req.body?.[k] !== "undefined") patch[k] = req.body[k];
+    if (typeof req.body?.name !== "undefined" || typeof req.body?.nombre !== "undefined") {
+      const n = (req.body?.name ?? req.body?.nombre ?? "").toString().trim();
+      patch.name = n;
     }
 
-    if (typeof patch.nombre !== "undefined") patch.nombre = String(patch.nombre).trim();
-    if (typeof patch.email !== "undefined") patch.email = String(patch.email).trim();
-    if (typeof patch.rfc !== "undefined") patch.rfc = String(patch.rfc).trim();
-    if (typeof patch.telefono !== "undefined") patch.telefono = String(patch.telefono).trim();
+    if (typeof req.body?.email !== "undefined") patch.email = cleanStr(req.body.email);
+
+    if (typeof req.body?.phone !== "undefined" || typeof req.body?.telefono !== "undefined") {
+      patch.phone = cleanStr(req.body?.phone ?? req.body?.telefono);
+    }
+
+    if (typeof req.body?.isActive !== "undefined" || typeof req.body?.activo !== "undefined") {
+      patch.isActive = boolFromAny(req.body?.isActive ?? req.body?.activo, true);
+    }
+
+    if (typeof patch.name !== "undefined" && !patch.name) {
+      return res.status(400).json({ ok: false, message: "El nombre del cliente es requerido." });
+    }
 
     const updated = await Client.findOneAndUpdate(
       { _id: id, owner },
@@ -132,12 +172,13 @@ router.put("/:id", ensureAuth, async (req, res) => {
       return res.status(404).json({ ok: false, message: "Cliente no encontrado." });
     }
 
-    return res.json({ ok: true, data: updated });
+    return res.json({ ok: true, data: normalizeCliente(updated) });
   } catch (err) {
     if (err && err.code === 11000) {
       return res.status(409).json({
         ok: false,
         message: "Conflicto: cliente duplicado para este usuario.",
+        key: err.keyValue || undefined,
       });
     }
     console.error("PUT /api/clientes/:id error:", err);
