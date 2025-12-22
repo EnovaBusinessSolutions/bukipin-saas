@@ -168,6 +168,28 @@ function flattenDetalles(entries) {
 }
 
 /**
+ * Helpers robustos para normalizar valores del frontend (Lovable)
+ */
+function normalizeMetodoPago(raw) {
+  let v = typeof raw === "string" ? raw.trim().toLowerCase() : "";
+
+  // UI suele mandar "tarjeta" pero el backend trabaja con "bancos"
+  if (["tarjeta", "transferencia", "spei", "banco", "bancos"].includes(v)) return "bancos";
+  if (["efectivo", "cash", "caja"].includes(v)) return "efectivo";
+
+  // Si viene vacío, cae a efectivo (default)
+  if (!v) return "efectivo";
+
+  return v; // lo validaremos después
+}
+
+function normalizeTipoPago(raw) {
+  let v = typeof raw === "string" ? raw.trim().toLowerCase() : "";
+  if (!v) return "contado";
+  return v;
+}
+
+/**
  * GET /api/ingresos/clientes-min?q=...&limit=200
  */
 router.get("/clientes-min", ensureAuth, async (req, res) => {
@@ -281,10 +303,7 @@ router.get("/detalles", ensureAuth, async (req, res) => {
       .sort({ fecha: -1, createdAt: -1 })
       .lean();
 
-    const total = items.reduce(
-      (acc, it) => acc + num(it.montoNeto ?? it.montoTotal ?? 0),
-      0
-    );
+    const total = items.reduce((acc, it) => acc + num(it.montoNeto ?? it.montoTotal ?? 0), 0);
 
     return res.json({
       ok: true,
@@ -364,7 +383,10 @@ router.get("/recientes", ensureAuth, async (req, res) => {
 
 /**
  * POST /api/ingresos/:id/cancelar
- * Compat con UI legacy: borra la transacción y su asiento ligado.
+ * Compat con UI legacy: hoy tu UI muestra "reversión", pero si tu modelo no soporta estado,
+ * mantenemos compat: borramos transacción + asiento ligado y devolvemos numeroAsientoCancelado.
+ *
+ * (Si quieres que cree reversión y marque cancelada, lo hacemos en un siguiente paso con tu schema real.)
  */
 router.post("/:id/cancelar", ensureAuth, async (req, res) => {
   try {
@@ -379,7 +401,9 @@ router.post("/:id/cancelar", ensureAuth, async (req, res) => {
       owner,
       source: "ingreso",
       sourceId: tx._id,
-    }).select("_id").lean();
+    })
+      .select("_id")
+      .lean();
 
     const numeroAsientoCancelado = linked ? String(linked._id) : null;
 
@@ -406,7 +430,7 @@ router.post("/:id/cancelar", ensureAuth, async (req, res) => {
  * - descripcion
  * - montoTotal / total
  * - montoDescuento / descuento
- * - metodoPago: efectivo|bancos
+ * - metodoPago: efectivo|bancos  (✅ acepta "tarjeta" y lo normaliza a "bancos")
  * - tipoPago: contado|parcial|credito
  * - montoPagado / pagado
  * - cuentaCodigo OR cuentaPrincipalCodigo (default 4001)
@@ -425,8 +449,13 @@ router.post("/", ensureAuth, async (req, res) => {
     const descuento = num(req.body?.montoDescuento ?? req.body?.descuento, 0);
     const neto = Math.max(0, total - Math.max(0, descuento));
 
-    const metodoPago = String(req.body?.metodoPago || "efectivo"); // efectivo|bancos
-    const tipoPago = String(req.body?.tipoPago || "contado"); // contado|parcial|credito
+    // ✅ AQUÍ ESTÁ LA SOLUCIÓN E2E: normalizar valores que manda la UI
+    const metodoPago = normalizeMetodoPago(req.body?.metodoPago); // efectivo|bancos (tarjeta=>bancos)
+    const tipoPago = normalizeTipoPago(req.body?.tipoPago); // contado|parcial|credito
+
+    // (Opcional) dejarlo normalizado para debugging
+    req.body.metodoPago = metodoPago;
+    req.body.tipoPago = tipoPago;
 
     const cuentaCodigo = String(
       req.body?.cuentaCodigo || req.body?.cuentaPrincipalCodigo || "4001"
@@ -447,14 +476,25 @@ router.post("/", ensureAuth, async (req, res) => {
     if (descuento < 0) {
       return res.status(400).json({ ok: false, message: "montoDescuento no puede ser negativo." });
     }
+
+    // ✅ ahora esto ya no truena cuando UI manda "tarjeta"
     if (!["efectivo", "bancos"].includes(metodoPago)) {
-      return res.status(400).json({ ok: false, message: "metodoPago inválido (efectivo|bancos)." });
+      return res.status(400).json({
+        ok: false,
+        message: "metodoPago inválido (efectivo|bancos).",
+      });
     }
     if (!["contado", "parcial", "credito"].includes(tipoPago)) {
-      return res.status(400).json({ ok: false, message: "tipoPago inválido (contado|parcial|credito)." });
+      return res.status(400).json({
+        ok: false,
+        message: "tipoPago inválido (contado|parcial|credito).",
+      });
     }
     if (tipoPago === "parcial" && (montoPagadoRaw < 0 || montoPagadoRaw > neto)) {
-      return res.status(400).json({ ok: false, message: "montoPagado debe estar entre 0 y montoNeto." });
+      return res.status(400).json({
+        ok: false,
+        message: "montoPagado debe estar entre 0 y montoNeto.",
+      });
     }
 
     // Normalización de pagado / pendiente
@@ -480,8 +520,8 @@ router.post("/", ensureAuth, async (req, res) => {
       montoDescuento: descuento,
       montoNeto: neto,
 
-      metodoPago,
-      tipoPago,
+      metodoPago, // ✅ normalizado
+      tipoPago, // ✅ normalizado
       montoPagado,
 
       cuentaCodigo,
@@ -585,7 +625,9 @@ router.post("/", ensureAuth, async (req, res) => {
   } catch (err) {
     const status = err?.statusCode || 500;
     console.error("POST /api/ingresos error:", err);
-    return res.status(status).json({ ok: false, message: err?.message || "Error creando ingreso" });
+    return res
+      .status(status)
+      .json({ ok: false, message: err?.message || "Error creando ingreso" });
   }
 });
 
