@@ -65,6 +65,8 @@ app.use("/api/transacciones", require("./routes/transacciones"));
 app.use("/api/inventario", require("./routes/inventario"));
 app.use("/api/contabilidad", require("./routes/contabilidad"));
 app.use("/api/movimientos-inventario", require("./routes/movimientosInventario"));
+app.use("/api/asientos", require("./routes/asientos"));
+
 
 
 // ✅ Legacy endpoints (agrégalos aquí cuando los crees)
