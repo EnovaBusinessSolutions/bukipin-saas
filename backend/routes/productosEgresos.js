@@ -2,11 +2,27 @@
 const express = require("express");
 const router = express.Router();
 const mongoose = require("mongoose");
+const path = require("path");
+const fs = require("fs");
 const ensureAuth = require("../middleware/ensureAuth");
 
 const ExpenseProduct = require("../models/ExpenseProduct");
 const ExpenseTransaction = require("../models/ExpenseTransaction");
 
+// ✅ Multer (para FormData con imagen)
+let multer = null;
+try {
+  multer = require("multer");
+} catch (_) {}
+
+const upload = multer
+  ? multer({
+      storage: multer.memoryStorage(),
+      limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
+    })
+  : null;
+
+// ---- helpers base ----
 function asBool(v, def = null) {
   if (v === undefined || v === null || v === "") return def;
   const s = String(v).trim().toLowerCase();
@@ -31,98 +47,153 @@ function toNum(v, def = 0) {
 function toObjectIdOrNull(v) {
   if (v === undefined || v === null) return null;
   if (v instanceof mongoose.Types.ObjectId) return v;
-
   const s = String(v).trim();
   if (!s) return null;
-
   return mongoose.Types.ObjectId.isValid(s) ? new mongoose.Types.ObjectId(s) : null;
 }
 
-// ✅ Detecta si tu modelo de transacciones usa "productoId" o "productId"
+function schemaHas(pathName) {
+  return !!ExpenseProduct?.schema?.paths?.[pathName];
+}
+
+// 🔁 lee el body soportando snake_case o camelCase
+function pickBody(req, keys, def = undefined) {
+  for (const k of keys) {
+    if (req.body && req.body[k] !== undefined) return req.body[k];
+  }
+  return def;
+}
+
+// ✅ Detecta si ExpenseTransaction usa "productoId" o "productId"
 let _txProductField = null;
 function getTxProductField() {
   if (_txProductField) return _txProductField;
-
   const schemaPaths = ExpenseTransaction?.schema?.paths || {};
   if (schemaPaths.productoId) _txProductField = "productoId";
   else if (schemaPaths.productId) _txProductField = "productId";
-  else _txProductField = "productoId"; // fallback por compat
-
+  else _txProductField = "productoId";
   return _txProductField;
+}
+
+// ✅ Guardar imagen en /public/uploads/egresos (si existe publicRoot servido por express.static)
+function saveImageIfAny(file) {
+  if (!file) return null;
+
+  const uploadsDir = path.join(process.cwd(), "public", "uploads", "egresos");
+  fs.mkdirSync(uploadsDir, { recursive: true });
+
+  const safeBase =
+    Date.now().toString(36) +
+    "-" +
+    Math.random().toString(36).slice(2, 9) +
+    "-" +
+    (file.originalname || "img").replace(/[^a-zA-Z0-9.\-_]/g, "_");
+
+  const outPath = path.join(uploadsDir, safeBase);
+  fs.writeFileSync(outPath, file.buffer);
+
+  // URL pública relativa (tu server debe servir /public como estático)
+  return `/uploads/egresos/${safeBase}`;
 }
 
 function mapForUI(doc, stats = null) {
   const d = doc?.toObject ? doc.toObject() : doc;
 
-  const transacciones = stats?.transacciones ? Number(stats.transacciones) : 0;
-  const precioPromedio = stats?.precioPromedio ? toNum(stats.precioPromedio, 0) : 0;
-  const variacionPrecio = stats?.variacionPrecio ? toNum(stats.variacionPrecio, 0) : 0;
-  const ultimaCompra = stats?.ultimaCompra ? new Date(stats.ultimaCompra).toISOString() : null;
+  // métricas
+  const total_transacciones = stats?.transacciones ? Number(stats.transacciones) : 0;
+  const precio_promedio = stats?.precioPromedio ? toNum(stats.precioPromedio, 0) : 0;
+  const variacion_precio = stats?.variacionPrecio ? toNum(stats.variacionPrecio, 0) : 0;
+  const ultima_compra = stats?.ultimaCompra ? new Date(stats.ultimaCompra).toISOString() : null;
 
-  // Campos extra si ya los tienes en ExpenseProduct (si no existen, no pasa nada)
-  const unidadMedida = d.unidadMedida ?? d.unidad_medida ?? d.unidad ?? "";
-  const proveedorPrincipal = d.proveedorPrincipal ?? d.proveedor_principal ?? d.proveedor ?? "";
-  const imagenUrl = d.imagenUrl ?? d.imageUrl ?? d.imagen_url ?? "";
+  // campos catálogo (normalizamos)
+  const unidad =
+    d.unidad ??
+    d.unidadMedida ??
+    d.unidad_medida ??
+    "";
 
+  const proveedor_principal =
+    d.proveedor_principal ??
+    d.proveedorPrincipal ??
+    d.proveedor ??
+    "";
+
+  const es_recurrente =
+    d.es_recurrente ??
+    d.esRecurrente ??
+    false;
+
+  const cuenta_contable =
+    d.cuenta_contable ??
+    d.cuentaContable ??
+    d.cuentaCodigo ??
+    "";
+
+  const subcuenta_id = d.subcuentaId ? String(d.subcuentaId) : (d.subcuenta_id ? String(d.subcuenta_id) : null);
+
+  const imagen_url =
+    d.imagen_url ??
+    d.imagenUrl ??
+    d.imageUrl ??
+    null;
+
+  // ✅ objeto final: lo que consume CatalogoProductos.tsx + hooks
   const item = {
     id: String(d._id),
     _id: d._id,
 
-    // ✅ root + compat (para que el frontend no diga undefined)
     nombre: d.nombre ?? "",
-    name: d.nombre ?? "",
-
-    tipo: d.tipo ?? "",
-    type: d.tipo ?? "",
-
     descripcion: d.descripcion ?? "",
-    cuentaCodigo: d.cuentaCodigo ?? "",
-    subcuentaId: d.subcuentaId ? String(d.subcuentaId) : null,
+    tipo: d.tipo ?? "",
 
-    unidadMedida,
-    proveedorPrincipal,
-    imagenUrl,
+    unidad,
+    proveedor_principal,
+    es_recurrente: !!es_recurrente,
+
+    subcuenta_id,
+    cuenta_contable,
+
+    imagen_url,
+
+    // métricas (snake_case)
+    precio_promedio,
+    variacion_precio,
+    total_transacciones,
+    ultima_compra,
 
     activo: !!d.activo,
 
-    // ✅ métricas (la UI las muestra en cards)
-    transacciones,
-    precioPromedio,
-    variacionPrecio,
-    ultimaCompra,
-
     created_at: d.createdAt,
     updated_at: d.updatedAt,
+
+    // ✅ extras compat (por si algún lado usa camelCase)
+    cuentaCodigo: cuenta_contable,
+    subcuentaId: subcuenta_id,
+    precioPromedio: precio_promedio,
+    variacionPrecio: variacion_precio,
+    transacciones: total_transacciones,
+    ultimaCompra: ultima_compra,
+    unidadMedida: unidad,
+    proveedorPrincipal: proveedor_principal,
+    imagenUrl: imagen_url,
+    cuenta_codigo: cuenta_contable,
   };
-
-  // compat snake_case (Lovable suele mezclar)
-  item.cuenta_codigo = item.cuentaCodigo;
-  item.subcuenta_id = item.subcuentaId;
-  item.precio_promedio = item.precioPromedio;
-  item.variacion_precio = item.variacionPrecio;
-  item.ultima_compra = item.ultimaCompra;
-
-  item.unidad_medida = item.unidadMedida;
-  item.proveedor_principal = item.proveedorPrincipal;
-  item.imagen_url = item.imagenUrl;
 
   return item;
 }
 
 /**
- * ✅ Calcula stats reales desde ExpenseTransaction:
+ * Stats reales desde ExpenseTransaction:
  * - transacciones (count)
  * - precioPromedio (avg precioUnitario)
  * - ultimaCompra (max fecha)
- * - variacionPrecio (% del último vs anterior) si hay >=2
+ * - variacionPrecio (% ultimo vs anterior) si hay >=2
  */
 async function buildStats(owner, productIds) {
   const txField = getTxProductField();
   const ownerId = owner instanceof mongoose.Types.ObjectId ? owner : new mongoose.Types.ObjectId(owner);
-
   if (!productIds?.length) return new Map();
 
-  // 1) stats base
   const baseAgg = await ExpenseTransaction.aggregate([
     { $match: { owner: ownerId, [txField]: { $in: productIds } } },
     {
@@ -137,7 +208,6 @@ async function buildStats(owner, productIds) {
 
   const map = new Map(baseAgg.map((s) => [String(s._id), { ...s, variacionPrecio: 0 }]));
 
-  // 2) variación: último vs anterior
   const lastTwoAgg = await ExpenseTransaction.aggregate([
     { $match: { owner: ownerId, [txField]: { $in: productIds } } },
     { $sort: { fecha: -1 } },
@@ -166,15 +236,14 @@ async function buildStats(owner, productIds) {
   return map;
 }
 
+// -------------------- ROUTES --------------------
+
 /**
  * GET /api/productos-egresos?activo=true&tipo=costo|gasto
- *
- * ✅ Por defecto: ARRAY
- * ✅ ?wrap=1: wrapper {ok,data,items,costos,gastos}
+ * ✅ devuelve ARRAY (lo que tu hook espera)
  */
 router.get("/", ensureAuth, async (req, res) => {
   try {
-    const wrap = String(req.query.wrap || "").trim() === "1";
     const owner = req.user._id;
 
     const activo = asBool(req.query.activo, null);
@@ -185,23 +254,13 @@ router.get("/", ensureAuth, async (req, res) => {
     if (tipo && ["costo", "gasto"].includes(tipo)) filter.tipo = tipo;
 
     const docs = await ExpenseProduct.find(filter).sort({ createdAt: -1 }).lean();
-
-    if (!docs.length) {
-      if (!wrap) return res.json([]);
-      return res.json({ ok: true, data: [], items: [], costos: [], gastos: [] });
-    }
+    if (!docs.length) return res.json([]);
 
     const ids = docs.map((d) => d._id);
     const statsById = await buildStats(owner, ids);
 
     const items = docs.map((d) => mapForUI(d, statsById.get(String(d._id)) || null));
-
-    if (!wrap) return res.json(items);
-
-    const costos = items.filter((x) => x.tipo === "costo");
-    const gastos = items.filter((x) => x.tipo === "gasto");
-
-    return res.json({ ok: true, data: items, items, costos, gastos });
+    return res.json(items);
   } catch (err) {
     console.error("GET /api/productos-egresos error:", err);
     return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
@@ -209,8 +268,8 @@ router.get("/", ensureAuth, async (req, res) => {
 });
 
 /**
- * ✅ NECESARIO para el modal "Editar"
  * GET /api/productos-egresos/:id
+ * ✅ necesario para editar / ver detalle
  */
 router.get("/:id", ensureAuth, async (req, res) => {
   try {
@@ -223,8 +282,8 @@ router.get("/:id", ensureAuth, async (req, res) => {
     const statsById = await buildStats(owner, [doc._id]);
     const item = mapForUI(doc, statsById.get(String(doc._id)) || null);
 
-    // ✅ compat: root + wrapper
-    return res.json({ ok: true, ...item, data: item, item });
+    // devolvemos root + wrapper por compat
+    return res.json({ ok: true, data: item, item, ...item });
   } catch (err) {
     console.error("GET /api/productos-egresos/:id error:", err);
     return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
@@ -233,124 +292,227 @@ router.get("/:id", ensureAuth, async (req, res) => {
 
 /**
  * POST /api/productos-egresos
- * ✅ Corrige el toast "undefined" devolviendo item en ROOT también.
+ * ✅ soporta JSON y multipart(FormData)
  */
-router.post("/", ensureAuth, async (req, res) => {
-  try {
-    const owner = req.user._id;
+router.post(
+  "/",
+  ensureAuth,
+  upload ? upload.single("imagen") : (req, res, next) => next(),
+  async (req, res) => {
+    try {
+      // Si no hay multer instalado y llega multipart => req.body vacío.
+      if (!upload && req.headers["content-type"]?.includes("multipart/form-data")) {
+        return res.status(400).json({
+          ok: false,
+          error: "MULTER_MISSING",
+          message: "Falta instalar multer en el backend para soportar imagen (FormData).",
+        });
+      }
 
-    const nombre = String(req.body?.nombre ?? req.body?.name ?? "").trim();
-    const tipo = normalizeTipo(req.body?.tipo ?? req.body?.type);
+      const owner = req.user._id;
 
-    if (!nombre) {
-      return res.status(400).json({ ok: false, error: "VALIDATION", message: "nombre es requerido." });
+      const nombre = String(pickBody(req, ["nombre", "name"], "")).trim();
+      const tipo = normalizeTipo(pickBody(req, ["tipo", "type"], ""));
+
+      const descripcion = String(pickBody(req, ["descripcion"], "")).trim();
+
+      const unidad = String(pickBody(req, ["unidad", "unidadMedida", "unidad_medida"], "")).trim();
+      const proveedor_principal = String(pickBody(req, ["proveedor_principal", "proveedorPrincipal", "proveedor"], "")).trim();
+
+      const es_recurrente = asBool(pickBody(req, ["es_recurrente", "esRecurrente"], false), false);
+
+      const subcuenta_id = pickBody(req, ["subcuenta_id", "subcuentaId"], null);
+      const subcuentaId = toObjectIdOrNull(subcuenta_id);
+
+      const cuenta_contable = String(pickBody(req, ["cuenta_contable", "cuentaContable", "cuentaCodigo", "cuenta_codigo"], "")).trim();
+
+      const activo = asBool(pickBody(req, ["activo"], true), true);
+
+      if (!nombre) {
+        return res.status(400).json({ ok: false, error: "VALIDATION", message: "nombre es requerido." });
+      }
+      if (!["costo", "gasto"].includes(tipo)) {
+        return res.status(400).json({ ok: false, error: "VALIDATION", message: "tipo inválido. Usa 'costo' o 'gasto'." });
+      }
+      if (!unidad) {
+        return res.status(400).json({ ok: false, error: "VALIDATION", message: "unidad es requerida." });
+      }
+      if (tipo === "gasto" && !cuenta_contable) {
+        return res.status(400).json({ ok: false, error: "VALIDATION", message: "cuenta_contable es requerida para gasto." });
+      }
+      if (tipo === "costo" && !subcuentaId) {
+        return res.status(400).json({ ok: false, error: "VALIDATION", message: "subcuenta_id es requerida para costo." });
+      }
+
+      // ✅ imagen (si viene)
+      const imagen_url = saveImageIfAny(req.file);
+
+      // payload robusto según schema disponible
+      const payload = {
+        owner,
+        nombre,
+        tipo,
+        descripcion,
+        activo,
+      };
+
+      // cuenta contable (acepta cualquiera de los 3 nombres)
+      if (schemaHas("cuenta_contable")) payload.cuenta_contable = cuenta_contable;
+      else if (schemaHas("cuentaContable")) payload.cuentaContable = cuenta_contable;
+      else payload.cuentaCodigo = cuenta_contable;
+
+      // subcuenta
+      if (schemaHas("subcuentaId")) payload.subcuentaId = subcuentaId;
+      else if (schemaHas("subcuenta_id")) payload.subcuenta_id = subcuentaId;
+      else payload.subcuentaId = subcuentaId;
+
+      // unidad
+      if (schemaHas("unidad")) payload.unidad = unidad;
+      else if (schemaHas("unidadMedida")) payload.unidadMedida = unidad;
+      else payload.unidad = unidad;
+
+      // proveedor
+      if (schemaHas("proveedor_principal")) payload.proveedor_principal = proveedor_principal;
+      else if (schemaHas("proveedorPrincipal")) payload.proveedorPrincipal = proveedor_principal;
+      else payload.proveedor_principal = proveedor_principal;
+
+      // recurrente
+      if (schemaHas("es_recurrente")) payload.es_recurrente = !!es_recurrente;
+      else if (schemaHas("esRecurrente")) payload.esRecurrente = !!es_recurrente;
+      else payload.es_recurrente = !!es_recurrente;
+
+      // imagen
+      if (imagen_url) {
+        if (schemaHas("imagen_url")) payload.imagen_url = imagen_url;
+        else if (schemaHas("imagenUrl")) payload.imagenUrl = imagen_url;
+        else payload.imagen_url = imagen_url;
+      }
+
+      const created = await ExpenseProduct.create(payload);
+
+      const item = mapForUI(created, null);
+      return res.status(201).json({ ok: true, data: item, item, ...item });
+    } catch (err) {
+      console.error("POST /api/productos-egresos error:", err);
+      return res.status(500).json({ ok: false, error: "SERVER_ERROR", message: err?.message || "SERVER_ERROR" });
     }
-    if (!["costo", "gasto"].includes(tipo)) {
-      return res.status(400).json({ ok: false, error: "VALIDATION", message: "tipo inválido. Usa 'costo' o 'gasto'." });
-    }
-
-    const descripcion = String(req.body?.descripcion ?? "").trim();
-    const cuentaCodigo = req.body?.cuentaCodigo ? String(req.body.cuentaCodigo).trim() : "";
-
-    // subcuentaId puede venir como string id
-    const subcuentaId = toObjectIdOrNull(req.body?.subcuentaId ?? req.body?.subcuenta_id);
-
-    const activo = asBool(req.body?.activo, true);
-
-    // Opcionales si ya los tienes en tu modelo ExpenseProduct
-    const unidadMedida = String(req.body?.unidadMedida ?? req.body?.unidad_medida ?? req.body?.unidad ?? "").trim();
-    const proveedorPrincipal = String(req.body?.proveedorPrincipal ?? req.body?.proveedor_principal ?? req.body?.proveedor ?? "").trim();
-    const imagenUrl = String(req.body?.imagenUrl ?? req.body?.imageUrl ?? req.body?.imagen_url ?? "").trim();
-
-    const payload = {
-      owner,
-      nombre,
-      tipo,
-      descripcion,
-      cuentaCodigo,
-      subcuentaId,
-      activo,
-    };
-
-    // solo asignar si el schema los soporta (para no romper si aún no existen)
-    const sp = ExpenseProduct.schema?.paths || {};
-    if (sp.unidadMedida) payload.unidadMedida = unidadMedida;
-    if (sp.proveedorPrincipal) payload.proveedorPrincipal = proveedorPrincipal;
-    if (sp.imagenUrl) payload.imagenUrl = imagenUrl;
-
-    const created = await ExpenseProduct.create(payload);
-
-    const item = mapForUI(created);
-
-    // ✅ root + wrapper (mata "undefined")
-    return res.status(201).json({ ok: true, ...item, data: item, item });
-  } catch (err) {
-    console.error("POST /api/productos-egresos error:", err);
-    return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
   }
-});
+);
 
 /**
  * PATCH /api/productos-egresos/:id
+ * ✅ soporta JSON y multipart(FormData)
  */
-router.patch("/:id", ensureAuth, async (req, res) => {
-  try {
-    const owner = req.user._id;
-    const id = String(req.params.id || "").trim();
-
-    const patch = {};
-
-    if (req.body?.nombre !== undefined || req.body?.name !== undefined) {
-      patch.nombre = String(req.body?.nombre ?? req.body?.name ?? "").trim();
-    }
-
-    if (req.body?.tipo !== undefined || req.body?.type !== undefined) {
-      patch.tipo = normalizeTipo(req.body?.tipo ?? req.body?.type);
-      if (patch.tipo && !["costo", "gasto"].includes(patch.tipo)) {
-        return res.status(400).json({ ok: false, error: "VALIDATION", message: "tipo inválido." });
+router.patch(
+  "/:id",
+  ensureAuth,
+  upload ? upload.single("imagen") : (req, res, next) => next(),
+  async (req, res) => {
+    try {
+      if (!upload && req.headers["content-type"]?.includes("multipart/form-data")) {
+        return res.status(400).json({
+          ok: false,
+          error: "MULTER_MISSING",
+          message: "Falta instalar multer en el backend para soportar imagen (FormData).",
+        });
       }
+
+      const owner = req.user._id;
+      const id = String(req.params.id || "").trim();
+
+      const patch = {};
+
+      // nombre
+      const nombreRaw = pickBody(req, ["nombre", "name"], undefined);
+      if (nombreRaw !== undefined) patch.nombre = String(nombreRaw || "").trim();
+
+      // tipo
+      const tipoRaw = pickBody(req, ["tipo", "type"], undefined);
+      if (tipoRaw !== undefined) {
+        patch.tipo = normalizeTipo(tipoRaw);
+        if (patch.tipo && !["costo", "gasto"].includes(patch.tipo)) {
+          return res.status(400).json({ ok: false, error: "VALIDATION", message: "tipo inválido." });
+        }
+      }
+
+      // descripcion
+      const descripcionRaw = pickBody(req, ["descripcion"], undefined);
+      if (descripcionRaw !== undefined) patch.descripcion = String(descripcionRaw || "").trim();
+
+      // unidad
+      const unidadRaw = pickBody(req, ["unidad", "unidadMedida", "unidad_medida"], undefined);
+      if (unidadRaw !== undefined) {
+        const unidad = String(unidadRaw || "").trim();
+        if (schemaHas("unidad")) patch.unidad = unidad;
+        else if (schemaHas("unidadMedida")) patch.unidadMedida = unidad;
+        else patch.unidad = unidad;
+      }
+
+      // proveedor
+      const provRaw = pickBody(req, ["proveedor_principal", "proveedorPrincipal", "proveedor"], undefined);
+      if (provRaw !== undefined) {
+        const prov = String(provRaw || "").trim();
+        if (schemaHas("proveedor_principal")) patch.proveedor_principal = prov;
+        else if (schemaHas("proveedorPrincipal")) patch.proveedorPrincipal = prov;
+        else patch.proveedor_principal = prov;
+      }
+
+      // recurrente
+      const recRaw = pickBody(req, ["es_recurrente", "esRecurrente"], undefined);
+      if (recRaw !== undefined) {
+        const rec = asBool(recRaw, false);
+        if (schemaHas("es_recurrente")) patch.es_recurrente = !!rec;
+        else if (schemaHas("esRecurrente")) patch.esRecurrente = !!rec;
+        else patch.es_recurrente = !!rec;
+      }
+
+      // cuenta contable
+      const ccRaw = pickBody(req, ["cuenta_contable", "cuentaContable", "cuentaCodigo", "cuenta_codigo"], undefined);
+      if (ccRaw !== undefined) {
+        const cc = String(ccRaw || "").trim();
+        if (schemaHas("cuenta_contable")) patch.cuenta_contable = cc;
+        else if (schemaHas("cuentaContable")) patch.cuentaContable = cc;
+        else patch.cuentaCodigo = cc;
+      }
+
+      // subcuenta
+      const subRaw = pickBody(req, ["subcuenta_id", "subcuentaId"], undefined);
+      if (subRaw !== undefined) {
+        const subId = toObjectIdOrNull(subRaw);
+        if (schemaHas("subcuentaId")) patch.subcuentaId = subId;
+        else if (schemaHas("subcuenta_id")) patch.subcuenta_id = subId;
+        else patch.subcuentaId = subId;
+      }
+
+      // activo
+      const activoRaw = pickBody(req, ["activo"], undefined);
+      if (activoRaw !== undefined) patch.activo = asBool(activoRaw, true);
+
+      // imagen
+      const imgUrl = saveImageIfAny(req.file);
+      if (imgUrl) {
+        if (schemaHas("imagen_url")) patch.imagen_url = imgUrl;
+        else if (schemaHas("imagenUrl")) patch.imagenUrl = imgUrl;
+        else patch.imagen_url = imgUrl;
+      }
+
+      const updated = await ExpenseProduct.findOneAndUpdate({ _id: id, owner }, patch, { new: true }).lean();
+      if (!updated) return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+
+      const statsById = await buildStats(owner, [updated._id]);
+      const item = mapForUI(updated, statsById.get(String(updated._id)) || null);
+
+      return res.json({ ok: true, data: item, item, ...item });
+    } catch (err) {
+      console.error("PATCH /api/productos-egresos/:id error:", err);
+      return res.status(500).json({ ok: false, error: "SERVER_ERROR", message: err?.message || "SERVER_ERROR" });
     }
-
-    if (req.body?.descripcion !== undefined) patch.descripcion = String(req.body.descripcion || "").trim();
-    if (req.body?.cuentaCodigo !== undefined || req.body?.cuenta_codigo !== undefined) {
-      patch.cuentaCodigo = String(req.body?.cuentaCodigo ?? req.body?.cuenta_codigo ?? "").trim();
-    }
-
-    if (req.body?.subcuentaId !== undefined || req.body?.subcuenta_id !== undefined) {
-      patch.subcuentaId = toObjectIdOrNull(req.body?.subcuentaId ?? req.body?.subcuenta_id);
-    }
-
-    if (req.body?.activo !== undefined) patch.activo = asBool(req.body.activo, true);
-
-    // opcionales si existen en schema
-    const sp = ExpenseProduct.schema?.paths || {};
-    if (sp.unidadMedida && (req.body?.unidadMedida !== undefined || req.body?.unidad_medida !== undefined || req.body?.unidad !== undefined)) {
-      patch.unidadMedida = String(req.body?.unidadMedida ?? req.body?.unidad_medida ?? req.body?.unidad ?? "").trim();
-    }
-    if (sp.proveedorPrincipal && (req.body?.proveedorPrincipal !== undefined || req.body?.proveedor_principal !== undefined || req.body?.proveedor !== undefined)) {
-      patch.proveedorPrincipal = String(req.body?.proveedorPrincipal ?? req.body?.proveedor_principal ?? req.body?.proveedor ?? "").trim();
-    }
-    if (sp.imagenUrl && (req.body?.imagenUrl !== undefined || req.body?.imageUrl !== undefined || req.body?.imagen_url !== undefined)) {
-      patch.imagenUrl = String(req.body?.imagenUrl ?? req.body?.imageUrl ?? req.body?.imagen_url ?? "").trim();
-    }
-
-    const updated = await ExpenseProduct.findOneAndUpdate({ _id: id, owner }, patch, { new: true }).lean();
-    if (!updated) return res.status(404).json({ ok: false, error: "NOT_FOUND" });
-
-    // ✅ stats actualizadas del producto
-    const statsById = await buildStats(owner, [updated._id]);
-    const item = mapForUI(updated, statsById.get(String(updated._id)) || null);
-
-    return res.json({ ok: true, ...item, data: item, item });
-  } catch (err) {
-    console.error("PATCH /api/productos-egresos/:id error:", err);
-    return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
   }
-});
+);
 
 /**
  * DELETE /api/productos-egresos/:id
- * Borra producto del catálogo y también sus transacciones ligadas.
+ * (tu UI usa borrado lógico, pero dejamos delete real por si lo ocupas)
  */
 router.delete("/:id", ensureAuth, async (req, res) => {
   try {

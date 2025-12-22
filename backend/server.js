@@ -62,6 +62,7 @@ app.use("/api/productos", require("./routes/productos"));
 app.use("/api/clientes", require("./routes/clientes"));
 app.use("/api/ingresos", require("./routes/ingresos"));
 app.use("/api/transacciones", require("./routes/transacciones"));
+app.use("/api/transacciones/egresos", require("./routes/transaccionesEgresos"));
 app.use("/api/inventario", require("./routes/inventario"));
 app.use("/api/contabilidad", require("./routes/contabilidad"));
 app.use("/api/movimientos-inventario", require("./routes/movimientosInventario"));
