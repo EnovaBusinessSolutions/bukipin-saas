@@ -4,6 +4,7 @@ const router = express.Router();
 
 const mongoose = require("mongoose");
 const JournalEntry = require("../models/JournalEntry");
+const Account = require("../models/Account");
 const ensureAuth = require("../middleware/ensureAuth");
 
 function num(v, def = 0) {
@@ -20,49 +21,76 @@ function toYMD(d) {
   return `${y}-${m}-${day}`;
 }
 
+async function getAccountNameMap(owner, codes) {
+  const unique = Array.from(new Set((codes || []).filter(Boolean).map((c) => String(c).trim())));
+  if (!unique.length) return {};
+
+  const rows = await Account.find({ owner, code: { $in: unique } })
+    .select("code name nombre")
+    .lean();
+
+  const map = {};
+  for (const r of rows) {
+    map[String(r.code)] = r.name ?? r.nombre ?? "";
+  }
+  return map;
+}
+
 /**
- * ✅ Mapeo compat con RegistroIngresos.tsx
- * - detalle_asientos (legacy)
- * - detalles (lo que el modal usa para la tabla)
- * - numeroAsiento / numero_asiento
+ * ✅ Shape EXACTO que RegistroIngresos.tsx espera:
+ * currentAsientos.descripcion
+ * currentAsientos.detalles[] = { cuenta_codigo, cuenta_nombre, descripcion, debe, haber }
  */
-function mapEntryForUI(entry) {
+function mapEntryForUI(entry, accountNameMap = {}) {
   const rawLines = entry.lines || entry.detalle_asientos || [];
+  const detalle_asientos = (rawLines || []).map((l) => {
+    const cuentaCodigo =
+      l.accountCodigo ?? l.accountCode ?? l.cuenta_codigo ?? l.code ?? "";
+    const cuenta_codigo = cuentaCodigo ? String(cuentaCodigo).trim() : "";
 
-  const detalle_asientos = (rawLines || []).map((l) => ({
-    cuenta_codigo: l.accountCodigo ?? l.accountCode ?? l.cuenta_codigo ?? null,
-    debe: num(l.debit ?? l.debe, 0),
-    haber: num(l.credit ?? l.haber, 0),
-    memo: l.memo ?? l.descripcion ?? "",
-  }));
+    return {
+      cuenta_codigo: cuenta_codigo || null,
+      cuenta_nombre: cuenta_codigo ? (accountNameMap[cuenta_codigo] || null) : null,
+      debe: num(l.debit ?? l.debe, 0),
+      haber: num(l.credit ?? l.haber, 0),
+      memo: l.memo ?? l.descripcion ?? "",
+    };
+  });
 
+  // 👇 UI pinta currentAsientos.detalles (NO detalle_asientos)
   const detalles = detalle_asientos.map((d) => ({
-    cuenta: d.cuenta_codigo,
+    cuenta_codigo: d.cuenta_codigo,
+    cuenta_nombre: d.cuenta_nombre,
     descripcion: d.memo || "",
     debe: d.debe,
     haber: d.haber,
   }));
 
+  const concepto = entry.concept ?? entry.concepto ?? "";
+  const numeroAsiento = entry.numeroAsiento ?? entry.numero_asiento ?? null;
+
   return {
     id: String(entry._id),
     _id: entry._id,
 
-    // ✅ folio/número (nuevo)
-    numeroAsiento: entry.numeroAsiento ?? null,
-    numero_asiento: entry.numeroAsiento ?? null,
+    numeroAsiento,
+    numero_asiento: numeroAsiento,
 
     asiento_fecha: toYMD(entry.date),
     fecha: entry.date,
 
-    concepto: entry.concept ?? entry.concepto ?? "",
+    // ✅ la UI usa currentAsientos.descripcion
+    descripcion: concepto,
+    concepto,
+
     source: entry.source ?? "",
     transaccion_ingreso_id: entry.sourceId ? String(entry.sourceId) : null,
 
     detalle_asientos,
     detalles,
 
-    created_at: entry.createdAt ?? null,
-    updated_at: entry.updatedAt ?? null,
+    created_at: entry.createdAt,
+    updated_at: entry.updatedAt,
   };
 }
 
@@ -71,7 +99,7 @@ router.get("/by-transaccion", ensureAuth, async (req, res) => {
   try {
     let { source, id } = req.query;
 
-    source = String(source || "").trim().toLowerCase();
+    source = String(source || "").trim();
     id = String(id || "").trim();
 
     if (!source || !id) {
@@ -82,62 +110,61 @@ router.get("/by-transaccion", ensureAuth, async (req, res) => {
       });
     }
 
-    // ✅ alias robustos
-    const sourceAliases = new Set([source]);
-    if (source === "ingresos") sourceAliases.add("ingreso");
-    if (source === "ingreso") sourceAliases.add("ingresos");
+    const sourceAliases = new Set([source.toLowerCase()]);
+    if (source.toLowerCase() === "ingresos") sourceAliases.add("ingreso");
+    if (source.toLowerCase() === "ingreso") sourceAliases.add("ingresos");
 
     const owner = req.user._id;
 
-    // ✅ soporta sourceId string u ObjectId
     const sourceIdCandidates = [id];
     if (mongoose.Types.ObjectId.isValid(id)) {
       sourceIdCandidates.push(new mongoose.Types.ObjectId(id));
     }
 
-    // 1) canónico: sourceId
-    let asiento = await JournalEntry.findOne({
-      owner,
-      source: { $in: Array.from(sourceAliases) },
-      sourceId: { $in: sourceIdCandidates },
-    })
-      .sort({ createdAt: -1 })
-      .lean();
+    const asiento =
+      (await JournalEntry.findOne({
+        owner,
+        source: { $in: Array.from(sourceAliases) },
+        sourceId: { $in: sourceIdCandidates },
+      })
+        .sort({ createdAt: -1 })
+        .lean()) ||
+      (await JournalEntry.findOne({
+        owner,
+        source: { $in: Array.from(sourceAliases) },
+        transaccionId: id,
+      })
+        .sort({ createdAt: -1 })
+        .lean()) ||
+      (await JournalEntry.findOne({
+        owner,
+        source: { $in: Array.from(sourceAliases) },
+        transaccion_id: id,
+      })
+        .sort({ createdAt: -1 })
+        .lean()) ||
+      (await JournalEntry.findOne({
+        owner,
+        "references.source": { $in: Array.from(sourceAliases) },
+        "references.id": id,
+      })
+        .sort({ createdAt: -1 })
+        .lean());
 
-    // 2) legacy fallbacks por si tuvieras campos viejos
-    if (!asiento) {
-      asiento =
-        (await JournalEntry.findOne({
-          owner,
-          source: { $in: Array.from(sourceAliases) },
-          transaccionId: id,
-        })
-          .sort({ createdAt: -1 })
-          .lean()) ||
-        (await JournalEntry.findOne({
-          owner,
-          source: { $in: Array.from(sourceAliases) },
-          transaccion_id: id,
-        })
-          .sort({ createdAt: -1 })
-          .lean()) ||
-        (await JournalEntry.findOne({
-          owner,
-          "references.source": { $in: Array.from(sourceAliases) },
-          "references.id": id,
-        })
-          .sort({ createdAt: -1 })
-          .lean());
-    }
+    if (!asiento) return res.status(404).json({ ok: false, error: "NOT_FOUND" });
 
-    if (!asiento) {
-      return res.status(404).json({ ok: false, error: "NOT_FOUND" });
-    }
+    // ✅ Enriquecer nombres de cuentas por code
+    const codes = (asiento.lines || [])
+      .map((l) => l.accountCodigo ?? l.accountCode ?? l.cuenta_codigo ?? null)
+      .filter(Boolean)
+      .map(String);
 
-    const asientoUI = mapEntryForUI(asiento);
+    const accountNameMap = await getAccountNameMap(owner, codes);
 
-    // ✅ numeroAsiento preferido; fallback al _id
-    const numeroAsiento = asientoUI.numeroAsiento || asientoUI.numero_asiento || String(asiento._id);
+    const asientoUI = mapEntryForUI(asiento, accountNameMap);
+
+    // ✅ numeroAsiento “real” si existe; si no, fallback a _id
+    const numeroAsiento = asientoUI.numeroAsiento || String(asiento._id);
 
     return res.json({
       ok: true,

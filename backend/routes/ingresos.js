@@ -69,6 +69,58 @@ async function nextJournalNumber(owner, dateObj) {
 }
 
 /**
+ * ======= ENRIQUECIMIENTOS (clave para que el modal se vea como Bukipin 2) =======
+ */
+
+async function getAccountNameMap(owner, codes) {
+  const unique = Array.from(
+    new Set((codes || []).filter(Boolean).map((c) => String(c).trim()))
+  );
+  if (!unique.length) return {};
+
+  const rows = await Account.find({ owner, code: { $in: unique } })
+    .select("code name nombre")
+    .lean();
+
+  const map = {};
+  for (const r of rows) {
+    map[String(r.code)] = r.name ?? r.nombre ?? "";
+  }
+  return map;
+}
+
+async function attachAccountInfo(owner, items) {
+  if (!items?.length) return items;
+
+  const codes = items
+    .map((it) => it.cuenta_codigo ?? it.cuentaCodigo ?? it.cuentaPrincipalCodigo ?? null)
+    .filter(Boolean)
+    .map(String);
+
+  const accountNameMap = await getAccountNameMap(owner, codes);
+
+  return items.map((it) => {
+    const code = String(it.cuenta_codigo ?? it.cuentaCodigo ?? it.cuentaPrincipalCodigo ?? "").trim();
+    if (!code) return it;
+
+    const nombre = accountNameMap[code] || it.cuenta_nombre || it.cuentaName || null;
+    const display = nombre ? `${code} - ${nombre}` : code;
+
+    return {
+      ...it,
+      cuenta_codigo: it.cuenta_codigo ?? code,
+      cuenta_nombre: it.cuenta_nombre ?? nombre,
+
+      // Aliases para UI/legacy (por si los usa)
+      cuenta_principal_codigo: it.cuenta_principal_codigo ?? code,
+      cuenta_principal_nombre: it.cuenta_principal_nombre ?? nombre,
+      cuenta_principal: it.cuenta_principal ?? display,
+      cuentaPrincipal: it.cuentaPrincipal ?? display,
+    };
+  });
+}
+
+/**
  * ✅ Enriquecer transacciones con datos del cliente (para el modal)
  */
 async function attachClientInfo(owner, items) {
@@ -77,7 +129,7 @@ async function attachClientInfo(owner, items) {
   const ids = Array.from(
     new Set(
       items
-        .map((it) => it.clienteId || it.clientId)
+        .map((it) => it.clienteId || it.clientId || it.cliente_id || it.clienteID)
         .filter(Boolean)
         .map((v) => String(v))
         .filter((v) => mongoose.Types.ObjectId.isValid(v))
@@ -106,12 +158,15 @@ async function attachClientInfo(owner, items) {
   );
 
   return items.map((it) => {
-    const cid = it.clienteId ? String(it.clienteId) : (it.clientId ? String(it.clientId) : "");
+    const cidRaw =
+      it.clienteId || it.clientId || it.cliente_id || it.clienteID || "";
+    const cid = cidRaw ? String(cidRaw) : "";
     const c = cid ? map.get(cid) : null;
     if (!c) return it;
 
     return {
       ...it,
+      // Campos que tu UI espera para el modal:
       cliente_nombre: it.cliente_nombre ?? c.nombre,
       cliente_email: it.cliente_email ?? c.email,
       cliente_telefono: it.cliente_telefono ?? c.telefono,
@@ -121,37 +176,40 @@ async function attachClientInfo(owner, items) {
 }
 
 /**
- * ✅ Mapeo compat para UI Lovable
+ * ✅ Mapeo compat para UI Lovable (transacciones)
  */
 function mapTxForUI(tx) {
   const fecha = tx.fecha ? new Date(tx.fecha) : null;
-
   const saldoPendiente = tx.saldoPendiente ?? tx.saldo_pendiente ?? 0;
+
+  const cuentaCodigo = tx.cuentaCodigo ?? tx.cuenta_codigo ?? tx.cuentaPrincipalCodigo ?? null;
 
   return {
     ...tx,
     id: tx._id ? String(tx._id) : tx.id,
 
+    // fecha
     fecha,
     fecha_ymd: fecha ? toYMD(fecha) : null,
 
+    // montos (aliases)
     monto_total: tx.montoTotal ?? tx.monto_total ?? 0,
     monto_descuento: tx.montoDescuento ?? tx.monto_descuento ?? 0,
     monto_neto: tx.montoNeto ?? tx.monto_neto ?? 0,
     monto_pagado: tx.montoPagado ?? tx.monto_pagado ?? 0,
 
-    // ✅ tu UI usa monto_pendiente
+    // UI usa monto_pendiente
     monto_pendiente: tx.monto_pendiente ?? saldoPendiente,
-
-    // compat viejo
     saldo_pendiente: saldoPendiente,
 
+    // pagos
     metodo_pago: tx.metodoPago ?? tx.metodo_pago ?? null,
     tipo_pago: tx.tipoPago ?? tx.tipo_pago ?? null,
 
-    cuenta_codigo: tx.cuentaCodigo ?? tx.cuenta_codigo ?? null,
+    // cuenta
+    cuenta_codigo: cuentaCodigo ?? null,
 
-    // ✅ cliente (si viene enriquecido)
+    // cliente (si viene enriquecido)
     cliente_nombre: tx.cliente_nombre ?? null,
     cliente_email: tx.cliente_email ?? null,
     cliente_telefono: tx.cliente_telefono ?? null,
@@ -162,6 +220,9 @@ function mapTxForUI(tx) {
   };
 }
 
+/**
+ * Journal line mode
+ */
 function journalLineMode() {
   const schema = JournalEntry?.schema;
   if (!schema) return "code";
@@ -212,32 +273,53 @@ async function buildLine(owner, { code, debit = 0, credit = 0, memo = "" }) {
   return { ...base, accountCodigo: String(code).trim() };
 }
 
-function mapEntryForUI(entry) {
-  const detalle_asientos = (entry.lines || []).map((l) => ({
-    cuenta_codigo: l.accountCodigo ?? l.accountCode ?? null,
-    debe: num(l.debit, 0),
-    haber: num(l.credit, 0),
-    memo: l.memo ?? "",
-  }));
+/**
+ * ✅ Mapeo del asiento (para UI)
+ * IMPORTANTE: RegistroIngresos.tsx pinta:
+ * - currentAsientos.descripcion
+ * - currentAsientos.detalles[] = { cuenta_codigo, cuenta_nombre, descripcion, debe, haber }
+ */
+function mapEntryForUI(entry, accountNameMap = {}) {
+  const rawLines = entry.lines || entry.detalle_asientos || [];
+
+  const detalle_asientos = (rawLines || []).map((l) => {
+    const cuentaCodigo = l.accountCodigo ?? l.accountCode ?? l.cuenta_codigo ?? "";
+    const cuenta_codigo = cuentaCodigo ? String(cuentaCodigo).trim() : "";
+
+    return {
+      cuenta_codigo: cuenta_codigo || null,
+      cuenta_nombre: cuenta_codigo ? (accountNameMap[cuenta_codigo] || null) : null,
+      debe: num(l.debit ?? l.debe, 0),
+      haber: num(l.credit ?? l.haber, 0),
+      memo: l.memo ?? "",
+    };
+  });
 
   const detalles = detalle_asientos.map((d) => ({
-    cuenta: d.cuenta_codigo,
+    cuenta_codigo: d.cuenta_codigo,
+    cuenta_nombre: d.cuenta_nombre,
     descripcion: d.memo || "",
     debe: d.debe,
     haber: d.haber,
   }));
 
+  const concepto = entry.concept ?? entry.concepto ?? "";
+  const numeroAsiento = entry.numeroAsiento ?? entry.numero_asiento ?? null;
+
   return {
     id: String(entry._id),
     _id: entry._id,
 
-    numeroAsiento: entry.numeroAsiento ?? null,
-    numero_asiento: entry.numeroAsiento ?? null,
+    numeroAsiento,
+    numero_asiento: numeroAsiento,
 
     asiento_fecha: toYMD(entry.date),
     fecha: entry.date,
 
-    concepto: entry.concept ?? "",
+    // ✅ la UI usa "descripcion"
+    descripcion: concepto,
+    concepto,
+
     source: entry.source ?? "",
     transaccion_ingreso_id: entry.sourceId ? String(entry.sourceId) : null,
 
@@ -249,6 +331,9 @@ function mapEntryForUI(entry) {
   };
 }
 
+/**
+ * Aplanar asientos (analítica)
+ */
 function flattenDetalles(entries) {
   const detalles = [];
   for (const e of entries) {
@@ -321,6 +406,47 @@ router.get("/clientes-min", ensureAuth, async (req, res) => {
 });
 
 /**
+ * GET /api/ingresos/asientos?start=YYYY-MM-DD&end=YYYY-MM-DD
+ */
+router.get("/asientos", ensureAuth, async (req, res) => {
+  try {
+    const owner = req.user._id;
+
+    const start = parseStartDate(req.query.start || req.query.from);
+    const end = parseEndDate(req.query.end || req.query.to);
+
+    if (!start || !end) {
+      return res.status(400).json({
+        ok: false,
+        message: "start/end (o from/to) son requeridos.",
+      });
+    }
+
+    const entries = await JournalEntry.find({
+      owner,
+      date: { $gte: start, $lte: end },
+      source: { $in: ["ingreso", "ingreso_directo"] },
+    })
+      .sort({ date: -1, createdAt: -1 })
+      .lean();
+
+    // ✅ accountNameMap para cuenta_nombre en cada línea
+    const allCodes = entries
+      .flatMap((e) => (e.lines || []).map((l) => l.accountCodigo ?? l.accountCode ?? null))
+      .filter(Boolean)
+      .map(String);
+
+    const accountNameMap = await getAccountNameMap(owner, allCodes);
+    const asientos = entries.map((e) => mapEntryForUI(e, accountNameMap));
+
+    return res.json({ ok: true, data: { asientos }, asientos });
+  } catch (err) {
+    console.error("GET /api/ingresos/asientos error:", err);
+    return res.status(500).json({ ok: false, message: "Error cargando asientos" });
+  }
+});
+
+/**
  * GET /api/ingresos/detalles?start=YYYY-MM-DD&end=YYYY-MM-DD
  */
 router.get("/detalles", ensureAuth, async (req, res) => {
@@ -354,11 +480,18 @@ router.get("/detalles", ensureAuth, async (req, res) => {
       .sort({ fecha: -1, createdAt: -1 })
       .lean();
 
-    // ✅ 1) map compat 2) enriquecer cliente
     let items = itemsRaw.map(mapTxForUI);
+
+    // ✅ 1) cuenta con nombre (para "Cuenta principal")
+    items = await attachAccountInfo(owner, items);
+
+    // ✅ 2) cliente (para el modal)
     items = await attachClientInfo(owner, items);
 
-    const total = itemsRaw.reduce((acc, it) => acc + num(it.montoNeto ?? it.montoTotal ?? 0), 0);
+    const total = itemsRaw.reduce(
+      (acc, it) => acc + num(it.montoNeto ?? it.montoTotal ?? 0),
+      0
+    );
 
     return res.json({
       ok: true,
@@ -370,6 +503,45 @@ router.get("/detalles", ensureAuth, async (req, res) => {
   } catch (err) {
     console.error("GET /api/ingresos/detalles error:", err);
     return res.status(500).json({ ok: false, message: "Error cargando detalles" });
+  }
+});
+
+/**
+ * GET /api/ingresos/asientos-directos?limit=300&start=...&end=...
+ */
+router.get("/asientos-directos", ensureAuth, async (req, res) => {
+  try {
+    const owner = req.user._id;
+    const limit = Math.min(2000, Number(req.query.limit || 300));
+
+    const start = parseStartDate(req.query.start || req.query.from);
+    const end = parseEndDate(req.query.end || req.query.to);
+
+    const filter = {
+      owner,
+      source: { $in: ["ingreso", "ingreso_directo"] },
+      $or: [{ sourceId: null }, { sourceId: { $exists: false } }],
+    };
+
+    if (start && end) filter.date = { $gte: start, $lte: end };
+
+    const entries = await JournalEntry.find(filter)
+      .sort({ date: -1, createdAt: -1 })
+      .limit(limit)
+      .lean();
+
+    const allCodes = entries
+      .flatMap((e) => (e.lines || []).map((l) => l.accountCodigo ?? l.accountCode ?? null))
+      .filter(Boolean)
+      .map(String);
+
+    const accountNameMap = await getAccountNameMap(owner, allCodes);
+    const asientos = entries.map((e) => mapEntryForUI(e, accountNameMap));
+
+    return res.json({ ok: true, data: { asientos }, asientos });
+  } catch (err) {
+    console.error("GET /api/ingresos/asientos-directos error:", err);
+    return res.status(500).json({ ok: false, message: "Error cargando asientos" });
   }
 });
 
@@ -387,6 +559,7 @@ router.get("/recientes", ensureAuth, async (req, res) => {
       .lean();
 
     let items = itemsRaw.map(mapTxForUI);
+    items = await attachAccountInfo(owner, items);
     items = await attachClientInfo(owner, items);
 
     return res.json({ ok: true, data: items, items });
@@ -460,8 +633,12 @@ router.post("/", ensureAuth, async (req, res) => {
 
     const montoPagadoRaw = num(req.body?.montoPagado ?? req.body?.pagado, 0);
 
-    if (!total || total <= 0) return res.status(400).json({ ok: false, message: "montoTotal debe ser > 0." });
-    if (descuento < 0) return res.status(400).json({ ok: false, message: "montoDescuento no puede ser negativo." });
+    if (!total || total <= 0) {
+      return res.status(400).json({ ok: false, message: "montoTotal debe ser > 0." });
+    }
+    if (descuento < 0) {
+      return res.status(400).json({ ok: false, message: "montoDescuento no puede ser negativo." });
+    }
 
     if (!["efectivo", "bancos"].includes(metodoPago)) {
       return res.status(400).json({ ok: false, message: "metodoPago inválido (efectivo|bancos)." });
@@ -473,7 +650,8 @@ router.post("/", ensureAuth, async (req, res) => {
       return res.status(400).json({ ok: false, message: "montoPagado debe estar entre 0 y montoNeto." });
     }
 
-    const montoPagado = tipoPago === "contado" ? neto : Math.min(Math.max(montoPagadoRaw, 0), neto);
+    const montoPagado =
+      tipoPago === "contado" ? neto : Math.min(Math.max(montoPagadoRaw, 0), neto);
     const saldoPendiente = tipoPago === "contado" ? 0 : Math.max(0, neto - montoPagado);
 
     const COD_CAJA = "1001";
@@ -498,7 +676,7 @@ router.post("/", ensureAuth, async (req, res) => {
       saldoPendiente,
     };
 
-    const clienteId = req.body?.clienteId ?? req.body?.clientId ?? null;
+    const clienteId = req.body?.clienteId ?? req.body?.clientId ?? req.body?.cliente_id ?? null;
     if (clienteId) txPayload.clienteId = clienteId;
 
     tx = await IncomeTransaction.create(txPayload);
@@ -506,22 +684,32 @@ router.post("/", ensureAuth, async (req, res) => {
     const lines = [];
 
     if (descuento > 0) {
-      lines.push(await buildLine(owner, { code: COD_DESCUENTOS, debit: descuento, credit: 0, memo: "Descuento" }));
+      lines.push(
+        await buildLine(owner, { code: COD_DESCUENTOS, debit: descuento, credit: 0, memo: "Descuento" })
+      );
     }
 
     if (tipoPago === "contado") {
-      lines.push(await buildLine(owner, { code: codCobro, debit: neto, credit: 0, memo: "Cobro contado" }));
+      lines.push(
+        await buildLine(owner, { code: codCobro, debit: neto, credit: 0, memo: "Cobro contado" })
+      );
     } else {
       if (montoPagado > 0) {
-        lines.push(await buildLine(owner, { code: codCobro, debit: montoPagado, credit: 0, memo: "Cobro" }));
+        lines.push(
+          await buildLine(owner, { code: codCobro, debit: montoPagado, credit: 0, memo: "Cobro" })
+        );
       }
       if (saldoPendiente > 0) {
-        lines.push(await buildLine(owner, { code: COD_CLIENTES, debit: saldoPendiente, credit: 0, memo: "Saldo pendiente" }));
+        lines.push(
+          await buildLine(owner, { code: COD_CLIENTES, debit: saldoPendiente, credit: 0, memo: "Saldo pendiente" })
+        );
       }
     }
 
     const haberIngresos = descuento > 0 ? total : neto;
-    lines.push(await buildLine(owner, { code: cuentaCodigo, debit: 0, credit: haberIngresos, memo: "Ingreso" }));
+    lines.push(
+      await buildLine(owner, { code: cuentaCodigo, debit: 0, credit: haberIngresos, memo: "Ingreso" })
+    );
 
     const numeroAsiento = await nextJournalNumber(owner, tx.fecha);
 
@@ -535,12 +723,19 @@ router.post("/", ensureAuth, async (req, res) => {
       numeroAsiento,
     });
 
+    // ✅ Asiento enriquecido con cuenta_nombre
+    const entryCodes = (entry.lines || [])
+      .map((l) => l.accountCodigo ?? l.accountCode ?? null)
+      .filter(Boolean)
+      .map(String);
+
+    const accountNameMap = await getAccountNameMap(owner, entryCodes);
+    const asiento = mapEntryForUI(entry, accountNameMap);
+
+    // ✅ Transacción enriquecida con cliente + cuenta para el modal
     let txUI = mapTxForUI(tx.toObject ? tx.toObject() : tx);
-
-    // ✅ enriquecer cliente en respuesta del POST (para el modal)
+    txUI = (await attachAccountInfo(owner, [txUI]))[0];
     txUI = (await attachClientInfo(owner, [txUI]))[0];
-
-    const asiento = mapEntryForUI(entry);
 
     return res.status(201).json({
       ok: true,
