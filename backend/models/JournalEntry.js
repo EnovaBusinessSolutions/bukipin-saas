@@ -17,6 +17,8 @@ const journalEntrySchema = new mongoose.Schema(
     date: { type: Date, default: Date.now, index: true },
     concept: { type: String, default: "", trim: true },
 
+    numeroAsiento: { type: String, default: null, index: true },
+
     source: { type: String, default: "", index: true }, // ingreso, pago_cxp, etc.
     sourceId: { type: mongoose.Schema.Types.ObjectId, default: null, index: true },
 
@@ -47,5 +49,7 @@ const journalEntrySchema = new mongoose.Schema(
 journalEntrySchema.index({ owner: 1, date: -1 });
 journalEntrySchema.index({ owner: 1, source: 1, date: -1 });
 journalEntrySchema.index({ owner: 1, source: 1, sourceId: 1 });
+journalEntrySchema.index({ owner: 1, numeroAsiento: 1 }, { unique: true, sparse: true });
+
 
 module.exports = mongoose.model("JournalEntry", journalEntrySchema);

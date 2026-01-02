@@ -6,6 +6,8 @@ const ensureAuth = require("../middleware/ensureAuth");
 const IncomeTransaction = require("../models/IncomeTransaction");
 const JournalEntry = require("../models/JournalEntry");
 const Account = require("../models/Account");
+const Counter = require("../models/Counter");
+
 
 // Opcional (si existe en tu proyecto)
 let Client = null;
@@ -62,6 +64,22 @@ function toYMD(d) {
   const day = String(dt.getDate()).padStart(2, "0");
   return `${y}-${m}-${day}`;
 }
+
+async function nextJournalNumber(owner, dateObj) {
+  const year = new Date(dateObj).getFullYear();
+  const key = `journal-${year}`;
+
+  const doc = await Counter.findOneAndUpdate(
+    { owner, key },
+    { $inc: { seq: 1 } },
+    { new: true, upsert: true }
+  ).lean();
+
+  const seq = doc?.seq || 1;
+  const numeroAsiento = `${year}-${String(seq).padStart(4, "0")}`;
+  return numeroAsiento;
+}
+
 
 /**
  * ✅ Mapeo mínimo COMPAT para transacciones (NO toca DB)
@@ -171,9 +189,21 @@ function mapEntryForUI(entry) {
     memo: l.memo ?? "",
   }));
 
+  // 👇 para que el frontend pueda usar "detalles" o "detalle_asientos"
+  const detalles = detalle_asientos.map((d) => ({
+    cuenta: d.cuenta_codigo,
+    descripcion: d.memo || "",
+    debe: d.debe,
+    haber: d.haber,
+  }));
+
   return {
     id: String(entry._id),
     _id: entry._id,
+
+    // ✅ folio/número
+    numeroAsiento: entry.numeroAsiento ?? null,
+    numero_asiento: entry.numeroAsiento ?? null,
 
     asiento_fecha: toYMD(entry.date),
     fecha: entry.date,
@@ -183,11 +213,13 @@ function mapEntryForUI(entry) {
     transaccion_ingreso_id: entry.sourceId ? String(entry.sourceId) : null,
 
     detalle_asientos,
+    detalles,
 
     created_at: entry.createdAt,
     updated_at: entry.updatedAt,
   };
 }
+
 
 /**
  * Aplanar asientos a "detalles" contables (analítica lo usa mucho)
@@ -461,9 +493,10 @@ router.post("/:id/cancelar", ensureAuth, async (req, res) => {
  * Crea transacción + asiento contable.
  */
 router.post("/", ensureAuth, async (req, res) => {
-  try {
-    const owner = req.user._id;
+  const owner = req.user._id;   // ✅ fuera del try
+  let tx = null;               // ✅ fuera del try (para rollback)
 
+  try {
     const tipoIngreso = String(req.body?.tipoIngreso || "general");
     const descripcion = String(req.body?.descripcion || "Ingreso").trim();
 
@@ -480,13 +513,11 @@ router.post("/", ensureAuth, async (req, res) => {
 
     const subcuentaId = req.body?.subcuentaId ?? null;
 
-    // ✅ CAMBIO MÍNIMO: parse robusto de fecha (corrige hora incorrecta)
+    // ✅ fecha robusta
     let fecha = null;
     if (req.body?.fecha) {
       fecha = parseTxDate(req.body.fecha);
-      if (!fecha) {
-        return res.status(400).json({ ok: false, message: "fecha inválida." });
-      }
+      if (!fecha) return res.status(400).json({ ok: false, message: "fecha inválida." });
     } else {
       fecha = new Date();
     }
@@ -525,15 +556,12 @@ router.post("/", ensureAuth, async (req, res) => {
       fecha,
       tipoIngreso,
       descripcion,
-
       montoTotal: total,
       montoDescuento: descuento,
       montoNeto: neto,
-
       metodoPago,
       tipoPago,
       montoPagado,
-
       cuentaCodigo,
       subcuentaId,
       saldoPendiente,
@@ -542,62 +570,42 @@ router.post("/", ensureAuth, async (req, res) => {
     const clienteId = req.body?.clienteId ?? req.body?.clientId ?? null;
     if (clienteId) txPayload.clienteId = clienteId;
 
-    const tx = await IncomeTransaction.create(txPayload);
+    // ✅ Guardamos tx pero la dejamos en "tx" (let) para rollback
+    tx = await IncomeTransaction.create(txPayload);
 
+    // ✅ Construir líneas
     const lines = [];
 
     if (descuento > 0) {
       lines.push(
-        await buildLine(owner, {
-          code: COD_DESCUENTOS,
-          debit: descuento,
-          credit: 0,
-          memo: "Descuento",
-        })
+        await buildLine(owner, { code: COD_DESCUENTOS, debit: descuento, credit: 0, memo: "Descuento" })
       );
     }
 
     if (tipoPago === "contado") {
       lines.push(
-        await buildLine(owner, {
-          code: codCobro,
-          debit: neto,
-          credit: 0,
-          memo: "Cobro contado",
-        })
+        await buildLine(owner, { code: codCobro, debit: neto, credit: 0, memo: "Cobro contado" })
       );
     } else {
       if (montoPagado > 0) {
         lines.push(
-          await buildLine(owner, {
-            code: codCobro,
-            debit: montoPagado,
-            credit: 0,
-            memo: "Cobro",
-          })
+          await buildLine(owner, { code: codCobro, debit: montoPagado, credit: 0, memo: "Cobro" })
         );
       }
       if (saldoPendiente > 0) {
         lines.push(
-          await buildLine(owner, {
-            code: COD_CLIENTES,
-            debit: saldoPendiente,
-            credit: 0,
-            memo: "Saldo pendiente",
-          })
+          await buildLine(owner, { code: COD_CLIENTES, debit: saldoPendiente, credit: 0, memo: "Saldo pendiente" })
         );
       }
     }
 
     const haberIngresos = descuento > 0 ? total : neto;
     lines.push(
-      await buildLine(owner, {
-        code: cuentaCodigo,
-        debit: 0,
-        credit: haberIngresos,
-        memo: "Ingreso",
-      })
+      await buildLine(owner, { code: cuentaCodigo, debit: 0, credit: haberIngresos, memo: "Ingreso" })
     );
+
+    // ✅ Folio real tipo 2026-0001
+    const numeroAsiento = await nextJournalNumber(owner, tx.fecha);
 
     const entry = await JournalEntry.create({
       owner,
@@ -606,27 +614,30 @@ router.post("/", ensureAuth, async (req, res) => {
       source: "ingreso",
       sourceId: tx._id,
       lines,
+      numeroAsiento,
     });
 
     const asiento = mapEntryForUI(entry);
-    const numeroAsiento = String(entry._id);
-
-    // ✅ devolvemos transaction también “compat” (esto ayuda al modal)
     const txUI = mapTxForUI(tx.toObject ? tx.toObject() : tx);
 
     return res.status(201).json({
       ok: true,
       numeroAsiento,
       asiento,
-      transaction: txUI, // compat extra
+      transaction: txUI,
       data: {
         transaction: txUI,
-        journalEntry: entry,
         asiento,
         numeroAsiento,
+        journalEntryId: String(entry._id),
       },
     });
   } catch (err) {
+    // ✅ Rollback REAL (ahora sí existe tx)
+    if (tx?._id) {
+      await IncomeTransaction.deleteOne({ _id: tx._id, owner }).catch(() => {});
+    }
+
     const status = err?.statusCode || 500;
     console.error("POST /api/ingresos error:", err);
     return res.status(status).json({ ok: false, message: err?.message || "Error creando ingreso" });
