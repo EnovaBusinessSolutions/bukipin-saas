@@ -21,6 +21,46 @@ function num(v, def = 0) {
   return Number.isFinite(n) ? n : def;
 }
 
+/**
+ * ✅ FIX FECHA/HORA (TZ issue)
+ * Si `fecha` viene guardada como "date-only" (00:00:00.000Z), el navegador (-06)
+ * la mueve a 18:00 del día anterior.
+ *
+ * Solución: mantener el día de `fecha` pero tomar la hora real desde `createdAt`.
+ */
+function fixFechaWithCreatedAt(tx) {
+  const f = tx?.fecha ? new Date(tx.fecha) : null;
+  const c = tx?.createdAt ? new Date(tx.createdAt) : null;
+
+  if (!f && c) return c;
+  if (!f) return null;
+
+  const isMidnightUTC =
+    f.getUTCHours() === 0 &&
+    f.getUTCMinutes() === 0 &&
+    f.getUTCSeconds() === 0 &&
+    f.getUTCMilliseconds() === 0;
+
+  // Si ya trae hora real, úsala tal cual
+  if (!isMidnightUTC) return f;
+
+  // Si no tenemos createdAt, al menos devolvemos f (date-only)
+  if (!c || Number.isNaN(c.getTime())) return f;
+
+  // Mantén el día de `fecha`, pero usa la hora de createdAt
+  return new Date(
+    Date.UTC(
+      f.getUTCFullYear(),
+      f.getUTCMonth(),
+      f.getUTCDate(),
+      c.getUTCHours(),
+      c.getUTCMinutes(),
+      c.getUTCSeconds(),
+      c.getUTCMilliseconds()
+    )
+  );
+}
+
 async function getAccountNameMap(owner, codes) {
   const unique = Array.from(
     new Set((codes || []).filter(Boolean).map((c) => String(c).trim()))
@@ -151,13 +191,18 @@ async function attachClientInfo(owner, items) {
 }
 
 function mapTxCompat(tx) {
+  // ✅ Fecha/hora corregida para UI
+  const fechaFixed = fixFechaWithCreatedAt(tx);
+
   // Normaliza montos
   const montoTotal = num(tx.montoTotal ?? tx.monto_total ?? 0);
   const montoDescuento = num(tx.montoDescuento ?? tx.monto_descuento ?? 0);
 
   // Si no viene montoNeto, lo calculamos
   const montoNeto = num(
-    tx.montoNeto ?? tx.monto_neto ?? Math.max(0, montoTotal - Math.max(0, montoDescuento)),
+    tx.montoNeto ??
+      tx.monto_neto ??
+      Math.max(0, montoTotal - Math.max(0, montoDescuento)),
     0
   );
 
@@ -169,17 +214,25 @@ function mapTxCompat(tx) {
     NaN
   );
 
-  const saldoPendiente =
-    Number.isFinite(saldoPendienteSaved)
-      ? saldoPendienteSaved
-      : Math.max(0, montoNeto - montoPagado);
+  const saldoPendiente = Number.isFinite(saldoPendienteSaved)
+    ? saldoPendienteSaved
+    : Math.max(0, montoNeto - montoPagado);
 
   const cuentaCodigo =
-    tx.cuentaCodigo ?? tx.cuenta_codigo ?? tx.cuentaPrincipalCodigo ?? tx.cuenta_principal_codigo ?? null;
+    tx.cuentaCodigo ??
+    tx.cuenta_codigo ??
+    tx.cuentaPrincipalCodigo ??
+    tx.cuenta_principal_codigo ??
+    null;
 
   return {
     ...tx,
     id: String(tx._id ?? tx.id),
+
+    // ✅ Sobrescribimos fecha para que el frontend pinte bien
+    // (si es date-only, ahora ya trae hora real)
+    fecha: fechaFixed || tx.fecha,
+    fecha_fixed: fechaFixed ? fechaFixed.toISOString() : null,
 
     // Montos camel
     montoTotal,
@@ -209,7 +262,8 @@ function mapTxCompat(tx) {
     cuenta_principal_codigo: cuentaCodigo ?? tx.cuenta_principal_codigo ?? null,
 
     // clienteId (normalizado)
-    clienteId: tx.clienteId ?? tx.clientId ?? tx.cliente_id ?? tx.clienteID ?? null,
+    clienteId:
+      tx.clienteId ?? tx.clientId ?? tx.cliente_id ?? tx.clienteID ?? null,
   };
 }
 
@@ -227,7 +281,7 @@ router.get("/ingresos/recientes", ensureAuth, async (req, res) => {
       .limit(limit)
       .lean();
 
-    // 1) compat con UI (pendiente/campos snake)
+    // 1) compat con UI (pendiente/campos snake + fecha corregida)
     let items = rows.map(mapTxCompat);
 
     // 2) cuenta principal display "4001 - Ventas"
