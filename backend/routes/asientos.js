@@ -3,8 +3,8 @@ const express = require("express");
 const router = express.Router();
 
 const mongoose = require("mongoose");
-const JournalEntry = require("../models/JournalEntry"); // ajusta ruta/nombre si difiere
-const ensureAuth = require("../middleware/ensureAuth"); // ✅ tu middleware real
+const JournalEntry = require("../models/JournalEntry");
+const ensureAuth = require("../middleware/ensureAuth");
 
 function num(v, def = 0) {
   const n = Number(v);
@@ -21,22 +21,35 @@ function toYMD(d) {
 }
 
 /**
- * Map mínimo compatible con tu UI (igual al de ingresos.js)
- * - NO altera datos, solo los expone en el shape "legacy"
+ * ✅ Mapeo compat con RegistroIngresos.tsx
+ * - detalle_asientos (legacy)
+ * - detalles (lo que el modal usa para la tabla)
+ * - numeroAsiento / numero_asiento
  */
 function mapEntryForUI(entry) {
-  const lines = entry.lines || entry.detalle_asientos || [];
+  const rawLines = entry.lines || entry.detalle_asientos || [];
 
-  const detalle_asientos = (lines || []).map((l) => ({
+  const detalle_asientos = (rawLines || []).map((l) => ({
     cuenta_codigo: l.accountCodigo ?? l.accountCode ?? l.cuenta_codigo ?? null,
     debe: num(l.debit ?? l.debe, 0),
     haber: num(l.credit ?? l.haber, 0),
-    memo: l.memo ?? "",
+    memo: l.memo ?? l.descripcion ?? "",
+  }));
+
+  const detalles = detalle_asientos.map((d) => ({
+    cuenta: d.cuenta_codigo,
+    descripcion: d.memo || "",
+    debe: d.debe,
+    haber: d.haber,
   }));
 
   return {
     id: String(entry._id),
     _id: entry._id,
+
+    // ✅ folio/número (nuevo)
+    numeroAsiento: entry.numeroAsiento ?? null,
+    numero_asiento: entry.numeroAsiento ?? null,
 
     asiento_fecha: toYMD(entry.date),
     fecha: entry.date,
@@ -46,9 +59,10 @@ function mapEntryForUI(entry) {
     transaccion_ingreso_id: entry.sourceId ? String(entry.sourceId) : null,
 
     detalle_asientos,
+    detalles,
 
-    created_at: entry.createdAt,
-    updated_at: entry.updatedAt,
+    created_at: entry.createdAt ?? null,
+    updated_at: entry.updatedAt ?? null,
   };
 }
 
@@ -57,7 +71,7 @@ router.get("/by-transaccion", ensureAuth, async (req, res) => {
   try {
     let { source, id } = req.query;
 
-    source = String(source || "").trim();
+    source = String(source || "").trim().toLowerCase();
     id = String(id || "").trim();
 
     if (!source || !id) {
@@ -68,83 +82,72 @@ router.get("/by-transaccion", ensureAuth, async (req, res) => {
       });
     }
 
-    // ✅ Alias mínimo: la UI suele mandar "ingreso"
-    // pero si llega "ingresos", lo convertimos.
-    // También buscamos ambas variantes para no romper nada.
-    const sourceAliases = new Set([source.toLowerCase()]);
-    if (source.toLowerCase() === "ingresos") sourceAliases.add("ingreso");
-    if (source.toLowerCase() === "ingreso") sourceAliases.add("ingresos");
+    // ✅ alias robustos
+    const sourceAliases = new Set([source]);
+    if (source === "ingresos") sourceAliases.add("ingreso");
+    if (source === "ingreso") sourceAliases.add("ingresos");
 
-    // Multi-tenant
     const owner = req.user._id;
 
-    // ✅ Soporte a sourceId como string u ObjectId (sin romper)
+    // ✅ soporta sourceId string u ObjectId
     const sourceIdCandidates = [id];
     if (mongoose.Types.ObjectId.isValid(id)) {
       sourceIdCandidates.push(new mongoose.Types.ObjectId(id));
     }
 
-    // 👇 Mantenemos tu lógica existente y SOLO la hacemos robusta:
-    // 1) canónico: sourceId (string/ObjectId)
-    // 2) legacy: transaccionId/transaccion_id
-    // 3) references
-    const asiento =
-      (await JournalEntry.findOne({
-        owner,
-        source: { $in: Array.from(sourceAliases) },
-        sourceId: { $in: sourceIdCandidates }, // ✅ robusto
-      })
-        .sort({ createdAt: -1 })
-        .lean()) ||
+    // 1) canónico: sourceId
+    let asiento = await JournalEntry.findOne({
+      owner,
+      source: { $in: Array.from(sourceAliases) },
+      sourceId: { $in: sourceIdCandidates },
+    })
+      .sort({ createdAt: -1 })
+      .lean();
 
-      (await JournalEntry.findOne({
-        owner,
-        source: { $in: Array.from(sourceAliases) },
-        transaccionId: id,
-      })
-        .sort({ createdAt: -1 })
-        .lean()) ||
-
-      (await JournalEntry.findOne({
-        owner,
-        source: { $in: Array.from(sourceAliases) },
-        transaccion_id: id,
-      })
-        .sort({ createdAt: -1 })
-        .lean()) ||
-
-      (await JournalEntry.findOne({
-        owner,
-        "references.source": { $in: Array.from(sourceAliases) },
-        "references.id": id,
-      })
-        .sort({ createdAt: -1 })
-        .lean());
+    // 2) legacy fallbacks por si tuvieras campos viejos
+    if (!asiento) {
+      asiento =
+        (await JournalEntry.findOne({
+          owner,
+          source: { $in: Array.from(sourceAliases) },
+          transaccionId: id,
+        })
+          .sort({ createdAt: -1 })
+          .lean()) ||
+        (await JournalEntry.findOne({
+          owner,
+          source: { $in: Array.from(sourceAliases) },
+          transaccion_id: id,
+        })
+          .sort({ createdAt: -1 })
+          .lean()) ||
+        (await JournalEntry.findOne({
+          owner,
+          "references.source": { $in: Array.from(sourceAliases) },
+          "references.id": id,
+        })
+          .sort({ createdAt: -1 })
+          .lean());
+    }
 
     if (!asiento) {
-      // 404 limpio
       return res.status(404).json({ ok: false, error: "NOT_FOUND" });
     }
 
-    // ✅ Respuesta compatible con UI (legacy + raw)
     const asientoUI = mapEntryForUI(asiento);
-    const numeroAsiento = String(asiento._id);
+
+    // ✅ numeroAsiento preferido; fallback al _id
+    const numeroAsiento = asientoUI.numeroAsiento || asientoUI.numero_asiento || String(asiento._id);
 
     return res.json({
       ok: true,
-
-      // compat "data"
       data: {
         asiento: asientoUI,
         numeroAsiento,
         raw: asiento,
       },
-
-      // compat extra (por si en algún lado lo consumen directo)
       asiento: asientoUI,
       numeroAsiento,
-
-      // compat array
       asientos: [asientoUI],
     });
   } catch (e) {
