@@ -45,6 +45,10 @@ function num(v, def = 0) {
   return Number.isFinite(n) ? n : def;
 }
 
+function lower(v) {
+  return String(v ?? "").trim().toLowerCase();
+}
+
 function toYMD(d) {
   const dt = new Date(d);
   if (Number.isNaN(dt.getTime())) return null;
@@ -72,19 +76,54 @@ async function nextJournalNumber(owner, dateObj) {
  * ======= ENRIQUECIMIENTOS (clave para que el modal se vea como Bukipin 2) =======
  */
 
+/**
+ * ✅ Montos consistentes SIEMPRE (no depender de saldoPendiente guardado)
+ */
+function computeMontos(tx) {
+  const total = num(tx?.montoTotal ?? tx?.monto_total ?? tx?.total, 0);
+  const descuento = num(tx?.montoDescuento ?? tx?.monto_descuento ?? tx?.descuento, 0);
+
+  // neto: si existe úsalo, si no: total-descuento
+  const neto = num(
+    tx?.montoNeto ?? tx?.monto_neto ?? tx?.neto,
+    Math.max(0, total - Math.max(0, descuento))
+  );
+
+  const pagado = num(
+    tx?.montoPagado ?? tx?.monto_pagado ?? tx?.pagado,
+    0
+  );
+
+  const tipoPago = lower(tx?.tipoPago ?? tx?.tipo_pago);
+
+  // ✅ regla E2E: contado => 0; parcial/credito => max(0, neto - pagado)
+  const pendiente =
+    tipoPago === "contado"
+      ? 0
+      : Math.max(0, Number((neto - pagado).toFixed(2)));
+
+  return { total, descuento, neto, pagado, pendiente, tipoPago };
+}
+
 async function getAccountNameMap(owner, codes) {
   const unique = Array.from(
     new Set((codes || []).filter(Boolean).map((c) => String(c).trim()))
   );
   if (!unique.length) return {};
 
-  const rows = await Account.find({ owner, code: { $in: unique } })
-    .select("code name nombre")
+  // ✅ soporta Account.code y Account.codigo
+  const rows = await Account.find({
+    owner,
+    $or: [{ code: { $in: unique } }, { codigo: { $in: unique } }],
+  })
+    .select("code codigo name nombre")
     .lean();
 
   const map = {};
   for (const r of rows) {
-    map[String(r.code)] = r.name ?? r.nombre ?? "";
+    const code = String(r.code ?? r.codigo ?? "").trim();
+    if (!code) continue;
+    map[code] = r.name ?? r.nombre ?? "";
   }
   return map;
 }
@@ -93,14 +132,29 @@ async function attachAccountInfo(owner, items) {
   if (!items?.length) return items;
 
   const codes = items
-    .map((it) => it.cuenta_codigo ?? it.cuentaCodigo ?? it.cuentaPrincipalCodigo ?? null)
+    .map(
+      (it) =>
+        it.cuenta_codigo ??
+        it.cuentaCodigo ??
+        it.cuentaPrincipalCodigo ??
+        it.cuenta_principal_codigo ??
+        it.cuenta_principal ??
+        null
+    )
     .filter(Boolean)
     .map(String);
 
   const accountNameMap = await getAccountNameMap(owner, codes);
 
   return items.map((it) => {
-    const code = String(it.cuenta_codigo ?? it.cuentaCodigo ?? it.cuentaPrincipalCodigo ?? "").trim();
+    const code = String(
+      it.cuenta_codigo ??
+        it.cuentaCodigo ??
+        it.cuentaPrincipalCodigo ??
+        it.cuenta_principal_codigo ??
+        ""
+    ).trim();
+
     if (!code) return it;
 
     const nombre = accountNameMap[code] || it.cuenta_nombre || it.cuentaName || null;
@@ -111,11 +165,14 @@ async function attachAccountInfo(owner, items) {
       cuenta_codigo: it.cuenta_codigo ?? code,
       cuenta_nombre: it.cuenta_nombre ?? nombre,
 
-      // Aliases para UI/legacy (por si los usa)
+      // ✅ campos tipo Bukipin 2 (para "Cuenta Principal")
+      cuentaPrincipalCodigo: it.cuentaPrincipalCodigo ?? code,
+      cuentaPrincipalNombre: it.cuentaPrincipalNombre ?? nombre,
+      cuentaPrincipal: it.cuentaPrincipal ?? display,
+
       cuenta_principal_codigo: it.cuenta_principal_codigo ?? code,
       cuenta_principal_nombre: it.cuenta_principal_nombre ?? nombre,
       cuenta_principal: it.cuenta_principal ?? display,
-      cuentaPrincipal: it.cuentaPrincipal ?? display,
     };
   });
 }
@@ -129,7 +186,15 @@ async function attachClientInfo(owner, items) {
   const ids = Array.from(
     new Set(
       items
-        .map((it) => it.clienteId || it.clientId || it.cliente_id || it.clienteID)
+        .map(
+          (it) =>
+            it.clienteId ||
+            it.clientId ||
+            it.cliente_id ||
+            it.client_id ||
+            it.clienteID ||
+            null
+        )
         .filter(Boolean)
         .map((v) => String(v))
         .filter((v) => mongoose.Types.ObjectId.isValid(v))
@@ -159,30 +224,50 @@ async function attachClientInfo(owner, items) {
 
   return items.map((it) => {
     const cidRaw =
-      it.clienteId || it.clientId || it.cliente_id || it.clienteID || "";
+      it.clienteId ||
+      it.clientId ||
+      it.cliente_id ||
+      it.client_id ||
+      it.clienteID ||
+      "";
     const cid = cidRaw ? String(cidRaw) : "";
     const c = cid ? map.get(cid) : null;
     if (!c) return it;
 
     return {
       ...it,
-      // Campos que tu UI espera para el modal:
+
+      // ✅ snake_case (UI modal)
       cliente_nombre: it.cliente_nombre ?? c.nombre,
       cliente_email: it.cliente_email ?? c.email,
       cliente_telefono: it.cliente_telefono ?? c.telefono,
       cliente_rfc: it.cliente_rfc ?? c.rfc,
+
+      // ✅ camelCase (por si alguna vista lo usa)
+      clienteNombre: it.clienteNombre ?? c.nombre,
+      clienteEmail: it.clienteEmail ?? c.email,
+      clienteTelefono: it.clienteTelefono ?? c.telefono,
+      clienteRfc: it.clienteRfc ?? c.rfc,
     };
   });
 }
 
 /**
  * ✅ Mapeo compat para UI Lovable (transacciones)
+ * IMPORTANTÍSIMO: aquí corregimos pendiente y “Cuenta Principal”
  */
 function mapTxForUI(tx) {
   const fecha = tx.fecha ? new Date(tx.fecha) : null;
-  const saldoPendiente = tx.saldoPendiente ?? tx.saldo_pendiente ?? 0;
 
-  const cuentaCodigo = tx.cuentaCodigo ?? tx.cuenta_codigo ?? tx.cuentaPrincipalCodigo ?? null;
+  const montos = computeMontos(tx);
+
+  // ✅ leer código de cuenta desde todas las variantes posibles
+  const cuentaCodigo =
+    tx.cuentaCodigo ??
+    tx.cuenta_codigo ??
+    tx.cuentaPrincipalCodigo ??
+    tx.cuenta_principal_codigo ??
+    null;
 
   return {
     ...tx,
@@ -192,24 +277,54 @@ function mapTxForUI(tx) {
     fecha,
     fecha_ymd: fecha ? toYMD(fecha) : null,
 
-    // montos (aliases)
-    monto_total: tx.montoTotal ?? tx.monto_total ?? 0,
-    monto_descuento: tx.montoDescuento ?? tx.monto_descuento ?? 0,
-    monto_neto: tx.montoNeto ?? tx.monto_neto ?? 0,
-    monto_pagado: tx.montoPagado ?? tx.monto_pagado ?? 0,
+    // ✅ montos canonical + aliases
+    montoTotal: montos.total,
+    montoDescuento: montos.descuento,
+    montoNeto: montos.neto,
+    montoPagado: montos.pagado,
 
-    // UI usa monto_pendiente
-    monto_pendiente: tx.monto_pendiente ?? saldoPendiente,
-    saldo_pendiente: saldoPendiente,
+    // ✅ pendiente correcto SIEMPRE
+    montoPendiente: montos.pendiente,
+    saldoPendiente: montos.pendiente,
+
+    // snake_case
+    monto_total: montos.total,
+    monto_descuento: montos.descuento,
+    monto_neto: montos.neto,
+    monto_pagado: montos.pagado,
+    monto_pendiente: montos.pendiente,
+    saldo_pendiente: montos.pendiente,
+
+    // por si la UI usa estos
+    total: montos.total,
+    descuento: montos.descuento,
+    neto: montos.neto,
+    pagado: montos.pagado,
+    pendiente: montos.pendiente,
 
     // pagos
+    metodoPago: tx.metodoPago ?? tx.metodo_pago ?? null,
+    tipoPago: tx.tipoPago ?? tx.tipo_pago ?? montos.tipoPago ?? null,
+
     metodo_pago: tx.metodoPago ?? tx.metodo_pago ?? null,
-    tipo_pago: tx.tipoPago ?? tx.tipo_pago ?? null,
+    tipo_pago: tx.tipoPago ?? tx.tipo_pago ?? montos.tipoPago ?? null,
 
     // cuenta
+    cuentaCodigo: cuentaCodigo ?? null,
     cuenta_codigo: cuentaCodigo ?? null,
+    cuentaPrincipalCodigo: tx.cuentaPrincipalCodigo ?? tx.cuenta_principal_codigo ?? cuentaCodigo ?? null,
+    cuenta_principal_codigo: tx.cuenta_principal_codigo ?? tx.cuentaPrincipalCodigo ?? cuentaCodigo ?? null,
 
     // cliente (si viene enriquecido)
+    clienteId:
+      tx.clienteId ?? tx.clientId ?? tx.cliente_id ?? tx.client_id ?? null,
+    clientId:
+      tx.clientId ?? tx.clienteId ?? tx.cliente_id ?? tx.client_id ?? null,
+    cliente_id:
+      tx.cliente_id ?? tx.clienteId ?? tx.clientId ?? tx.client_id ?? null,
+    client_id:
+      tx.client_id ?? tx.clientId ?? tx.clienteId ?? tx.cliente_id ?? null,
+
     cliente_nombre: tx.cliente_nombre ?? null,
     cliente_email: tx.cliente_email ?? null,
     cliente_telefono: tx.cliente_telefono ?? null,
@@ -243,8 +358,12 @@ function journalLineMode() {
 }
 
 async function accountIdByCode(owner, code) {
-  const acc = await Account.findOne({ owner, code: String(code).trim() })
-    .select("_id code name")
+  const c = String(code).trim();
+  const acc = await Account.findOne({
+    owner,
+    $or: [{ code: c }, { codigo: c }],
+  })
+    .select("_id code codigo name nombre")
     .lean();
   return acc?._id || null;
 }
@@ -262,7 +381,7 @@ async function buildLine(owner, { code, debit = 0, credit = 0, memo = "" }) {
     const id = await accountIdByCode(owner, code);
     if (!id) {
       const err = new Error(
-        `No existe la cuenta contable con code="${String(code).trim()}" para este usuario. Asegúrate de que el seed la haya creado.`
+        `No existe la cuenta contable con code/codigo="${String(code).trim()}" para este usuario. Asegúrate de que el seed la haya creado.`
       );
       err.statusCode = 400;
       throw err;
@@ -430,7 +549,6 @@ router.get("/asientos", ensureAuth, async (req, res) => {
       .sort({ date: -1, createdAt: -1 })
       .lean();
 
-    // ✅ accountNameMap para cuenta_nombre en cada línea
     const allCodes = entries
       .flatMap((e) => (e.lines || []).map((l) => l.accountCodigo ?? l.accountCode ?? null))
       .filter(Boolean)
@@ -488,10 +606,10 @@ router.get("/detalles", ensureAuth, async (req, res) => {
     // ✅ 2) cliente (para el modal)
     items = await attachClientInfo(owner, items);
 
-    const total = itemsRaw.reduce(
-      (acc, it) => acc + num(it.montoNeto ?? it.montoTotal ?? 0),
-      0
-    );
+    const total = itemsRaw.reduce((acc, it) => {
+      const m = computeMontos(it);
+      return acc + num(m.neto, 0);
+    }, 0);
 
     return res.json({
       ok: true,
@@ -665,19 +783,42 @@ router.post("/", ensureAuth, async (req, res) => {
       fecha,
       tipoIngreso,
       descripcion,
+
       montoTotal: total,
       montoDescuento: descuento,
       montoNeto: neto,
       metodoPago,
       tipoPago,
       montoPagado,
+
+      // ✅ espejo de cuenta para que NUNCA se pierda por schema strict
       cuentaCodigo,
+      cuentaPrincipalCodigo: cuentaCodigo,
+      cuenta_principal_codigo: cuentaCodigo,
+
       subcuentaId,
+
+      // ✅ espejo de pendiente para que NUNCA se pierda por schema strict
       saldoPendiente,
+      saldo_pendiente: saldoPendiente,
+      montoPendiente: saldoPendiente,
+      monto_pendiente: saldoPendiente,
     };
 
-    const clienteId = req.body?.clienteId ?? req.body?.clientId ?? req.body?.cliente_id ?? null;
-    if (clienteId) txPayload.clienteId = clienteId;
+    // ✅ espejo de cliente para que NUNCA se pierda por schema strict
+    const clienteIdRaw =
+      req.body?.clienteId ??
+      req.body?.clientId ??
+      req.body?.cliente_id ??
+      req.body?.client_id ??
+      null;
+
+    if (clienteIdRaw) {
+      txPayload.clienteId = clienteIdRaw;
+      txPayload.clientId = clienteIdRaw;
+      txPayload.cliente_id = clienteIdRaw;
+      txPayload.client_id = clienteIdRaw;
+    }
 
     tx = await IncomeTransaction.create(txPayload);
 
@@ -685,7 +826,12 @@ router.post("/", ensureAuth, async (req, res) => {
 
     if (descuento > 0) {
       lines.push(
-        await buildLine(owner, { code: COD_DESCUENTOS, debit: descuento, credit: 0, memo: "Descuento" })
+        await buildLine(owner, {
+          code: COD_DESCUENTOS,
+          debit: descuento,
+          credit: 0,
+          memo: "Descuento",
+        })
       );
     }
 
@@ -723,7 +869,6 @@ router.post("/", ensureAuth, async (req, res) => {
       numeroAsiento,
     });
 
-    // ✅ Asiento enriquecido con cuenta_nombre
     const entryCodes = (entry.lines || [])
       .map((l) => l.accountCodigo ?? l.accountCode ?? null)
       .filter(Boolean)
