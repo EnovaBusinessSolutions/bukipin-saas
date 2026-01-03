@@ -16,95 +16,62 @@ try {
 } catch (_) {}
 
 /**
- * ============================================================================
- * ✅ FECHAS E2E (MX) — Evita el bug de 18:00 del día anterior por timezone UTC
+ * =========================
+ * ✅ TIMEZONE / FECHA E2E
+ * =========================
+ * Render/Node suele correr en UTC.
+ * El UI (CDMX -06) muestra 00:00Z como 18:00 del día anterior.
  *
- * Render/Node suele correr en UTC. Si parseas YYYY-MM-DD como Date directo,
- * JS lo interpreta como UTC 00:00, y en MX (-06) se ve como 18:00 del día anterior.
- *
- * México (CDMX) está fijo en UTC-06 (sin DST). Usamos offset fijo.
- * ============================================================================
+ * Estrategia:
+ * 1) Si llega fecha "YYYY-MM-DD" => guardamos con hora real de captura (no medianoche).
+ * 2) Si ya existe guardada como 00:00Z => para UI combinamos:
+ *    - día de `fecha`
+ *    - hora de `createdAt`
  */
-const MX_OFFSET_MIN = 6 * 60; // MX = UTC-06 => para convertir MX local → UTC, sumas 6h
-const MX_OFFSET_MS = MX_OFFSET_MIN * 60 * 1000;
+const TZ_OFFSET_MINUTES = Number(process.env.APP_TZ_OFFSET_MINUTES ?? -360); // CDMX estándar (-06)
 
 function isDateOnly(str) {
   return /^\d{4}-\d{2}-\d{2}$/.test(String(str || "").trim());
 }
 
-function hasExplicitTZ(str) {
+function dateOnlyToUtc(str, hh = 0, mm = 0, ss = 0, ms = 0) {
   const s = String(str || "").trim();
-  // ISO con Z o con offset al final
-  return /[zZ]$/.test(s) || /[+-]\d{2}:\d{2}$/.test(s);
+  if (!isDateOnly(s)) return null;
+  const [y, m, d] = s.split("-").map((x) => Number(x));
+  if (!y || !m || !d) return null;
+
+  // Interpretamos "YYYY-MM-DD HH:mm" como HORA LOCAL (TZ_OFFSET_MINUTES),
+  // y lo convertimos a UTC.
+  const utcMillis = Date.UTC(y, m - 1, d, hh, mm, ss, ms);
+  return new Date(utcMillis - TZ_OFFSET_MINUTES * 60 * 1000);
 }
 
-function parseISOWithoutTZ(str) {
-  // YYYY-MM-DDTHH:mm(:ss(.ms)?)?
-  const s = String(str || "").trim();
-  const m = s.match(
-    /^(\d{4})-(\d{2})-(\d{2})[T\s](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?$/
-  );
-  if (!m) return null;
-  const y = Number(m[1]);
-  const mo = Number(m[2]);
-  const d = Number(m[3]);
-  const hh = Number(m[4]);
-  const mm = Number(m[5]);
-  const ss = m[6] ? Number(m[6]) : 0;
-  const ms = m[7] ? Number(String(m[7]).padEnd(3, "0")) : 0;
-  return { y, mo, d, hh, mm, ss, ms };
-}
-
-function mexicoNowTimeParts() {
-  // Obtenemos “hora MX” sin depender del TZ del server:
-  // (nowUTC - 6h) y leemos como UTC parts.
-  const mx = new Date(Date.now() - MX_OFFSET_MS);
+function getLocalPartsFromUtc(dateObj) {
+  const d = new Date(dateObj);
+  if (Number.isNaN(d.getTime())) return null;
+  const local = new Date(d.getTime() + TZ_OFFSET_MINUTES * 60 * 1000);
   return {
-    hh: mx.getUTCHours(),
-    mm: mx.getUTCMinutes(),
-    ss: mx.getUTCSeconds(),
-    ms: mx.getUTCMilliseconds(),
+    hh: local.getUTCHours(),
+    mm: local.getUTCMinutes(),
+    ss: local.getUTCSeconds(),
+    ms: local.getUTCMilliseconds(),
   };
 }
 
-function dateFromMexicoLocalParts(y, mo, d, hh = 0, mm = 0, ss = 0, ms = 0) {
-  // “(y-mo-d hh:mm) MX” -> Date UTC sumando 6h
-  return new Date(Date.UTC(y, mo - 1, d, hh + 6, mm, ss, ms));
+function toYMDLocal(d) {
+  const dt = new Date(d);
+  if (Number.isNaN(dt.getTime())) return null;
+  const local = new Date(dt.getTime() + TZ_OFFSET_MINUTES * 60 * 1000);
+  const y = local.getUTCFullYear();
+  const m = String(local.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(local.getUTCDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
 }
 
 function parseStartDate(s) {
   if (!s) return null;
   const str = String(s).trim();
-
-  // 1) YYYY-MM-DD => inicio del día en MX (00:00:00.000)
-  if (isDateOnly(str)) {
-    const [y, mo, d] = str.split("-").map(Number);
-    const dt = dateFromMexicoLocalParts(y, mo, d, 0, 0, 0, 0);
-    return Number.isNaN(dt.getTime()) ? null : dt;
-  }
-
-  // 2) ISO con TZ (Z o +hh:mm) => absoluto
-  if (hasExplicitTZ(str)) {
-    const dt = new Date(str);
-    return Number.isNaN(dt.getTime()) ? null : dt;
-  }
-
-  // 3) ISO sin TZ => interpretarlo como MX local
-  const parts = parseISOWithoutTZ(str);
-  if (parts) {
-    const dt = dateFromMexicoLocalParts(
-      parts.y,
-      parts.mo,
-      parts.d,
-      parts.hh,
-      parts.mm,
-      parts.ss,
-      parts.ms
-    );
-    return Number.isNaN(dt.getTime()) ? null : dt;
-  }
-
-  // fallback
+  if (isDateOnly(str)) return dateOnlyToUtc(str, 0, 0, 0, 0);
   const d = new Date(str);
   return Number.isNaN(d.getTime()) ? null : d;
 }
@@ -112,77 +79,67 @@ function parseStartDate(s) {
 function parseEndDate(s) {
   if (!s) return null;
   const str = String(s).trim();
-
-  // 1) YYYY-MM-DD => fin del día en MX (23:59:59.999)
-  if (isDateOnly(str)) {
-    const [y, mo, d] = str.split("-").map(Number);
-    const dt = dateFromMexicoLocalParts(y, mo, d, 23, 59, 59, 999);
-    return Number.isNaN(dt.getTime()) ? null : dt;
-  }
-
-  // 2) ISO con TZ => absoluto
-  if (hasExplicitTZ(str)) {
-    const dt = new Date(str);
-    return Number.isNaN(dt.getTime()) ? null : dt;
-  }
-
-  // 3) ISO sin TZ => interpretarlo como MX local
-  const parts = parseISOWithoutTZ(str);
-  if (parts) {
-    const dt = dateFromMexicoLocalParts(
-      parts.y,
-      parts.mo,
-      parts.d,
-      parts.hh,
-      parts.mm,
-      parts.ss,
-      parts.ms
-    );
-    return Number.isNaN(dt.getTime()) ? null : dt;
-  }
-
+  if (isDateOnly(str)) return dateOnlyToUtc(str, 23, 59, 59, 999);
   const d = new Date(str);
   return Number.isNaN(d.getTime()) ? null : d;
 }
 
-function parseTxDate(s) {
-  if (!s) return null;
-  const str = String(s).trim();
-  if (!str) return null;
+/**
+ * ✅ Para guardar transacciones:
+ * - si llega YYYY-MM-DD => usar hora real (captura) pero mantener el día seleccionado
+ * - si llega ISO => usarlo tal cual
+ * - si no llega => now
+ */
+function parseTxDateSmart(raw, now = new Date()) {
+  if (!raw) return now;
+  const str = String(raw).trim();
+  if (!str) return now;
 
-  // ✅ Caso clave: YYYY-MM-DD (date-only)
-  // En ingresos, si el front manda solo el día, usamos la HORA ACTUAL de MX
-  // para que NO se guarde como medianoche (y NO brinque al día anterior).
-  if (isDateOnly(str)) {
-    const [y, mo, d] = str.split("-").map(Number);
-    const nowT = mexicoNowTimeParts();
-    const dt = dateFromMexicoLocalParts(y, mo, d, nowT.hh, nowT.mm, nowT.ss, nowT.ms);
-    return Number.isNaN(dt.getTime()) ? null : dt;
+  if (!isDateOnly(str)) {
+    const d = new Date(str);
+    return Number.isNaN(d.getTime()) ? now : d;
   }
 
-  // ISO con TZ => absoluto
-  if (hasExplicitTZ(str)) {
-    const dt = new Date(str);
-    return Number.isNaN(dt.getTime()) ? null : dt;
-  }
+  // YYYY-MM-DD: mantenemos el día, ponemos la hora real de captura
+  const parts = getLocalPartsFromUtc(now);
+  if (!parts) return now;
 
-  // ISO sin TZ => interpretarlo como MX local
-  const parts = parseISOWithoutTZ(str);
-  if (parts) {
-    const dt = dateFromMexicoLocalParts(
-      parts.y,
-      parts.mo,
-      parts.d,
-      parts.hh,
-      parts.mm,
-      parts.ss,
-      parts.ms
-    );
-    return Number.isNaN(dt.getTime()) ? null : dt;
-  }
+  const d2 = dateOnlyToUtc(str, parts.hh, parts.mm, parts.ss, parts.ms);
+  return d2 || now;
+}
 
-  const d = new Date(str);
-  return Number.isNaN(d.getTime()) ? null : d;
+/**
+ * ✅ Fix display: si `fecha` es medianoche UTC => se “va” al día anterior en -06.
+ * Mantén el día de fecha, usa la hora real de createdAt.
+ */
+function fixFechaWithCreatedAt(tx) {
+  const f = tx?.fecha ? new Date(tx.fecha) : null;
+  const c = tx?.createdAt ? new Date(tx.createdAt) : null;
+
+  if (!f && c && !Number.isNaN(c.getTime())) return c;
+  if (!f || Number.isNaN(f.getTime())) return null;
+
+  const isMidnightUTC =
+    f.getUTCHours() === 0 &&
+    f.getUTCMinutes() === 0 &&
+    f.getUTCSeconds() === 0 &&
+    f.getUTCMilliseconds() === 0;
+
+  if (!isMidnightUTC) return f;
+  if (!c || Number.isNaN(c.getTime())) return f;
+
+  // Creamos una fecha UTC con el día de f (UTC) y la hora de c (UTC)
+  return new Date(
+    Date.UTC(
+      f.getUTCFullYear(),
+      f.getUTCMonth(),
+      f.getUTCDate(),
+      c.getUTCHours(),
+      c.getUTCMinutes(),
+      c.getUTCSeconds(),
+      c.getUTCMilliseconds()
+    )
+  );
 }
 
 function num(v, def = 0) {
@@ -192,22 +149,6 @@ function num(v, def = 0) {
 
 function lower(v) {
   return String(v ?? "").trim().toLowerCase();
-}
-
-/**
- * ✅ YMD en horario México (para que no cambie de día por UTC)
- */
-function toYMD(d) {
-  const dt = new Date(d);
-  if (Number.isNaN(dt.getTime())) return null;
-
-  // Convertimos el instante UTC a “reloj MX” restando 6 horas y leyendo UTC parts.
-  const mx = new Date(dt.getTime() - MX_OFFSET_MS);
-
-  const y = mx.getUTCFullYear();
-  const m = String(mx.getUTCMonth() + 1).padStart(2, "0");
-  const day = String(mx.getUTCDate()).padStart(2, "0");
-  return `${y}-${m}-${day}`;
 }
 
 async function nextJournalNumber(owner, dateObj) {
@@ -225,34 +166,22 @@ async function nextJournalNumber(owner, dateObj) {
 }
 
 /**
- * ======= ENRIQUECIMIENTOS (clave para que el modal se vea como Bukipin 2) =======
- */
-
-/**
- * ✅ Montos consistentes SIEMPRE (no depender de saldoPendiente guardado)
+ * ======= ENRIQUECIMIENTOS =======
  */
 function computeMontos(tx) {
   const total = num(tx?.montoTotal ?? tx?.monto_total ?? tx?.total, 0);
   const descuento = num(tx?.montoDescuento ?? tx?.monto_descuento ?? tx?.descuento, 0);
 
-  // neto: si existe úsalo, si no: total-descuento
   const neto = num(
     tx?.montoNeto ?? tx?.monto_neto ?? tx?.neto,
     Math.max(0, total - Math.max(0, descuento))
   );
 
-  const pagado = num(
-    tx?.montoPagado ?? tx?.monto_pagado ?? tx?.pagado,
-    0
-  );
-
+  const pagado = num(tx?.montoPagado ?? tx?.monto_pagado ?? tx?.pagado, 0);
   const tipoPago = lower(tx?.tipoPago ?? tx?.tipo_pago);
 
-  // ✅ regla E2E: contado => 0; parcial/credito => max(0, neto - pagado)
   const pendiente =
-    tipoPago === "contado"
-      ? 0
-      : Math.max(0, Number((neto - pagado).toFixed(2)));
+    tipoPago === "contado" ? 0 : Math.max(0, Number((neto - pagado).toFixed(2)));
 
   return { total, descuento, neto, pagado, pendiente, tipoPago };
 }
@@ -263,7 +192,6 @@ async function getAccountNameMap(owner, codes) {
   );
   if (!unique.length) return {};
 
-  // ✅ soporta Account.code y Account.codigo
   const rows = await Account.find({
     owner,
     $or: [{ code: { $in: unique } }, { codigo: { $in: unique } }],
@@ -317,7 +245,6 @@ async function attachAccountInfo(owner, items) {
       cuenta_codigo: it.cuenta_codigo ?? code,
       cuenta_nombre: it.cuenta_nombre ?? nombre,
 
-      // ✅ campos tipo Bukipin 2 (para "Cuenta Principal")
       cuentaPrincipalCodigo: it.cuentaPrincipalCodigo ?? code,
       cuentaPrincipalNombre: it.cuentaPrincipalNombre ?? nombre,
       cuentaPrincipal: it.cuentaPrincipal ?? display,
@@ -329,9 +256,6 @@ async function attachAccountInfo(owner, items) {
   });
 }
 
-/**
- * ✅ Enriquecer transacciones con datos del cliente (para el modal)
- */
 async function attachClientInfo(owner, items) {
   if (!Client || !items?.length) return items;
 
@@ -376,26 +300,18 @@ async function attachClientInfo(owner, items) {
 
   return items.map((it) => {
     const cidRaw =
-      it.clienteId ||
-      it.clientId ||
-      it.cliente_id ||
-      it.client_id ||
-      it.clienteID ||
-      "";
+      it.clienteId || it.clientId || it.cliente_id || it.client_id || it.clienteID || "";
     const cid = cidRaw ? String(cidRaw) : "";
     const c = cid ? map.get(cid) : null;
     if (!c) return it;
 
     return {
       ...it,
-
-      // ✅ snake_case (UI modal)
       cliente_nombre: it.cliente_nombre ?? c.nombre,
       cliente_email: it.cliente_email ?? c.email,
       cliente_telefono: it.cliente_telefono ?? c.telefono,
       cliente_rfc: it.cliente_rfc ?? c.rfc,
 
-      // ✅ camelCase (por si alguna vista lo usa)
       clienteNombre: it.clienteNombre ?? c.nombre,
       clienteEmail: it.clienteEmail ?? c.email,
       clienteTelefono: it.clienteTelefono ?? c.telefono,
@@ -405,15 +321,14 @@ async function attachClientInfo(owner, items) {
 }
 
 /**
- * ✅ Mapeo compat para UI Lovable (transacciones)
- * IMPORTANTÍSIMO: aquí corregimos pendiente y “Cuenta Principal”
+ * ✅ Mapeo transacción para UI (con fecha FIXED)
  */
 function mapTxForUI(tx) {
-  const fecha = tx.fecha ? new Date(tx.fecha) : null;
+  const fechaFixed = fixFechaWithCreatedAt(tx);
+  const fecha = fechaFixed ? new Date(fechaFixed) : tx?.fecha ? new Date(tx.fecha) : null;
 
   const montos = computeMontos(tx);
 
-  // ✅ leer código de cuenta desde todas las variantes posibles
   const cuentaCodigo =
     tx.cuentaCodigo ??
     tx.cuenta_codigo ??
@@ -425,21 +340,19 @@ function mapTxForUI(tx) {
     ...tx,
     id: tx._id ? String(tx._id) : tx.id,
 
-    // fecha
+    // ✅ fecha corregida
     fecha,
-    fecha_ymd: fecha ? toYMD(fecha) : null,
+    fecha_fixed: fecha ? fecha.toISOString() : null,
+    fecha_ymd: fecha ? toYMDLocal(fecha) : null,
 
-    // ✅ montos canonical + aliases
     montoTotal: montos.total,
     montoDescuento: montos.descuento,
     montoNeto: montos.neto,
     montoPagado: montos.pagado,
 
-    // ✅ pendiente correcto SIEMPRE
     montoPendiente: montos.pendiente,
     saldoPendiente: montos.pendiente,
 
-    // snake_case
     monto_total: montos.total,
     monto_descuento: montos.descuento,
     monto_neto: montos.neto,
@@ -447,35 +360,29 @@ function mapTxForUI(tx) {
     monto_pendiente: montos.pendiente,
     saldo_pendiente: montos.pendiente,
 
-    // por si la UI usa estos
     total: montos.total,
     descuento: montos.descuento,
     neto: montos.neto,
     pagado: montos.pagado,
     pendiente: montos.pendiente,
 
-    // pagos
     metodoPago: tx.metodoPago ?? tx.metodo_pago ?? null,
     tipoPago: tx.tipoPago ?? tx.tipo_pago ?? montos.tipoPago ?? null,
 
     metodo_pago: tx.metodoPago ?? tx.metodo_pago ?? null,
     tipo_pago: tx.tipoPago ?? tx.tipo_pago ?? montos.tipoPago ?? null,
 
-    // cuenta
     cuentaCodigo: cuentaCodigo ?? null,
     cuenta_codigo: cuentaCodigo ?? null,
-    cuentaPrincipalCodigo: tx.cuentaPrincipalCodigo ?? tx.cuenta_principal_codigo ?? cuentaCodigo ?? null,
-    cuenta_principal_codigo: tx.cuenta_principal_codigo ?? tx.cuentaPrincipalCodigo ?? cuentaCodigo ?? null,
+    cuentaPrincipalCodigo:
+      tx.cuentaPrincipalCodigo ?? tx.cuenta_principal_codigo ?? cuentaCodigo ?? null,
+    cuenta_principal_codigo:
+      tx.cuenta_principal_codigo ?? tx.cuentaPrincipalCodigo ?? cuentaCodigo ?? null,
 
-    // cliente (si viene enriquecido)
-    clienteId:
-      tx.clienteId ?? tx.clientId ?? tx.cliente_id ?? tx.client_id ?? null,
-    clientId:
-      tx.clientId ?? tx.clienteId ?? tx.cliente_id ?? tx.client_id ?? null,
-    cliente_id:
-      tx.cliente_id ?? tx.clienteId ?? tx.clientId ?? tx.client_id ?? null,
-    client_id:
-      tx.client_id ?? tx.clientId ?? tx.clienteId ?? tx.cliente_id ?? null,
+    clienteId: tx.clienteId ?? tx.clientId ?? tx.cliente_id ?? tx.client_id ?? null,
+    clientId: tx.clientId ?? tx.clienteId ?? tx.cliente_id ?? tx.client_id ?? null,
+    cliente_id: tx.cliente_id ?? tx.clienteId ?? tx.clientId ?? tx.client_id ?? null,
+    client_id: tx.client_id ?? tx.clientId ?? tx.clienteId ?? tx.cliente_id ?? null,
 
     cliente_nombre: tx.cliente_nombre ?? null,
     cliente_email: tx.cliente_email ?? null,
@@ -544,12 +451,6 @@ async function buildLine(owner, { code, debit = 0, credit = 0, memo = "" }) {
   return { ...base, accountCodigo: String(code).trim() };
 }
 
-/**
- * ✅ Mapeo del asiento (para UI)
- * IMPORTANTE: RegistroIngresos.tsx pinta:
- * - currentAsientos.descripcion
- * - currentAsientos.detalles[] = { cuenta_codigo, cuenta_nombre, descripcion, debe, haber }
- */
 function mapEntryForUI(entry, accountNameMap = {}) {
   const rawLines = entry.lines || entry.detalle_asientos || [];
 
@@ -584,10 +485,9 @@ function mapEntryForUI(entry, accountNameMap = {}) {
     numeroAsiento,
     numero_asiento: numeroAsiento,
 
-    asiento_fecha: toYMD(entry.date),
+    asiento_fecha: toYMDLocal(entry.date),
     fecha: entry.date,
 
-    // ✅ la UI usa "descripcion"
     descripcion: concepto,
     concepto,
 
@@ -602,13 +502,10 @@ function mapEntryForUI(entry, accountNameMap = {}) {
   };
 }
 
-/**
- * Aplanar asientos (analítica)
- */
 function flattenDetalles(entries) {
   const detalles = [];
   for (const e of entries) {
-    const asientoFecha = toYMD(e.date);
+    const asientoFecha = toYMDLocal(e.date);
     for (const l of e.lines || []) {
       detalles.push({
         cuenta_codigo: l.accountCodigo ?? l.accountCode ?? null,
@@ -752,10 +649,7 @@ router.get("/detalles", ensureAuth, async (req, res) => {
 
     let items = itemsRaw.map(mapTxForUI);
 
-    // ✅ 1) cuenta con nombre (para "Cuenta principal")
     items = await attachAccountInfo(owner, items);
-
-    // ✅ 2) cliente (para el modal)
     items = await attachClientInfo(owner, items);
 
     const total = itemsRaw.reduce((acc, it) => {
@@ -898,11 +792,8 @@ router.post("/", ensureAuth, async (req, res) => {
 
     const subcuentaId = req.body?.subcuentaId ?? null;
 
-    // ✅ FECHA E2E:
-    // - si viene YYYY-MM-DD => se guarda con la HORA ACTUAL de MX
-    // - si viene ISO con Z/offset => absoluto
-    // - si no viene => ahora mismo
-    let fecha = req.body?.fecha ? parseTxDate(req.body.fecha) : new Date();
+    const now = new Date();
+    let fecha = parseTxDateSmart(req.body?.fecha, now);
     if (!fecha) return res.status(400).json({ ok: false, message: "fecha inválida." });
 
     const montoPagadoRaw = num(req.body?.montoPagado ?? req.body?.pagado, 0);
@@ -947,21 +838,18 @@ router.post("/", ensureAuth, async (req, res) => {
       tipoPago,
       montoPagado,
 
-      // ✅ espejo de cuenta para que NUNCA se pierda por schema strict
       cuentaCodigo,
       cuentaPrincipalCodigo: cuentaCodigo,
       cuenta_principal_codigo: cuentaCodigo,
 
       subcuentaId,
 
-      // ✅ espejo de pendiente para que NUNCA se pierda por schema strict
       saldoPendiente,
       saldo_pendiente: saldoPendiente,
       montoPendiente: saldoPendiente,
       monto_pendiente: saldoPendiente,
     };
 
-    // ✅ espejo de cliente para que NUNCA se pierda por schema strict
     const clienteIdRaw =
       req.body?.clienteId ??
       req.body?.clientId ??
@@ -1033,7 +921,6 @@ router.post("/", ensureAuth, async (req, res) => {
     const accountNameMap = await getAccountNameMap(owner, entryCodes);
     const asiento = mapEntryForUI(entry, accountNameMap);
 
-    // ✅ Transacción enriquecida con cliente + cuenta para el modal
     let txUI = mapTxForUI(tx.toObject ? tx.toObject() : tx);
     txUI = (await attachAccountInfo(owner, [txUI]))[0];
     txUI = (await attachClientInfo(owner, [txUI]))[0];

@@ -13,17 +13,26 @@ try {
   Client = require("../models/Client");
 } catch (_) {}
 
-/**
- * Helpers
- */
+const TZ_OFFSET_MINUTES = Number(process.env.APP_TZ_OFFSET_MINUTES ?? -360);
+
 function num(v, def = 0) {
   const n = Number(v);
   return Number.isFinite(n) ? n : def;
 }
 
+function toYMDLocal(d) {
+  const dt = new Date(d);
+  if (Number.isNaN(dt.getTime())) return null;
+  const local = new Date(dt.getTime() + TZ_OFFSET_MINUTES * 60 * 1000);
+  const y = local.getUTCFullYear();
+  const m = String(local.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(local.getUTCDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
 /**
  * ✅ FIX FECHA/HORA (TZ issue)
- * Si `fecha` viene guardada como "date-only" (00:00:00.000Z), el navegador (-06)
+ * Si `fecha` viene guardada como 00:00:00.000Z, el navegador (-06)
  * la mueve a 18:00 del día anterior.
  *
  * Solución: mantener el día de `fecha` pero tomar la hora real desde `createdAt`.
@@ -41,13 +50,9 @@ function fixFechaWithCreatedAt(tx) {
     f.getUTCSeconds() === 0 &&
     f.getUTCMilliseconds() === 0;
 
-  // Si ya trae hora real, úsala tal cual
   if (!isMidnightUTC) return f;
-
-  // Si no tenemos createdAt, al menos devolvemos f (date-only)
   if (!c || Number.isNaN(c.getTime())) return f;
 
-  // Mantén el día de `fecha`, pero usa la hora de createdAt
   return new Date(
     Date.UTC(
       f.getUTCFullYear(),
@@ -67,13 +72,18 @@ async function getAccountNameMap(owner, codes) {
   );
   if (!unique.length) return {};
 
-  const rows = await Account.find({ owner, code: { $in: unique } })
-    .select("code name nombre")
+  const rows = await Account.find({
+    owner,
+    $or: [{ code: { $in: unique } }, { codigo: { $in: unique } }],
+  })
+    .select("code codigo name nombre")
     .lean();
 
   const map = {};
   for (const r of rows) {
-    map[String(r.code)] = r.name ?? r.nombre ?? "";
+    const code = String(r.code ?? r.codigo ?? "").trim();
+    if (!code) continue;
+    map[code] = r.name ?? r.nombre ?? "";
   }
   return map;
 }
@@ -116,14 +126,9 @@ async function attachAccountInfo(owner, items) {
 
     return {
       ...it,
-
-      // Canonical
       cuentaCodigo: it.cuentaCodigo ?? code,
-
-      // UI/legacy (lo que el modal suele leer)
       cuenta_codigo: it.cuenta_codigo ?? code,
       cuenta_nombre: it.cuenta_nombre ?? nombre,
-
       cuenta_principal_codigo: it.cuenta_principal_codigo ?? code,
       cuenta_principal_nombre: it.cuenta_principal_nombre ?? nombre,
       cuenta_principal: it.cuenta_principal ?? display,
@@ -143,6 +148,7 @@ async function attachClientInfo(owner, items) {
             it.clienteId ??
             it.clientId ??
             it.cliente_id ??
+            it.client_id ??
             it.clienteID ??
             null
         )
@@ -175,7 +181,7 @@ async function attachClientInfo(owner, items) {
 
   return items.map((it) => {
     const cid = String(
-      it.clienteId ?? it.clientId ?? it.cliente_id ?? it.clienteID ?? ""
+      it.clienteId ?? it.clientId ?? it.cliente_id ?? it.client_id ?? it.clienteID ?? ""
     );
     const c = cid ? map.get(cid) : null;
     if (!c) return it;
@@ -191,24 +197,18 @@ async function attachClientInfo(owner, items) {
 }
 
 function mapTxCompat(tx) {
-  // ✅ Fecha/hora corregida para UI
   const fechaFixed = fixFechaWithCreatedAt(tx);
 
-  // Normaliza montos
   const montoTotal = num(tx.montoTotal ?? tx.monto_total ?? 0);
   const montoDescuento = num(tx.montoDescuento ?? tx.monto_descuento ?? 0);
 
-  // Si no viene montoNeto, lo calculamos
   const montoNeto = num(
-    tx.montoNeto ??
-      tx.monto_neto ??
-      Math.max(0, montoTotal - Math.max(0, montoDescuento)),
+    tx.montoNeto ?? tx.monto_neto ?? Math.max(0, montoTotal - Math.max(0, montoDescuento)),
     0
   );
 
   const montoPagado = num(tx.montoPagado ?? tx.monto_pagado ?? 0);
 
-  // Pendiente robusto: preferimos el que venga guardado; si no, calculamos
   const saldoPendienteSaved = num(
     tx.saldoPendiente ?? tx.saldo_pendiente ?? tx.monto_pendiente,
     NaN
@@ -225,45 +225,39 @@ function mapTxCompat(tx) {
     tx.cuenta_principal_codigo ??
     null;
 
+  const fechaFinal = fechaFixed || tx.fecha || null;
+
   return {
     ...tx,
     id: String(tx._id ?? tx.id),
 
-    // ✅ Sobrescribimos fecha para que el frontend pinte bien
-    // (si es date-only, ahora ya trae hora real)
-    fecha: fechaFixed || tx.fecha,
+    fecha: fechaFinal,
     fecha_fixed: fechaFixed ? fechaFixed.toISOString() : null,
+    fecha_ymd: fechaFinal ? toYMDLocal(fechaFinal) : null,
 
-    // Montos camel
     montoTotal,
     montoDescuento,
     montoNeto,
     montoPagado,
     saldoPendiente,
 
-    // Montos legacy (snake)
     monto_total: montoTotal,
     monto_descuento: montoDescuento,
     monto_neto: montoNeto,
     monto_pagado: montoPagado,
 
-    // 🔥 clave para tu modal: diferentes aliases
     monto_pendiente: saldoPendiente,
     saldo_pendiente: saldoPendiente,
     pendiente: saldoPendiente,
 
-    // pagos legacy
     metodo_pago: tx.metodoPago ?? tx.metodo_pago ?? null,
     tipo_pago: tx.tipoPago ?? tx.tipo_pago ?? null,
 
-    // cuenta
     cuentaCodigo: cuentaCodigo ?? tx.cuentaCodigo ?? null,
     cuenta_codigo: cuentaCodigo ?? tx.cuenta_codigo ?? null,
     cuenta_principal_codigo: cuentaCodigo ?? tx.cuenta_principal_codigo ?? null,
 
-    // clienteId (normalizado)
-    clienteId:
-      tx.clienteId ?? tx.clientId ?? tx.cliente_id ?? tx.clienteID ?? null,
+    clienteId: tx.clienteId ?? tx.clientId ?? tx.cliente_id ?? tx.client_id ?? tx.clienteID ?? null,
   };
 }
 
@@ -275,19 +269,13 @@ router.get("/ingresos/recientes", ensureAuth, async (req, res) => {
     const owner = req.user._id;
     const limit = Math.min(2000, Number(req.query.limit || 1000));
 
-    // Orden robusto: primero por fecha si existe; fallback createdAt
     const rows = await IncomeTransaction.find({ owner })
       .sort({ fecha: -1, createdAt: -1 })
       .limit(limit)
       .lean();
 
-    // 1) compat con UI (pendiente/campos snake + fecha corregida)
     let items = rows.map(mapTxCompat);
-
-    // 2) cuenta principal display "4001 - Ventas"
     items = await attachAccountInfo(owner, items);
-
-    // 3) cliente (nombre/email/telefono/rfc)
     items = await attachClientInfo(owner, items);
 
     return res.json({ ok: true, data: items, items });
