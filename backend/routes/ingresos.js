@@ -15,19 +15,133 @@ try {
   Client = require("../models/Client");
 } catch (_) {}
 
+/**
+ * ============================================================================
+ * ✅ FECHAS E2E (MX) — Evita el bug de 18:00 del día anterior por timezone UTC
+ *
+ * Render/Node suele correr en UTC. Si parseas YYYY-MM-DD como Date directo,
+ * JS lo interpreta como UTC 00:00, y en MX (-06) se ve como 18:00 del día anterior.
+ *
+ * México (CDMX) está fijo en UTC-06 (sin DST). Usamos offset fijo.
+ * ============================================================================
+ */
+const MX_OFFSET_MIN = 6 * 60; // MX = UTC-06 => para convertir MX local → UTC, sumas 6h
+const MX_OFFSET_MS = MX_OFFSET_MIN * 60 * 1000;
+
+function isDateOnly(str) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(String(str || "").trim());
+}
+
+function hasExplicitTZ(str) {
+  const s = String(str || "").trim();
+  // ISO con Z o con offset al final
+  return /[zZ]$/.test(s) || /[+-]\d{2}:\d{2}$/.test(s);
+}
+
+function parseISOWithoutTZ(str) {
+  // YYYY-MM-DDTHH:mm(:ss(.ms)?)?
+  const s = String(str || "").trim();
+  const m = s.match(
+    /^(\d{4})-(\d{2})-(\d{2})[T\s](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?$/
+  );
+  if (!m) return null;
+  const y = Number(m[1]);
+  const mo = Number(m[2]);
+  const d = Number(m[3]);
+  const hh = Number(m[4]);
+  const mm = Number(m[5]);
+  const ss = m[6] ? Number(m[6]) : 0;
+  const ms = m[7] ? Number(String(m[7]).padEnd(3, "0")) : 0;
+  return { y, mo, d, hh, mm, ss, ms };
+}
+
+function mexicoNowTimeParts() {
+  // Obtenemos “hora MX” sin depender del TZ del server:
+  // (nowUTC - 6h) y leemos como UTC parts.
+  const mx = new Date(Date.now() - MX_OFFSET_MS);
+  return {
+    hh: mx.getUTCHours(),
+    mm: mx.getUTCMinutes(),
+    ss: mx.getUTCSeconds(),
+    ms: mx.getUTCMilliseconds(),
+  };
+}
+
+function dateFromMexicoLocalParts(y, mo, d, hh = 0, mm = 0, ss = 0, ms = 0) {
+  // “(y-mo-d hh:mm) MX” -> Date UTC sumando 6h
+  return new Date(Date.UTC(y, mo - 1, d, hh + 6, mm, ss, ms));
+}
+
 function parseStartDate(s) {
   if (!s) return null;
   const str = String(s).trim();
-  const isDateOnly = /^\d{4}-\d{2}-\d{2}$/.test(str);
-  const d = new Date(isDateOnly ? `${str}T00:00:00` : str);
+
+  // 1) YYYY-MM-DD => inicio del día en MX (00:00:00.000)
+  if (isDateOnly(str)) {
+    const [y, mo, d] = str.split("-").map(Number);
+    const dt = dateFromMexicoLocalParts(y, mo, d, 0, 0, 0, 0);
+    return Number.isNaN(dt.getTime()) ? null : dt;
+  }
+
+  // 2) ISO con TZ (Z o +hh:mm) => absoluto
+  if (hasExplicitTZ(str)) {
+    const dt = new Date(str);
+    return Number.isNaN(dt.getTime()) ? null : dt;
+  }
+
+  // 3) ISO sin TZ => interpretarlo como MX local
+  const parts = parseISOWithoutTZ(str);
+  if (parts) {
+    const dt = dateFromMexicoLocalParts(
+      parts.y,
+      parts.mo,
+      parts.d,
+      parts.hh,
+      parts.mm,
+      parts.ss,
+      parts.ms
+    );
+    return Number.isNaN(dt.getTime()) ? null : dt;
+  }
+
+  // fallback
+  const d = new Date(str);
   return Number.isNaN(d.getTime()) ? null : d;
 }
 
 function parseEndDate(s) {
   if (!s) return null;
   const str = String(s).trim();
-  const isDateOnly = /^\d{4}-\d{2}-\d{2}$/.test(str);
-  const d = new Date(isDateOnly ? `${str}T23:59:59.999` : str);
+
+  // 1) YYYY-MM-DD => fin del día en MX (23:59:59.999)
+  if (isDateOnly(str)) {
+    const [y, mo, d] = str.split("-").map(Number);
+    const dt = dateFromMexicoLocalParts(y, mo, d, 23, 59, 59, 999);
+    return Number.isNaN(dt.getTime()) ? null : dt;
+  }
+
+  // 2) ISO con TZ => absoluto
+  if (hasExplicitTZ(str)) {
+    const dt = new Date(str);
+    return Number.isNaN(dt.getTime()) ? null : dt;
+  }
+
+  // 3) ISO sin TZ => interpretarlo como MX local
+  const parts = parseISOWithoutTZ(str);
+  if (parts) {
+    const dt = dateFromMexicoLocalParts(
+      parts.y,
+      parts.mo,
+      parts.d,
+      parts.hh,
+      parts.mm,
+      parts.ss,
+      parts.ms
+    );
+    return Number.isNaN(dt.getTime()) ? null : dt;
+  }
+
+  const d = new Date(str);
   return Number.isNaN(d.getTime()) ? null : d;
 }
 
@@ -35,8 +149,39 @@ function parseTxDate(s) {
   if (!s) return null;
   const str = String(s).trim();
   if (!str) return null;
-  const isDateOnly = /^\d{4}-\d{2}-\d{2}$/.test(str);
-  const d = new Date(isDateOnly ? `${str}T00:00:00` : str);
+
+  // ✅ Caso clave: YYYY-MM-DD (date-only)
+  // En ingresos, si el front manda solo el día, usamos la HORA ACTUAL de MX
+  // para que NO se guarde como medianoche (y NO brinque al día anterior).
+  if (isDateOnly(str)) {
+    const [y, mo, d] = str.split("-").map(Number);
+    const nowT = mexicoNowTimeParts();
+    const dt = dateFromMexicoLocalParts(y, mo, d, nowT.hh, nowT.mm, nowT.ss, nowT.ms);
+    return Number.isNaN(dt.getTime()) ? null : dt;
+  }
+
+  // ISO con TZ => absoluto
+  if (hasExplicitTZ(str)) {
+    const dt = new Date(str);
+    return Number.isNaN(dt.getTime()) ? null : dt;
+  }
+
+  // ISO sin TZ => interpretarlo como MX local
+  const parts = parseISOWithoutTZ(str);
+  if (parts) {
+    const dt = dateFromMexicoLocalParts(
+      parts.y,
+      parts.mo,
+      parts.d,
+      parts.hh,
+      parts.mm,
+      parts.ss,
+      parts.ms
+    );
+    return Number.isNaN(dt.getTime()) ? null : dt;
+  }
+
+  const d = new Date(str);
   return Number.isNaN(d.getTime()) ? null : d;
 }
 
@@ -49,12 +194,19 @@ function lower(v) {
   return String(v ?? "").trim().toLowerCase();
 }
 
+/**
+ * ✅ YMD en horario México (para que no cambie de día por UTC)
+ */
 function toYMD(d) {
   const dt = new Date(d);
   if (Number.isNaN(dt.getTime())) return null;
-  const y = dt.getFullYear();
-  const m = String(dt.getMonth() + 1).padStart(2, "0");
-  const day = String(dt.getDate()).padStart(2, "0");
+
+  // Convertimos el instante UTC a “reloj MX” restando 6 horas y leyendo UTC parts.
+  const mx = new Date(dt.getTime() - MX_OFFSET_MS);
+
+  const y = mx.getUTCFullYear();
+  const m = String(mx.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(mx.getUTCDate()).padStart(2, "0");
   return `${y}-${m}-${day}`;
 }
 
@@ -746,6 +898,10 @@ router.post("/", ensureAuth, async (req, res) => {
 
     const subcuentaId = req.body?.subcuentaId ?? null;
 
+    // ✅ FECHA E2E:
+    // - si viene YYYY-MM-DD => se guarda con la HORA ACTUAL de MX
+    // - si viene ISO con Z/offset => absoluto
+    // - si no viene => ahora mismo
     let fecha = req.body?.fecha ? parseTxDate(req.body.fecha) : new Date();
     if (!fecha) return res.status(400).json({ ok: false, message: "fecha inválida." });
 
