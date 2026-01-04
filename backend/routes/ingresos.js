@@ -502,24 +502,49 @@ function mapEntryForUI(entry, accountNameMap = {}) {
   };
 }
 
-function flattenDetalles(entries) {
+function flattenDetalles(entries, accountMaps = null) {
   const detalles = [];
+
+  const getCodeFromLine = (l) => {
+    const code =
+      l.accountCodigo ??
+      l.accountCode ??
+      l.cuenta_codigo ??
+      l.cuentaCodigo ??
+      null;
+
+    if (code) return String(code).trim();
+
+    // ✅ Si viene en modo "id" (accountId), intentamos resolverlo
+    const aid = l.accountId ?? l.cuenta_id ?? l.account ?? null;
+    if (aid && accountMaps?.codeById) {
+      const resolved = accountMaps.codeById[String(aid)];
+      if (resolved) return String(resolved).trim();
+    }
+
+    return null;
+  };
+
   for (const e of entries) {
     const asientoFecha = toYMDLocal(e.date);
     for (const l of e.lines || []) {
+      const cuenta_codigo = getCodeFromLine(l);
+
       detalles.push({
-        cuenta_codigo: l.accountCodigo ?? l.accountCode ?? null,
-        debe: num(l.debit, 0),
-        haber: num(l.credit, 0),
+        cuenta_codigo,
+        debe: num(l.debit ?? l.debe, 0),
+        haber: num(l.credit ?? l.haber, 0),
         asiento_fecha: asientoFecha,
         asiento_id: String(e._id),
-        concepto: e.concept ?? "",
+        concepto: e.concept ?? e.concepto ?? "",
         transaccion_ingreso_id: e.sourceId ? String(e.sourceId) : null,
       });
     }
   }
+
   return detalles;
 }
+
 
 function normalizeMetodoPago(raw) {
   let v = typeof raw === "string" ? raw.trim().toLowerCase() : "";
@@ -573,6 +598,52 @@ router.get("/clientes-min", ensureAuth, async (req, res) => {
   }
 });
 
+async function buildAccountMaps(owner, entries) {
+  const codes = new Set();
+  const ids = new Set();
+
+  for (const e of entries || []) {
+    for (const l of e.lines || []) {
+      const c = l.accountCodigo ?? l.accountCode ?? l.cuenta_codigo ?? l.cuentaCodigo ?? null;
+      if (c) codes.add(String(c).trim());
+
+      const aid = l.accountId ?? l.cuenta_id ?? l.account ?? null;
+      if (aid && mongoose.Types.ObjectId.isValid(String(aid))) ids.add(String(aid));
+    }
+  }
+
+  // Si no hay nada, regresa maps vacíos
+  if (!codes.size && !ids.size) {
+    return { nameByCode: {}, codeById: {}, nameById: {} };
+  }
+
+  const query = { owner, $or: [] };
+  if (codes.size) query.$or.push({ $or: [{ code: { $in: [...codes] } }, { codigo: { $in: [...codes] } }] });
+  if (ids.size) query.$or.push({ _id: { $in: [...ids].map((x) => new mongoose.Types.ObjectId(x)) } });
+
+  const rows = await Account.find(query)
+    .select("_id code codigo name nombre")
+    .lean();
+
+  const nameByCode = {};
+  const codeById = {};
+  const nameById = {};
+
+  for (const r of rows) {
+    const id = String(r._id);
+    const code = String(r.code ?? r.codigo ?? "").trim();
+    const name = r.name ?? r.nombre ?? "";
+
+    if (id) {
+      nameById[id] = name;
+      if (code) codeById[id] = code;
+    }
+    if (code) nameByCode[code] = name;
+  }
+
+  return { nameByCode, codeById, nameById };
+}
+
 /**
  * GET /api/ingresos/asientos?start=YYYY-MM-DD&end=YYYY-MM-DD
  */
@@ -598,20 +669,30 @@ router.get("/asientos", ensureAuth, async (req, res) => {
       .sort({ date: -1, createdAt: -1 })
       .lean();
 
-    const allCodes = entries
-      .flatMap((e) => (e.lines || []).map((l) => l.accountCodigo ?? l.accountCode ?? null))
-      .filter(Boolean)
-      .map(String);
+    // ✅ Mapas para resolver cuenta por code o por accountId
+    const accountMaps = await buildAccountMaps(owner, entries);
 
-    const accountNameMap = await getAccountNameMap(owner, allCodes);
-    const asientos = entries.map((e) => mapEntryForUI(e, accountNameMap));
+    // ✅ asientos mapeados como ya los usas
+    const asientos = entries.map((e) => {
+      // reutilizamos tu mapEntryForUI, pero le pasamos un map de nombres por código
+      return mapEntryForUI(e, accountMaps.nameByCode);
+    });
 
-    return res.json({ ok: true, data: { asientos }, asientos });
+    // ✅ detalles aplanados (esto es lo que te faltaba)
+    const detalles = flattenDetalles(entries, accountMaps);
+
+    return res.json({
+      ok: true,
+      data: { asientos, detalles },
+      asientos,
+      detalles,
+    });
   } catch (err) {
     console.error("GET /api/ingresos/asientos error:", err);
     return res.status(500).json({ ok: false, message: "Error cargando asientos" });
   }
 });
+
 
 /**
  * GET /api/ingresos/detalles?start=YYYY-MM-DD&end=YYYY-MM-DD
