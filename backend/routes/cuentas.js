@@ -5,7 +5,6 @@ const router = express.Router();
 const ensureAuth = require("../middleware/ensureAuth");
 const Account = require("../models/Account");
 
-// Helpers
 function toStr(v) {
   if (v === null || typeof v === "undefined") return "";
   return String(v).trim();
@@ -18,115 +17,106 @@ function toBool(v) {
   return false;
 }
 
-function getCodigo(doc) {
-  return toStr(doc?.codigo ?? doc?.code ?? doc?.cuenta_codigo ?? "");
-}
-function getNombre(doc) {
-  return toStr(doc?.nombre ?? doc?.name ?? doc?.descripcion ?? "");
-}
-
 /**
- * Inferencias estilo Bukipin 2 para estado/grupo/subgrupo a partir del código.
- * (solo se usan si el documento no trae esos campos)
+ * Inferencia de clasificación (fallback) por código:
+ * - 1xxx Activos (Balance General)
+ * - 2xxx Pasivos (Balance General)
+ * - 3xxx Capital (Balance General)
+ * - 4xxx Ingresos (Estado de Resultados)
+ * - 5xxx/6xxx Egresos (Estado de Resultados)
+ * - 7xxx Impuestos (Estado de Resultados)
  */
-function inferEstadoGrupoSubgrupoByCodigo(codigo) {
-  const c = String(codigo || "").replace(/\s+/g, "");
-  const n1 = c.slice(0, 1); // 1..7
-  const n2 = c.slice(0, 2); // 11,12,13,21...
+function deriveClasificacionFromCodigo(codigoRaw) {
+  const codigo = toStr(codigoRaw);
+  const n = parseInt(codigo, 10);
 
-  let estado_financiero = "Estado de Resultados";
-  let grupo = "Otros Ingresos y Gastos";
-
-  if (n1 === "1") {
-    estado_financiero = "Balance General";
-    grupo = "Activos";
-  } else if (n1 === "2") {
-    estado_financiero = "Balance General";
-    grupo = "Pasivos";
-  } else if (n1 === "3") {
-    estado_financiero = "Balance General";
-    grupo = "Capital Contable";
-  } else if (n1 === "4") {
-    estado_financiero = "Estado de Resultados";
-    grupo = "Ingresos";
-  } else if (n1 === "5") {
-    estado_financiero = "Estado de Resultados";
-    grupo = "Egresos";
-  } else if (n1 === "6") {
-    estado_financiero = "Estado de Resultados";
-    grupo = "Impuestos";
-  } else if (n1 === "7") {
-    estado_financiero = "Estado de Resultados";
-    grupo = "Otros Ingresos y Gastos";
-  }
-
+  // Defaults razonables
+  let estado_financiero = "Sin estado";
+  let grupo = "Sin grupo";
   let subgrupo = "General";
 
-  if (grupo === "Activos") {
-    if (n2 === "11") subgrupo = "Activo Circulante";
-    else if (n2 === "12") subgrupo = "Activo No Circulante";
-    else if (n2 === "13") subgrupo = "Activo Diferido";
-    else subgrupo = "Activo Circulante";
-  }
+  if (!codigo) return { estado_financiero, grupo, subgrupo };
 
-  if (grupo === "Pasivos") {
-    if (n2 === "21") subgrupo = "Pasivo Corto Plazo";
-    else if (n2 === "22") subgrupo = "Pasivo Largo Plazo";
-    else if (n2 === "23") subgrupo = "Pasivo Diferido";
-    else subgrupo = "Pasivo Corto Plazo";
-  }
+  const first = codigo[0];
 
-  if (grupo === "Capital Contable") {
-    if (n2 === "31") subgrupo = "Capital Contribuido";
-    else if (n2 === "32") subgrupo = "Capital Ganado";
-    else subgrupo = "Capital Contribuido";
-  }
+  // Estado financiero
+  if (first === "1" || first === "2" || first === "3") estado_financiero = "Balance General";
+  else estado_financiero = "Estado de Resultados";
 
-  if (grupo === "Ingresos") {
-    if (n2 === "41") subgrupo = "Ingresos Operativos";
-    else if (n2 === "42") subgrupo = "Otros Ingresos";
-    else subgrupo = "Ingresos Operativos";
-  }
+  // Grupo
+  if (first === "1") grupo = "Activos";
+  else if (first === "2") grupo = "Pasivos";
+  else if (first === "3") grupo = "Capital Contable";
+  else if (first === "4") grupo = "Ingresos";
+  else if (first === "5" || first === "6") grupo = "Egresos";
+  else if (first === "7") grupo = "Impuestos";
+  else grupo = "General";
 
-  if (grupo === "Egresos") {
-    if (n2 === "51") subgrupo = "Costo de Ventas";
-    else if (n2 === "52") subgrupo = "Gastos Operativos";
-    else if (n2 === "53") subgrupo = "Gastos Financieros";
-    else subgrupo = "Gastos Operativos";
+  // Subgrupos por rango (MVP, pero suficiente para replicar Bukipin2)
+  if (!Number.isNaN(n)) {
+    if (first === "1") {
+      if (n >= 1000 && n < 1200) subgrupo = "Activo Circulante";
+      else if (n >= 1200 && n < 1300) subgrupo = "Activo No Circulante";
+      else if (n >= 1300 && n < 1400) subgrupo = "Activo Diferido";
+      else subgrupo = "General";
+    } else if (first === "2") {
+      if (n >= 2000 && n < 2100) subgrupo = "Pasivo Corto Plazo";
+      else if (n >= 2100 && n < 2200) subgrupo = "Pasivo Largo Plazo";
+      else subgrupo = "General";
+    } else if (first === "3") {
+      if (n >= 3000 && n < 3100) subgrupo = "Capital Contribuido";
+      else if (n >= 3100 && n < 3200) subgrupo = "Capital Ganado";
+      else if (n >= 3200 && n < 3300) subgrupo = "Capital Reembolsado";
+      else subgrupo = "General";
+    } else {
+      // Para resultados, puedes extender luego. Por ahora:
+      subgrupo = "General";
+    }
   }
-
-  if (grupo === "Impuestos") subgrupo = "Impuestos";
-  if (grupo === "Otros Ingresos y Gastos") subgrupo = "Otros";
 
   return { estado_financiero, grupo, subgrupo };
 }
 
 /**
- * Normaliza una cuenta a un formato seguro (ES + EN) + campos financieros.
+ * Heurística para "subcuenta" (las que crea tu módulo de subcuentas):
+ * típicamente tienen parentCode y terminan en -01, .01, /01, etc.
+ * Esto evita duplicarlas en el catálogo principal.
+ */
+function looksLikeSubcuenta(doc) {
+  const parentCode = toStr(doc.parentCode);
+  if (!parentCode) return false;
+
+  const codigo = toStr(doc.codigo ?? doc.code);
+  return /[-./]\d+$/.test(codigo); // 4001-01, 4001.01, 4001/01
+}
+
+/**
+ * Normaliza salida (ES + EN) + clasificación contable
  */
 function normalizeAccountOut(doc) {
-  const codigo = getCodigo(doc);
-  const nombre = getNombre(doc);
+  const codigo = toStr(doc.codigo ?? doc.code);
+  const nombre = toStr(doc.nombre ?? doc.name);
 
-  const estado_financiero_raw = toStr(doc?.estado_financiero ?? doc?.estadoFinanciero ?? "");
-  const grupo_raw = toStr(doc?.grupo ?? doc?.group ?? doc?.categoria ?? "");
-  const subgrupo_raw = toStr(doc?.subgrupo ?? doc?.subGrupo ?? "");
+  const estado_financiero_in = toStr(doc.estado_financiero ?? doc.estadoFinanciero);
+  const grupo_in = toStr(doc.grupo);
+  const subgrupo_in = toStr(doc.subgrupo);
 
-  const inferred = inferEstadoGrupoSubgrupoByCodigo(codigo);
+  const derived =
+    !estado_financiero_in || !grupo_in || !subgrupo_in
+      ? deriveClasificacionFromCodigo(codigo)
+      : null;
 
-  const estado_financiero = estado_financiero_raw || inferred.estado_financiero;
-  const grupo = grupo_raw || inferred.grupo;
-  const subgrupo = subgrupo_raw || inferred.subgrupo;
+  const estado_financiero = estado_financiero_in || derived?.estado_financiero || "Sin estado";
+  const grupo = grupo_in || derived?.grupo || "Sin grupo";
+  const subgrupo = subgrupo_in || derived?.subgrupo || "General";
 
   return {
     id: doc._id,
     _id: doc._id,
 
-    // canonical
+    // canonical + alias
     codigo,
     nombre,
-
-    // alias compat
     code: codigo,
     name: nombre,
 
@@ -137,7 +127,7 @@ function normalizeAccountOut(doc) {
     isActive: typeof doc.isActive === "boolean" ? doc.isActive : true,
     isDefault: typeof doc.isDefault === "boolean" ? doc.isDefault : false,
 
-    // ✅ campos contables que necesita el frontend
+    // ✅ CLASIFICACIÓN (lo que tu UI necesita)
     estado_financiero,
     grupo,
     subgrupo,
@@ -147,29 +137,13 @@ function normalizeAccountOut(doc) {
   };
 }
 
-/**
- * Determina si una cuenta "doc" es cuenta madre: parentCode == null/undefined
- */
-function isParentAccount(doc) {
-  return !doc.parentCode;
-}
-
-/**
- * Revisa si existen subcuentas hijas de un codigo (parentCode)
- */
-async function hasChildren({ owner, parentCode }) {
-  return !!(await Account.exists({ owner, parentCode }));
-}
-
 // Soporta montajes:
 //  - app.use("/api/cuentas", router) => GET /
 //  - app.use("/api", router)        => GET /cuentas
-const GET_PATHS = ["/", "/cuentas"];
-const POST_PATHS = ["/", "/cuentas"];
-
-router.get(GET_PATHS, ensureAuth, async (req, res) => {
+router.get(["/", "/cuentas"], ensureAuth, async (req, res) => {
   try {
     const owner = req.user._id;
+
     const q = { owner };
 
     // active=true|false
@@ -178,42 +152,37 @@ router.get(GET_PATHS, ensureAuth, async (req, res) => {
     }
 
     /**
-     * ✅ NUEVO comportamiento:
-     * - Por defecto: trae TODO (madres + subcuentas) para alimentar el catálogo completo.
+     * Comportamiento por defecto (FIX):
+     * - Devuelve TODAS las cuentas (incluyendo las que tengan parentCode),
+     *   pero EXCLUYE subcuentas “-01” para que no se dupliquen.
      *
-     * Params soportados:
-     * - onlyMadres=true      => solo cuentas madre
-     * - onlySubcuentas=true  => solo subcuentas
-     * - includeSubcuentas=... (compat legacy)
+     * Params:
+     * - includeSubcuentas=true  => incluye también subcuentas “-01”
+     * - onlySubcuentas=true     => sólo subcuentas “-01”
      */
-    const onlyMadres = String(req.query.onlyMadres || "false") === "true";
+    const includeSubcuentas = String(req.query.includeSubcuentas || "false") === "true";
     const onlySubcuentas = String(req.query.onlySubcuentas || "false") === "true";
-    const includeSubcuentas = String(req.query.includeSubcuentas || "true") === "true"; // ✅ default true
+
+    const items = await Account.find(q)
+      .sort({ codigo: 1, code: 1 })
+      .lean();
+
+    let filtered = items;
 
     if (onlySubcuentas) {
-      q.parentCode = { $exists: true, $ne: null };
-    } else if (onlyMadres || !includeSubcuentas) {
-      q.$or = [{ parentCode: null }, { parentCode: { $exists: false } }];
+      filtered = items.filter(looksLikeSubcuenta);
+    } else if (!includeSubcuentas) {
+      filtered = items.filter((x) => !looksLikeSubcuenta(x));
     }
-    // else: includeSubcuentas=true => no filtro extra
 
-    const items = await Account.find(q).lean();
-
-    const normalized = items
-      .map(normalizeAccountOut)
-      .filter((c) => c.codigo);
-
-    // orden por codigo (numérico si puede)
-    normalized.sort((a, b) => String(a.codigo).localeCompare(String(b.codigo)));
-
-    return res.json({ ok: true, data: normalized });
+    return res.json({ ok: true, data: filtered.map(normalizeAccountOut) });
   } catch (err) {
     console.error("GET /api/cuentas error:", err);
     return res.status(500).json({ ok: false, message: "Error cargando cuentas" });
   }
 });
 
-router.post(POST_PATHS, ensureAuth, async (req, res) => {
+router.post(["/", "/cuentas"], ensureAuth, async (req, res) => {
   try {
     const owner = req.user._id;
 
@@ -225,12 +194,17 @@ router.post(POST_PATHS, ensureAuth, async (req, res) => {
     const parentCodeRaw = req.body?.parentCode ?? null;
     const parentCode = parentCodeRaw ? toStr(parentCodeRaw) : null;
 
-    // Esta ruta es para CUENTAS MADRE.
-    if (parentCode) {
-      return res.status(400).json({
-        ok: false,
-        message: "Para crear subcuentas usa POST /api/subcuentas (no /api/cuentas).",
-      });
+    // Campos de clasificación (opcionales)
+    let estado_financiero = toStr(req.body?.estado_financiero ?? req.body?.estadoFinanciero);
+    let grupo = toStr(req.body?.grupo);
+    let subgrupo = toStr(req.body?.subgrupo);
+
+    // Si no vienen, los derivamos
+    if (!estado_financiero || !grupo || !subgrupo) {
+      const d = deriveClasificacionFromCodigo(codigo);
+      estado_financiero = estado_financiero || d.estado_financiero;
+      grupo = grupo || d.grupo;
+      subgrupo = subgrupo || d.subgrupo;
     }
 
     if (!codigo) return res.status(400).json({ ok: false, message: "Falta 'codigo'." });
@@ -239,13 +213,21 @@ router.post(POST_PATHS, ensureAuth, async (req, res) => {
 
     const created = await Account.create({
       owner,
+
       codigo,
       nombre,
       code: codigo,
       name: nombre,
+
       type,
       category,
-      parentCode: null,
+
+      parentCode: parentCode || null,
+
+      estado_financiero,
+      grupo,
+      subgrupo,
+
       isDefault: false,
       isActive: true,
     });
@@ -266,13 +248,7 @@ router.post(POST_PATHS, ensureAuth, async (req, res) => {
   }
 });
 
-// Soporta montajes:
-//  - /api/cuentas/:id
-//  - /api/cuentas/cuentas/:id
-const PUT_PATHS = ["/:id", "/cuentas/:id"];
-const DELETE_PATHS = ["/:id", "/cuentas/:id"];
-
-router.put(PUT_PATHS, ensureAuth, async (req, res) => {
+router.put(["/:id", "/cuentas/:id"], ensureAuth, async (req, res) => {
   try {
     const owner = req.user._id;
     const { id } = req.params;
@@ -282,51 +258,41 @@ router.put(PUT_PATHS, ensureAuth, async (req, res) => {
 
     const patch = {};
 
-    const nextCodigo =
-      typeof req.body?.codigo !== "undefined" || typeof req.body?.code !== "undefined"
-        ? toStr(req.body?.codigo ?? req.body?.code)
-        : null;
-
-    if (nextCodigo !== null) {
-      const currentCodigo = String(current.codigo ?? current.code ?? "").trim();
-      if (isParentAccount(current) && nextCodigo && nextCodigo !== currentCodigo) {
-        const children = await hasChildren({ owner, parentCode: currentCodigo });
-        if (children) {
-          return res.status(409).json({
-            ok: false,
-            message:
-              "No puedes cambiar el código de esta cuenta porque tiene subcuentas asociadas. Elimina/migra subcuentas primero.",
-          });
-        }
-      }
+    if (typeof req.body?.codigo !== "undefined" || typeof req.body?.code !== "undefined") {
+      const nextCodigo = toStr(req.body?.codigo ?? req.body?.code);
       patch.codigo = nextCodigo;
       patch.code = nextCodigo;
+
+      // si cambia código, recalcular clasificación si no mandan nada
+      const hasClasif =
+        typeof req.body?.estado_financiero !== "undefined" ||
+        typeof req.body?.estadoFinanciero !== "undefined" ||
+        typeof req.body?.grupo !== "undefined" ||
+        typeof req.body?.subgrupo !== "undefined";
+
+      if (!hasClasif) {
+        const d = deriveClasificacionFromCodigo(nextCodigo);
+        patch.estado_financiero = d.estado_financiero;
+        patch.grupo = d.grupo;
+        patch.subgrupo = d.subgrupo;
+      }
     }
 
-    const nextNombre =
-      typeof req.body?.nombre !== "undefined" || typeof req.body?.name !== "undefined"
-        ? toStr(req.body?.nombre ?? req.body?.name)
-        : null;
-
-    if (nextNombre !== null) {
+    if (typeof req.body?.nombre !== "undefined" || typeof req.body?.name !== "undefined") {
+      const nextNombre = toStr(req.body?.nombre ?? req.body?.name);
       patch.nombre = nextNombre;
       patch.name = nextNombre;
     }
 
     if (typeof req.body?.type !== "undefined") patch.type = toStr(req.body.type);
     if (typeof req.body?.category !== "undefined") patch.category = toStr(req.body.category);
+    if (typeof req.body?.parentCode !== "undefined") patch.parentCode = req.body.parentCode ? toStr(req.body.parentCode) : null;
 
-    if (typeof req.body?.parentCode !== "undefined") {
-      const requested = req.body.parentCode ? toStr(req.body.parentCode) : null;
-      if (requested) {
-        return res.status(400).json({
-          ok: false,
-          message:
-            "No se permite asignar parentCode desde /api/cuentas. Para subcuentas usa /api/subcuentas.",
-        });
-      }
-      patch.parentCode = null;
+    if (typeof req.body?.estado_financiero !== "undefined" || typeof req.body?.estadoFinanciero !== "undefined") {
+      patch.estado_financiero = toStr(req.body?.estado_financiero ?? req.body?.estadoFinanciero);
     }
+    if (typeof req.body?.grupo !== "undefined") patch.grupo = toStr(req.body.grupo);
+    if (typeof req.body?.subgrupo !== "undefined") patch.subgrupo = toStr(req.body.subgrupo);
 
     if (typeof req.body?.isActive !== "undefined") patch.isActive = toBool(req.body.isActive);
 
@@ -349,25 +315,13 @@ router.put(PUT_PATHS, ensureAuth, async (req, res) => {
   }
 });
 
-router.delete(DELETE_PATHS, ensureAuth, async (req, res) => {
+router.delete(["/:id", "/cuentas/:id"], ensureAuth, async (req, res) => {
   try {
     const owner = req.user._id;
     const { id } = req.params;
 
     const current = await Account.findOne({ _id: id, owner }).lean();
     if (!current) return res.status(404).json({ ok: false, message: "Cuenta no encontrada." });
-
-    if (isParentAccount(current)) {
-      const currentCodigo = String(current.codigo ?? current.code ?? "").trim();
-      const children = await hasChildren({ owner, parentCode: currentCodigo });
-      if (children) {
-        return res.status(409).json({
-          ok: false,
-          message:
-            "No puedes eliminar esta cuenta porque tiene subcuentas asociadas. Elimina subcuentas primero.",
-        });
-      }
-    }
 
     await Account.findOneAndDelete({ _id: id, owner }).lean();
     return res.json({ ok: true });
