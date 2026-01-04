@@ -6,8 +6,6 @@ const ensureAuth = require("../middleware/ensureAuth");
 const Account = require("../models/Account");
 
 // Helpers
-const s = (v) => (typeof v === "string" ? v.trim() : v);
-
 function toStr(v) {
   if (v === null || typeof v === "undefined") return "";
   return String(v).trim();
@@ -20,15 +18,105 @@ function toBool(v) {
   return false;
 }
 
+function getCodigo(doc) {
+  return toStr(doc?.codigo ?? doc?.code ?? doc?.cuenta_codigo ?? "");
+}
+function getNombre(doc) {
+  return toStr(doc?.nombre ?? doc?.name ?? doc?.descripcion ?? "");
+}
+
 /**
- * Normaliza una cuenta a un formato seguro (ES + EN) para compatibilidad:
- * - id y _id
- * - codigo y code
- * - nombre y name
+ * Inferencias estilo Bukipin 2 para estado/grupo/subgrupo a partir del código.
+ * (solo se usan si el documento no trae esos campos)
+ */
+function inferEstadoGrupoSubgrupoByCodigo(codigo) {
+  const c = String(codigo || "").replace(/\s+/g, "");
+  const n1 = c.slice(0, 1); // 1..7
+  const n2 = c.slice(0, 2); // 11,12,13,21...
+
+  let estado_financiero = "Estado de Resultados";
+  let grupo = "Otros Ingresos y Gastos";
+
+  if (n1 === "1") {
+    estado_financiero = "Balance General";
+    grupo = "Activos";
+  } else if (n1 === "2") {
+    estado_financiero = "Balance General";
+    grupo = "Pasivos";
+  } else if (n1 === "3") {
+    estado_financiero = "Balance General";
+    grupo = "Capital Contable";
+  } else if (n1 === "4") {
+    estado_financiero = "Estado de Resultados";
+    grupo = "Ingresos";
+  } else if (n1 === "5") {
+    estado_financiero = "Estado de Resultados";
+    grupo = "Egresos";
+  } else if (n1 === "6") {
+    estado_financiero = "Estado de Resultados";
+    grupo = "Impuestos";
+  } else if (n1 === "7") {
+    estado_financiero = "Estado de Resultados";
+    grupo = "Otros Ingresos y Gastos";
+  }
+
+  let subgrupo = "General";
+
+  if (grupo === "Activos") {
+    if (n2 === "11") subgrupo = "Activo Circulante";
+    else if (n2 === "12") subgrupo = "Activo No Circulante";
+    else if (n2 === "13") subgrupo = "Activo Diferido";
+    else subgrupo = "Activo Circulante";
+  }
+
+  if (grupo === "Pasivos") {
+    if (n2 === "21") subgrupo = "Pasivo Corto Plazo";
+    else if (n2 === "22") subgrupo = "Pasivo Largo Plazo";
+    else if (n2 === "23") subgrupo = "Pasivo Diferido";
+    else subgrupo = "Pasivo Corto Plazo";
+  }
+
+  if (grupo === "Capital Contable") {
+    if (n2 === "31") subgrupo = "Capital Contribuido";
+    else if (n2 === "32") subgrupo = "Capital Ganado";
+    else subgrupo = "Capital Contribuido";
+  }
+
+  if (grupo === "Ingresos") {
+    if (n2 === "41") subgrupo = "Ingresos Operativos";
+    else if (n2 === "42") subgrupo = "Otros Ingresos";
+    else subgrupo = "Ingresos Operativos";
+  }
+
+  if (grupo === "Egresos") {
+    if (n2 === "51") subgrupo = "Costo de Ventas";
+    else if (n2 === "52") subgrupo = "Gastos Operativos";
+    else if (n2 === "53") subgrupo = "Gastos Financieros";
+    else subgrupo = "Gastos Operativos";
+  }
+
+  if (grupo === "Impuestos") subgrupo = "Impuestos";
+  if (grupo === "Otros Ingresos y Gastos") subgrupo = "Otros";
+
+  return { estado_financiero, grupo, subgrupo };
+}
+
+/**
+ * Normaliza una cuenta a un formato seguro (ES + EN) + campos financieros.
  */
 function normalizeAccountOut(doc) {
-  const codigo = doc.codigo ?? doc.code ?? null;
-  const nombre = doc.nombre ?? doc.name ?? null;
+  const codigo = getCodigo(doc);
+  const nombre = getNombre(doc);
+
+  const estado_financiero_raw = toStr(doc?.estado_financiero ?? doc?.estadoFinanciero ?? "");
+  const grupo_raw = toStr(doc?.grupo ?? doc?.group ?? doc?.categoria ?? "");
+  const subgrupo_raw = toStr(doc?.subgrupo ?? doc?.subGrupo ?? "");
+
+  const inferred = inferEstadoGrupoSubgrupoByCodigo(codigo);
+
+  const estado_financiero = estado_financiero_raw || inferred.estado_financiero;
+  const grupo = grupo_raw || inferred.grupo;
+  const subgrupo = subgrupo_raw || inferred.subgrupo;
 
   return {
     id: doc._id,
@@ -49,14 +137,18 @@ function normalizeAccountOut(doc) {
     isActive: typeof doc.isActive === "boolean" ? doc.isActive : true,
     isDefault: typeof doc.isDefault === "boolean" ? doc.isDefault : false,
 
+    // ✅ campos contables que necesita el frontend
+    estado_financiero,
+    grupo,
+    subgrupo,
+
     createdAt: doc.createdAt,
     updatedAt: doc.updatedAt,
   };
 }
 
 /**
- * Determina si una cuenta "doc" es cuenta madre:
- * parentCode == null/undefined
+ * Determina si una cuenta "doc" es cuenta madre: parentCode == null/undefined
  */
 function isParentAccount(doc) {
   return !doc.parentCode;
@@ -78,7 +170,6 @@ const POST_PATHS = ["/", "/cuentas"];
 router.get(GET_PATHS, ensureAuth, async (req, res) => {
   try {
     const owner = req.user._id;
-
     const q = { owner };
 
     // active=true|false
@@ -87,27 +178,35 @@ router.get(GET_PATHS, ensureAuth, async (req, res) => {
     }
 
     /**
-     * Por defecto: SOLO cuentas madre
-     * - includeSubcuentas=true => incluye todo
-     * - onlySubcuentas=true    => sólo subcuentas
+     * ✅ NUEVO comportamiento:
+     * - Por defecto: trae TODO (madres + subcuentas) para alimentar el catálogo completo.
+     *
+     * Params soportados:
+     * - onlyMadres=true      => solo cuentas madre
+     * - onlySubcuentas=true  => solo subcuentas
+     * - includeSubcuentas=... (compat legacy)
      */
-    const includeSubcuentas = String(req.query.includeSubcuentas || "false") === "true";
+    const onlyMadres = String(req.query.onlyMadres || "false") === "true";
     const onlySubcuentas = String(req.query.onlySubcuentas || "false") === "true";
+    const includeSubcuentas = String(req.query.includeSubcuentas || "true") === "true"; // ✅ default true
 
-    if (!includeSubcuentas) {
-      if (onlySubcuentas) {
-        q.parentCode = { $exists: true, $ne: null };
-      } else {
-        // cuentas madre
-        q.$or = [{ parentCode: null }, { parentCode: { $exists: false } }];
-      }
+    if (onlySubcuentas) {
+      q.parentCode = { $exists: true, $ne: null };
+    } else if (onlyMadres || !includeSubcuentas) {
+      q.$or = [{ parentCode: null }, { parentCode: { $exists: false } }];
     }
+    // else: includeSubcuentas=true => no filtro extra
 
-    const items = await Account.find(q)
-      .sort({ codigo: 1, code: 1 })
-      .lean();
+    const items = await Account.find(q).lean();
 
-    return res.json({ ok: true, data: items.map(normalizeAccountOut) });
+    const normalized = items
+      .map(normalizeAccountOut)
+      .filter((c) => c.codigo);
+
+    // orden por codigo (numérico si puede)
+    normalized.sort((a, b) => String(a.codigo).localeCompare(String(b.codigo)));
+
+    return res.json({ ok: true, data: normalized });
   } catch (err) {
     console.error("GET /api/cuentas error:", err);
     return res.status(500).json({ ok: false, message: "Error cargando cuentas" });
@@ -126,7 +225,7 @@ router.post(POST_PATHS, ensureAuth, async (req, res) => {
     const parentCodeRaw = req.body?.parentCode ?? null;
     const parentCode = parentCodeRaw ? toStr(parentCodeRaw) : null;
 
-    // Esta ruta es para CUENTAS MADRE. Si te mandan parentCode, mejor guiar.
+    // Esta ruta es para CUENTAS MADRE.
     if (parentCode) {
       return res.status(400).json({
         ok: false,
@@ -138,19 +237,14 @@ router.post(POST_PATHS, ensureAuth, async (req, res) => {
     if (!nombre) return res.status(400).json({ ok: false, message: "Falta 'nombre'." });
     if (!type) return res.status(400).json({ ok: false, message: "Falta 'type'." });
 
-    // Canonical ES + alias EN
     const created = await Account.create({
       owner,
-
       codigo,
       nombre,
-
       code: codigo,
       name: nombre,
-
       type,
       category,
-
       parentCode: null,
       isDefault: false,
       isActive: true,
@@ -186,7 +280,6 @@ router.put(PUT_PATHS, ensureAuth, async (req, res) => {
     const current = await Account.findOne({ _id: id, owner }).lean();
     if (!current) return res.status(404).json({ ok: false, message: "Cuenta no encontrada." });
 
-    // Acepta parches ES o EN y normaliza a ES+EN
     const patch = {};
 
     const nextCodigo =
@@ -195,7 +288,6 @@ router.put(PUT_PATHS, ensureAuth, async (req, res) => {
         : null;
 
     if (nextCodigo !== null) {
-      // Si es cuenta madre y cambia el código, no permitir si tiene subcuentas
       const currentCodigo = String(current.codigo ?? current.code ?? "").trim();
       if (isParentAccount(current) && nextCodigo && nextCodigo !== currentCodigo) {
         const children = await hasChildren({ owner, parentCode: currentCodigo });
@@ -207,7 +299,6 @@ router.put(PUT_PATHS, ensureAuth, async (req, res) => {
           });
         }
       }
-
       patch.codigo = nextCodigo;
       patch.code = nextCodigo;
     }
@@ -225,7 +316,6 @@ router.put(PUT_PATHS, ensureAuth, async (req, res) => {
     if (typeof req.body?.type !== "undefined") patch.type = toStr(req.body.type);
     if (typeof req.body?.category !== "undefined") patch.category = toStr(req.body.category);
 
-    // Esta ruta NO debe convertir una cuenta madre en subcuenta.
     if (typeof req.body?.parentCode !== "undefined") {
       const requested = req.body.parentCode ? toStr(req.body.parentCode) : null;
       if (requested) {
@@ -267,7 +357,6 @@ router.delete(DELETE_PATHS, ensureAuth, async (req, res) => {
     const current = await Account.findOne({ _id: id, owner }).lean();
     if (!current) return res.status(404).json({ ok: false, message: "Cuenta no encontrada." });
 
-    // Si es cuenta madre, no permitir borrar si tiene subcuentas
     if (isParentAccount(current)) {
       const currentCodigo = String(current.codigo ?? current.code ?? "").trim();
       const children = await hasChildren({ owner, parentCode: currentCodigo });
@@ -280,7 +369,7 @@ router.delete(DELETE_PATHS, ensureAuth, async (req, res) => {
       }
     }
 
-    const deleted = await Account.findOneAndDelete({ _id: id, owner }).lean();
+    await Account.findOneAndDelete({ _id: id, owner }).lean();
     return res.json({ ok: true });
   } catch (err) {
     console.error("DELETE /api/cuentas/:id error:", err);
