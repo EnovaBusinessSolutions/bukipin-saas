@@ -189,8 +189,8 @@ function inferClasificacion(code, type) {
     else if (c.startsWith("12")) subgrupo = "Activo No Circulante";
     else if (c.startsWith("13")) subgrupo = "Activo Diferido";
   } else if (grupo === "Pasivos") {
-    if (c.startsWith("20")) subgrupo = "Pasivo Corto Plazo";
-    else if (c.startsWith("21")) subgrupo = "Pasivo Largo Plazo";
+    if (c.startsWith("20")) subgrupo = "Pasivo Circulante";
+    else if (c.startsWith("21")) subgrupo = "Pasivo No Circulante";
   } else if (grupo === "Capital Contable") {
     if (c.startsWith("30")) subgrupo = "Capital Contribuido";
     else if (c.startsWith("31")) subgrupo = "Capital Ganado";
