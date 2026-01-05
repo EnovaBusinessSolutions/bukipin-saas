@@ -147,6 +147,19 @@ function lower(v) {
   return String(v ?? "").trim().toLowerCase();
 }
 
+function isObjectId(v) {
+  return !!v && mongoose.Types.ObjectId.isValid(String(v));
+}
+
+function toIdString(v) {
+  if (!v) return null;
+  try {
+    return String(v);
+  } catch {
+    return null;
+  }
+}
+
 async function nextJournalNumber(owner, dateObj) {
   const year = new Date(dateObj).getFullYear();
   const key = `journal-${year}`;
@@ -252,6 +265,42 @@ async function attachAccountInfo(owner, items) {
   });
 }
 
+/**
+ * ✅ Resolver subcuenta a (id + code) desde ref (ObjectId o code)
+ */
+async function resolveAccountFromRef(owner, ref) {
+  if (!ref) return { id: null, code: null };
+
+  const s = String(ref).trim();
+  if (!s) return { id: null, code: null };
+
+  // si es ObjectId: buscamos cuenta para obtener code
+  if (isObjectId(s)) {
+    const acc = await Account.findOne({
+      owner,
+      _id: new mongoose.Types.ObjectId(s),
+    })
+      .select("_id code codigo")
+      .lean();
+
+    if (!acc) return { id: s, code: null };
+    const code = String(acc.code ?? acc.codigo ?? "").trim() || null;
+    return { id: String(acc._id), code };
+  }
+
+  // si es code: buscamos cuenta para obtener _id
+  const acc = await Account.findOne({
+    owner,
+    $or: [{ code: s }, { codigo: s }],
+  })
+    .select("_id code codigo")
+    .lean();
+
+  if (!acc) return { id: null, code: s };
+  const code = String(acc.code ?? acc.codigo ?? "").trim() || s;
+  return { id: String(acc._id), code };
+}
+
 // ✅ Enriquecer subcuenta (para que el UI no diga “sin subcuenta”)
 async function attachSubcuentaInfo(owner, items) {
   if (!items?.length) return items;
@@ -261,10 +310,10 @@ async function attachSubcuentaInfo(owner, items) {
       items
         .map(
           (it) =>
-            it.subcuentaCodigo ??
-            it.subcuenta_codigo ??
             it.subcuentaId ??
             it.subcuenta_id ??
+            it.subcuentaCodigo ??
+            it.subcuenta_codigo ??
             null
         )
         .filter(Boolean)
@@ -299,10 +348,10 @@ async function attachSubcuentaInfo(owner, items) {
 
   return items.map((it) => {
     const ref =
-      it.subcuentaCodigo ??
-      it.subcuenta_codigo ??
       it.subcuentaId ??
       it.subcuenta_id ??
+      it.subcuentaCodigo ??
+      it.subcuenta_codigo ??
       null;
 
     if (!ref) return it;
@@ -313,16 +362,84 @@ async function attachSubcuentaInfo(owner, items) {
 
     if (!r) return it;
 
+    const id = String(r._id);
     const code = String(r.code ?? r.codigo ?? "").trim();
     const name = r.name ?? r.nombre ?? "";
 
+    // ✅ AQUÍ ESTÁ LA CLAVE: poner también el id (lo que el frontend filtra)
     return {
       ...it,
+      subcuentaId: it.subcuentaId ?? id,
+      subcuenta_id: it.subcuenta_id ?? id,
+
       subcuentaCodigo: it.subcuentaCodigo ?? code,
       subcuenta_codigo: it.subcuenta_codigo ?? code,
+
       subcuentaNombre: it.subcuentaNombre ?? name,
       subcuenta_nombre: it.subcuenta_nombre ?? name,
+
       subcuenta: it.subcuenta ?? (name ? `${code} - ${name}` : code),
+    };
+  });
+}
+
+// ✅ Inferir subcuenta desde Product cuando la tx no la trae
+async function attachSubcuentaFromProduct(owner, items) {
+  if (!Product || !items?.length) return items;
+
+  const getPid = (it) =>
+    it.productId ??
+    it.product_id ??
+    it.productoId ??
+    it.producto_id ??
+    it.itemId ??
+    it.item_id ??
+    null;
+
+  const need = items
+    .map((it, idx) => ({ it, idx, pid: getPid(it) }))
+    .filter(
+      ({ it, pid }) =>
+        !!pid &&
+        isObjectId(pid) &&
+        !(it.subcuentaId || it.subcuenta_id || it.subcuentaCodigo || it.subcuenta_codigo)
+    );
+
+  if (!need.length) return items;
+
+  const ids = Array.from(new Set(need.map((x) => String(x.pid))));
+  const rows = await Product.find({
+    owner,
+    _id: { $in: ids.map((x) => new mongoose.Types.ObjectId(x)) },
+  })
+    .select("subcuentaId subcuenta_id subcuenta subcuentaCodigo subcuenta_codigo")
+    .lean();
+
+  const map = new Map(
+    rows.map((p) => {
+      const subRef =
+        p.subcuentaId ??
+        p.subcuenta_id ??
+        p.subcuenta ??
+        p.subcuentaCodigo ??
+        p.subcuenta_codigo ??
+        null;
+
+      return [String(p._id), subRef ? String(subRef) : null];
+    })
+  );
+
+  return items.map((it) => {
+    const pid = getPid(it);
+    if (!pid || !isObjectId(pid)) return it;
+    const subRef = map.get(String(pid));
+    if (!subRef) return it;
+
+    // guardamos "ref" en tx para que luego attachSubcuentaInfo resuelva id/nombre
+    return {
+      ...it,
+      subcuentaId: it.subcuentaId ?? subRef,
+      subcuenta_id: it.subcuenta_id ?? subRef,
     };
   });
 }
@@ -393,6 +510,7 @@ async function attachClientInfo(owner, items) {
 
 /**
  * ✅ Mapeo transacción para UI (con fecha FIXED)
+ * ✅ subcuenta_id/subcuentaId siempre string (si existe)
  */
 function mapTxForUI(tx) {
   const fechaFixed = fixFechaWithCreatedAt(tx);
@@ -407,11 +525,12 @@ function mapTxForUI(tx) {
     tx.cuenta_principal_codigo ??
     null;
 
-  const subcuentaId =
-    tx.subcuentaId ?? tx.subcuenta_id ?? tx.subcuenta ?? null;
+  // ✅ subcuenta: aquí NO mezcles "subcuenta" display con id
+  const rawSubId = tx.subcuentaId ?? tx.subcuenta_id ?? null;
+  const rawSubCode = tx.subcuentaCodigo ?? tx.subcuenta_codigo ?? null;
 
-  const subcuentaCodigo =
-    tx.subcuentaCodigo ?? tx.subcuenta_codigo ?? null;
+  const subcuentaId = rawSubId ? toIdString(rawSubId) : null;
+  const subcuentaCodigo = rawSubCode ? String(rawSubCode).trim() : null;
 
   return {
     ...tx,
@@ -455,7 +574,7 @@ function mapTxForUI(tx) {
     cuenta_principal_codigo:
       tx.cuenta_principal_codigo ?? tx.cuentaPrincipalCodigo ?? cuentaCodigo ?? null,
 
-    // ✅ subcuenta (para UI)
+    // ✅ subcuenta canonical
     subcuentaId: subcuentaId ?? null,
     subcuenta_id: subcuentaId ?? null,
     subcuentaCodigo: subcuentaCodigo ?? null,
@@ -531,46 +650,6 @@ async function buildLine(owner, { code, debit = 0, credit = 0, memo = "" }) {
   }
 
   return { ...base, accountCodigo: String(code).trim() };
-}
-
-// ✅ helpers para resolver subcuenta desde refs/productos
-function isObjectId(v) {
-  return !!v && mongoose.Types.ObjectId.isValid(String(v));
-}
-
-async function resolveAccountCodeFromRef(owner, ref) {
-  if (!ref) return null;
-
-  // Si ya viene como "4001-01"
-  if (!isObjectId(ref)) return String(ref).trim();
-
-  // Si viene como ObjectId, buscamos el código
-  const acc = await Account.findOne({ owner, _id: ref })
-    .select("code codigo")
-    .lean();
-
-  const code = String(acc?.code ?? acc?.codigo ?? "").trim();
-  return code || null;
-}
-
-async function resolveSubcuentaFromProduct(owner, productId) {
-  if (!Product || !productId || !isObjectId(productId)) return { subcuentaRef: null };
-
-  const p = await Product.findOne({ owner, _id: productId })
-    .select(
-      "subcuentaId subcuenta_id subcuenta subcuentaCodigo subcuenta_codigo cuentaCodigo cuenta_codigo"
-    )
-    .lean();
-
-  const subRef =
-    p?.subcuentaId ??
-    p?.subcuenta_id ??
-    p?.subcuenta ??
-    p?.subcuentaCodigo ??
-    p?.subcuenta_codigo ??
-    null;
-
-  return { subcuentaRef: subRef || null };
 }
 
 function mapEntryForUI(entry, accountNameMap = {}) {
@@ -844,7 +923,8 @@ router.get("/detalles", ensureAuth, async (req, res) => {
     let items = itemsRaw.map(mapTxForUI);
 
     items = await attachAccountInfo(owner, items);
-    items = await attachSubcuentaInfo(owner, items); // ✅
+    items = await attachSubcuentaFromProduct(owner, items); // ✅ inferencia por producto
+    items = await attachSubcuentaInfo(owner, items); // ✅ ahora sí mete subcuenta_id + nombre
     items = await attachClientInfo(owner, items);
 
     const total = itemsRaw.reduce((acc, it) => {
@@ -919,7 +999,8 @@ router.get("/recientes", ensureAuth, async (req, res) => {
 
     let items = itemsRaw.map(mapTxForUI);
     items = await attachAccountInfo(owner, items);
-    items = await attachSubcuentaInfo(owner, items); // ✅
+    items = await attachSubcuentaFromProduct(owner, items);
+    items = await attachSubcuentaInfo(owner, items);
     items = await attachClientInfo(owner, items);
 
     return res.json({ ok: true, data: items, items });
@@ -989,6 +1070,7 @@ router.post("/", ensureAuth, async (req, res) => {
     // ✅ subcuenta puede venir por body o inferirse por producto
     let subcuentaRef =
       req.body?.subcuentaId ??
+      req.body?.subcuenta_id ??
       req.body?.subcuentaCodigo ??
       req.body?.subcuenta_codigo ??
       null;
@@ -1003,11 +1085,29 @@ router.post("/", ensureAuth, async (req, res) => {
       null;
 
     if (!subcuentaRef && productIdRaw) {
-      const { subcuentaRef: subFromProduct } = await resolveSubcuentaFromProduct(owner, productIdRaw);
-      subcuentaRef = subFromProduct;
+      // inferir desde producto
+      const p = await Product?.findOne({
+        owner,
+        _id: new mongoose.Types.ObjectId(String(productIdRaw)),
+      })
+        .select("subcuentaId subcuenta_id subcuenta subcuentaCodigo subcuenta_codigo")
+        .lean()
+        .catch(() => null);
+
+      subcuentaRef =
+        p?.subcuentaId ??
+        p?.subcuenta_id ??
+        p?.subcuenta ??
+        p?.subcuentaCodigo ??
+        p?.subcuenta_codigo ??
+        null;
     }
 
-    const subcuentaCodigoResolved = await resolveAccountCodeFromRef(owner, subcuentaRef);
+    // ✅ resolver a id+code
+    const { id: subcuentaIdResolved, code: subcuentaCodigoResolved } = await resolveAccountFromRef(
+      owner,
+      subcuentaRef
+    );
 
     const now = new Date();
     let fecha = parseTxDateSmart(req.body?.fecha, now);
@@ -1059,12 +1159,13 @@ router.post("/", ensureAuth, async (req, res) => {
       cuentaPrincipalCodigo: cuentaCodigo,
       cuenta_principal_codigo: cuentaCodigo,
 
-      // ✅ guardamos ambas (ref + code) para UI/compat
-      subcuentaId: subcuentaRef ?? null,
+      // ✅ guardamos id + code (canonical)
+      subcuentaId: subcuentaIdResolved ?? null,
+      subcuenta_id: subcuentaIdResolved ?? null,
       subcuentaCodigo: subcuentaCodigoResolved ?? null,
       subcuenta_codigo: subcuentaCodigoResolved ?? null,
 
-      // ✅ ayuda a debug/trace
+      // trazabilidad (si venía por producto)
       productId: productIdRaw ?? null,
       product_id: productIdRaw ?? null,
 
