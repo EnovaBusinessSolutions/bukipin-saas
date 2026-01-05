@@ -10,20 +10,29 @@ function toStr(v) {
   return String(v).trim();
 }
 
+/**
+ * ✅ Subcuenta = tiene parentCode y NO es el mismo código del padre
+ * (No dependemos de que el código termine en "-01", porque en Bukipin 2
+ * hay “subcuentas” como 5002/5003/5004 colgadas de 5001).
+ */
 function looksLikeSubcuenta(doc) {
   const parentCode = toStr(doc.parentCode);
   if (!parentCode) return false;
   const code = toStr(doc.code);
-  return /[-./]\d+$/.test(code);
+  if (!code) return false;
+  return code !== parentCode;
 }
 
 /**
- * Catálogo base (alineado a tu enum de Account.type)
+ * ✅ Catálogo base (alineado al enum)
  * type: activo|pasivo|capital|ingreso|gasto|orden
  *
- * NOTA:
- * - Depreciaciones/Amortización acumulada son "contra-activos", pero en tu enum
- *   no existe ese tipo, así que las dejamos como "activo" (para agrupar en Balance General).
+ * NOTA IMPORTANTE:
+ * - Antes usabas type:"costo" (no existe en el enum). Aquí ya NO lo usamos.
+ * - Para no romper data ya insertada con "costo", abajo lo normalizamos a "gasto".
+ *
+ * ESTRUCTURA:
+ * - Puedes “colar” jerarquía con parentCode (para que UI muestre subcuentas como Bukipin 2).
  */
 const DEFAULT_CHART = [
   // =======================
@@ -32,16 +41,17 @@ const DEFAULT_CHART = [
   { code: "1001", name: "Caja", type: "activo" },
   { code: "1002", name: "Bancos", type: "activo" },
 
-  // En tus flujos legacy ya usas 1101 como Clientes, lo mantenemos.
-  { code: "1101", name: "Clientes", type: "activo" },
-
   { code: "1003", name: "Cuentas por Cobrar Clientes", type: "activo" },
+  { code: "1003-01", name: "Clientes", type: "activo", parentCode: "1003" },
 
   { code: "1004", name: "Documentos por Cobrar", type: "activo" },
   { code: "1005", name: "Inventario de Mercancías", type: "activo" },
   { code: "1006", name: "Inventario de Materias Primas", type: "activo" },
   { code: "1007", name: "IVA Acreditable", type: "activo" },
   { code: "1008", name: "Gastos Pagados por Anticipado", type: "activo" },
+
+  // Legacy (lo sigues usando en flujos viejos)
+  { code: "1101", name: "Clientes", type: "activo" },
 
   // =======================
   // ACTIVOS (No circulante)
@@ -89,87 +99,98 @@ const DEFAULT_CHART = [
   { code: "2103", name: "Documentos por Pagar Largo Plazo", type: "pasivo" },
 
   // =======================
-  // CAPITAL CONTABLE (Capital Contribuido)
+  // CAPITAL CONTABLE
   // =======================
   { code: "3001", name: "Capital Social", type: "capital" },
   { code: "3002", name: "Aportaciones para Futuros Aumentos", type: "capital" },
   { code: "3003", name: "Prima en Venta de Acciones", type: "capital" },
 
-  // =======================
-  // CAPITAL CONTABLE (Capital Ganado)
-  // =======================
-
   { code: "3101", name: "Reserva Legal", type: "capital" },
   { code: "3102", name: "Utilidades Retenidas", type: "capital" },
   { code: "3104", name: "Pérdidas Acumuladas", type: "capital" },
 
-// =======================
-  // CAPITAL CONTABLE (Capital Reembolsado)
-  // =======================
-
   { code: "3201", name: "Dividendos Decretados", type: "capital" },
 
   // =======================
-  // INGRESOS (Ingresos por Ventas)
+  // INGRESOS (Ventas)
   // =======================
   { code: "4001", name: "Ventas", type: "ingreso" },
+
+  // Subcuentas de Ventas (como ya las estás mostrando en tu sistema)
+  { code: "4001-01", name: "Ventas Contado", type: "ingreso", parentCode: "4001" },
+  { code: "4001-02", name: "Ventas Crédito", type: "ingreso", parentCode: "4001" },
+  { code: "4001-03", name: "Ventas Transferencia", type: "ingreso", parentCode: "4001" },
+  { code: "4001-04", name: "Otras Ventas", type: "ingreso", parentCode: "4001" },
+
   { code: "4002", name: "Devoluciones sobre Ventas", type: "ingreso" },
   { code: "4003", name: "Descuentos sobre Ventas", type: "ingreso" },
   { code: "4004", name: "Ventas inventarios", type: "ingreso" },
 
   // =======================
-  // INGRESOS (Otros Ingresos)
+  // INGRESOS (Otros)
   // =======================
-
   { code: "4101", name: "Productos Financieros", type: "ingreso" },
   { code: "4102", name: "Otros Productos", type: "ingreso" },
   { code: "4103", name: "Ganancia en Venta de Activos", type: "ingreso" },
 
   // =======================
-  // EGRESOS (Costo de Ventas)
+  // EGRESOS (Costo de Ventas) — como Bukipin 2
   // =======================
-  { code: "5001", name: "Costo de Ventas", type: "costo" },
-  { code: "5002", name: "Costo de Ventas Inventario", type: "costo" },
-  { code: "5003", name: "Devoluciones sobre Compras", type: "costo" },
-  { code: "5004", name: "Descuentos sobre Compras", type: "costo" },
+  { code: "5001", name: "Costo de Ventas", type: "gasto" },
+  { code: "5002", name: "Costo de Ventas Inventario", type: "gasto", parentCode: "5001" },
+  { code: "5003", name: "Devoluciones sobre Compras", type: "gasto", parentCode: "5001" },
+  { code: "5004", name: "Descuentos sobre Compras", type: "gasto", parentCode: "5001" },
 
   // =======================
-  // EGRESOS (Gastos de Operacion)
+  // EGRESOS (Gastos de Operación) — faltaban en Bukipin 1
   // =======================
+  { code: "5101", name: "Gastos de Venta", type: "gasto" },
+  { code: "5102", name: "Sueldos y Salarios Ventas", type: "gasto" },
+  { code: "5103", name: "Comisiones sobre Ventas", type: "gasto" },
+  { code: "5104", name: "Publicidad", type: "gasto" },
+  { code: "5105", name: "Gastos de Administración", type: "gasto" },
+  { code: "5106", name: "Sueldos y Salarios Administración", type: "gasto" },
+  { code: "5107", name: "Renta de Oficinas", type: "gasto" },
+  { code: "5108", name: "Servicios Públicos", type: "gasto" },
 
+  // =======================
+  // EGRESOS (Depreciaciones y Amortizaciones) — como Bukipin 2
+  // =======================
   { code: "5109", name: "Depreciaciones", type: "gasto" },
   { code: "5110", name: "Amortizaciones", type: "gasto" },
 
-   // =======================
-  // EGRESOS (Gastos Financieros)
   // =======================
+  // EGRESOS (Gastos Financieros) — como Bukipin 2
+  // =======================
+  { code: "5201", name: "Intereses Pagados", type: "gasto" },
 
-   { code: "5201", name: "Intereses Pagados", type: "gasto" },
-
-// =======================
+  // =======================
   // EGRESOS (Otros Gastos)
   // =======================
-
   { code: "5204", name: "Otros gastos", type: "gasto" },
 
   // =======================
-  // Otros Ingresos y Gastos (Resultados No Operativos)
+  // Otros Ingresos y Gastos (Resultados No Operativos) — como Bukipin 2
   // =======================
-
   { code: "5202", name: "Comisiones Bancarias", type: "gasto" },
   { code: "5203", name: "Pérdida en Venta de Activos", type: "gasto" },
 
   // =======================
   // Impuestos (Provisiones)
   // =======================
-
   { code: "6001", name: "Impuesto sobre la Renta", type: "gasto" },
   { code: "6002", name: "Participación de Utilidades a Trabajadores", type: "gasto" },
+
+  // Opcional (si en tu UI ya existe 7001 en Bukipin 1, no estorba)
+  { code: "7001", name: "Impuestos", type: "gasto" },
 ];
 
 function inferClasificacion(code, type) {
-  const c = String(code || "");
-  const t = String(type || "").toLowerCase();
+  const c = String(code || "").trim();
+  const rawType = String(type || "").toLowerCase().trim();
+
+  // ✅ Normaliza data vieja
+  const t = rawType === "costo" ? "gasto" : rawType;
 
   const estado_financiero = ["activo", "pasivo", "capital"].includes(t)
     ? "Balance General"
@@ -181,6 +202,10 @@ function inferClasificacion(code, type) {
   else if (t === "capital") grupo = "Capital Contable";
   else if (t === "ingreso") grupo = "Ingresos";
   else if (t === "gasto") grupo = "Egresos";
+
+  // ✅ Overrides para que quede como en tu UI de Bukipin 2
+  if (["5202", "5203"].includes(c)) grupo = "Otros Ingresos y Gastos";
+  if (c.startsWith("60") || c.startsWith("70")) grupo = "Impuestos";
 
   let subgrupo = "General";
 
@@ -199,15 +224,14 @@ function inferClasificacion(code, type) {
     subgrupo = c.startsWith("41") ? "Otros Ingresos" : "Ingresos por Ventas";
   } else if (grupo === "Egresos") {
     if (c.startsWith("50")) subgrupo = "Costo de Ventas";
-    else if (c.startsWith("51")) subgrupo = "Gastos de Operación";
-    else if (c.startsWith("52")) subgrupo = "General";
-    else if (c.startsWith("53")) subgrupo = "Depreciaciones y Amortizaciones";
-    else if (c.startsWith("54")) subgrupo = "Gastos Financieros";
-    else if (c.startsWith("55")) subgrupo = "Otros Gastos";
-    else if (c.startsWith("60") || c.startsWith("70")) {
-      grupo = "Impuestos";
-      subgrupo = "Provisiones";
-    }
+    else if (["5109", "5110"].includes(c) || c.startsWith("53")) subgrupo = "Depreciaciones y Amortizaciones";
+    else if (c === "5201" || c.startsWith("54")) subgrupo = "Gastos Financieros";
+    else if (c === "5204" || c.startsWith("55")) subgrupo = "Otros Gastos";
+    else subgrupo = "Gastos de Operación";
+  } else if (grupo === "Otros Ingresos y Gastos") {
+    subgrupo = "Resultados No Operativos";
+  } else if (grupo === "Impuestos") {
+    subgrupo = "Provisiones";
   }
 
   return { estado_financiero, grupo, subgrupo };
@@ -216,9 +240,11 @@ function inferClasificacion(code, type) {
 function normalizeAccountOut(doc) {
   const code = toStr(doc.code);
   const name = toStr(doc.name);
-  const type = toStr(doc.type);
 
-  const { estado_financiero, grupo, subgrupo } = inferClasificacion(code, type);
+  const rawType = toStr(doc.type).toLowerCase();
+  const normalizedType = rawType === "costo" ? "gasto" : rawType;
+
+  const { estado_financiero, grupo, subgrupo } = inferClasificacion(code, normalizedType);
 
   return {
     id: doc._id,
@@ -229,7 +255,10 @@ function normalizeAccountOut(doc) {
     code,
     name,
 
-    type: type || null,
+    // ✅ entregamos el type normalizado para que el frontend agrupe bien
+    type: normalizedType || null,
+    originalType: rawType || null,
+
     category: doc.category ?? "general",
     parentCode: doc.parentCode ?? null,
 
@@ -247,8 +276,9 @@ function normalizeAccountOut(doc) {
 
 /**
  * ✅ Seed idempotente:
- * - SIEMPRE hace upsert del DEFAULT_CHART (no depende de minCount)
+ * - Upsert por (owner + code)
  * - NO pisa cambios del usuario ($setOnInsert)
+ * - Inserta NUEVAS cuentas cuando agregas más al DEFAULT_CHART
  */
 async function ensureDefaultChart(owner) {
   const before = await Account.countDocuments({ owner });
@@ -292,18 +322,18 @@ async function ensureDefaultChart(owner) {
 }
 
 /**
- * ✅ RUTA FIRMA (para confirmar que estás pegándole al router correcto)
+ * ✅ RUTA FIRMA (para confirmar router correcto)
  */
 router.get("/__sig", (req, res) => {
   return res.json({
     ok: true,
-    sig: "cuentas-router-v2026-01-05-fullchart",
+    sig: "cuentas-router-v2026-01-05-bukipin2-match",
     time: new Date().toISOString(),
   });
 });
 
 router.get(["/", "/cuentas"], ensureAuth, async (req, res) => {
-  res.set("x-bukipin-cuentas", "v2026-01-05-fullchart");
+  res.set("x-bukipin-cuentas", "v2026-01-05-bukipin2-match");
   res.set("cache-control", "no-store");
 
   try {
