@@ -15,18 +15,28 @@ try {
   Client = require("../models/Client");
 } catch (_) {}
 
+// ✅ Opcional: modelo de productos/catálogo (para inferir subcuenta)
+let Product = null;
+try {
+  Product = require("../models/Product");
+} catch (_) {
+  try {
+    Product = require("../models/Producto");
+  } catch (_) {
+    try {
+      Product = require("../models/CatalogProduct");
+    } catch (_) {
+      try {
+        Product = require("../models/InventoryItem");
+      } catch (_) {}
+    }
+  }
+}
+
 /**
  * =========================
  * ✅ TIMEZONE / FECHA E2E
  * =========================
- * Render/Node suele correr en UTC.
- * El UI (CDMX -06) muestra 00:00Z como 18:00 del día anterior.
- *
- * Estrategia:
- * 1) Si llega fecha "YYYY-MM-DD" => guardamos con hora real de captura (no medianoche).
- * 2) Si ya existe guardada como 00:00Z => para UI combinamos:
- *    - día de `fecha`
- *    - hora de `createdAt`
  */
 const TZ_OFFSET_MINUTES = Number(process.env.APP_TZ_OFFSET_MINUTES ?? -360); // CDMX estándar (-06)
 
@@ -40,8 +50,6 @@ function dateOnlyToUtc(str, hh = 0, mm = 0, ss = 0, ms = 0) {
   const [y, m, d] = s.split("-").map((x) => Number(x));
   if (!y || !m || !d) return null;
 
-  // Interpretamos "YYYY-MM-DD HH:mm" como HORA LOCAL (TZ_OFFSET_MINUTES),
-  // y lo convertimos a UTC.
   const utcMillis = Date.UTC(y, m - 1, d, hh, mm, ss, ms);
   return new Date(utcMillis - TZ_OFFSET_MINUTES * 60 * 1000);
 }
@@ -84,12 +92,6 @@ function parseEndDate(s) {
   return Number.isNaN(d.getTime()) ? null : d;
 }
 
-/**
- * ✅ Para guardar transacciones:
- * - si llega YYYY-MM-DD => usar hora real (captura) pero mantener el día seleccionado
- * - si llega ISO => usarlo tal cual
- * - si no llega => now
- */
 function parseTxDateSmart(raw, now = new Date()) {
   if (!raw) return now;
   const str = String(raw).trim();
@@ -100,7 +102,6 @@ function parseTxDateSmart(raw, now = new Date()) {
     return Number.isNaN(d.getTime()) ? now : d;
   }
 
-  // YYYY-MM-DD: mantenemos el día, ponemos la hora real de captura
   const parts = getLocalPartsFromUtc(now);
   if (!parts) return now;
 
@@ -108,10 +109,6 @@ function parseTxDateSmart(raw, now = new Date()) {
   return d2 || now;
 }
 
-/**
- * ✅ Fix display: si `fecha` es medianoche UTC => se “va” al día anterior en -06.
- * Mantén el día de fecha, usa la hora real de createdAt.
- */
 function fixFechaWithCreatedAt(tx) {
   const f = tx?.fecha ? new Date(tx.fecha) : null;
   const c = tx?.createdAt ? new Date(tx.createdAt) : null;
@@ -128,7 +125,6 @@ function fixFechaWithCreatedAt(tx) {
   if (!isMidnightUTC) return f;
   if (!c || Number.isNaN(c.getTime())) return f;
 
-  // Creamos una fecha UTC con el día de f (UTC) y la hora de c (UTC)
   return new Date(
     Date.UTC(
       f.getUTCFullYear(),
@@ -256,6 +252,81 @@ async function attachAccountInfo(owner, items) {
   });
 }
 
+// ✅ Enriquecer subcuenta (para que el UI no diga “sin subcuenta”)
+async function attachSubcuentaInfo(owner, items) {
+  if (!items?.length) return items;
+
+  const refs = Array.from(
+    new Set(
+      items
+        .map(
+          (it) =>
+            it.subcuentaCodigo ??
+            it.subcuenta_codigo ??
+            it.subcuentaId ??
+            it.subcuenta_id ??
+            null
+        )
+        .filter(Boolean)
+        .map((v) => String(v))
+    )
+  );
+
+  if (!refs.length) return items;
+
+  const ids = refs.filter((v) => mongoose.Types.ObjectId.isValid(v));
+  const codes = refs.filter((v) => !mongoose.Types.ObjectId.isValid(v));
+
+  const or = [];
+  if (ids.length) {
+    or.push({ _id: { $in: ids.map((x) => new mongoose.Types.ObjectId(x)) } });
+  }
+  if (codes.length) {
+    or.push({ $or: [{ code: { $in: codes } }, { codigo: { $in: codes } }] });
+  }
+  if (!or.length) return items;
+
+  const rows = await Account.find({ owner, $or: or })
+    .select("_id code codigo name nombre")
+    .lean();
+
+  const byId = new Map(rows.map((r) => [String(r._id), r]));
+  const byCode = new Map(
+    rows
+      .map((r) => [String(r.code ?? r.codigo ?? "").trim(), r])
+      .filter(([k]) => !!k)
+  );
+
+  return items.map((it) => {
+    const ref =
+      it.subcuentaCodigo ??
+      it.subcuenta_codigo ??
+      it.subcuentaId ??
+      it.subcuenta_id ??
+      null;
+
+    if (!ref) return it;
+
+    const r = mongoose.Types.ObjectId.isValid(String(ref))
+      ? byId.get(String(ref))
+      : byCode.get(String(ref).trim());
+
+    if (!r) return it;
+
+    const code = String(r.code ?? r.codigo ?? "").trim();
+    const name = r.name ?? r.nombre ?? "";
+
+    return {
+      ...it,
+      subcuentaCodigo: it.subcuentaCodigo ?? code,
+      subcuenta_codigo: it.subcuenta_codigo ?? code,
+      subcuentaNombre: it.subcuentaNombre ?? name,
+      subcuenta_nombre: it.subcuenta_nombre ?? name,
+      subcuenta: it.subcuenta ?? (name ? `${code} - ${name}` : code),
+    };
+  });
+}
+
 async function attachClientInfo(owner, items) {
   if (!Client || !items?.length) return items;
 
@@ -336,11 +407,16 @@ function mapTxForUI(tx) {
     tx.cuenta_principal_codigo ??
     null;
 
+  const subcuentaId =
+    tx.subcuentaId ?? tx.subcuenta_id ?? tx.subcuenta ?? null;
+
+  const subcuentaCodigo =
+    tx.subcuentaCodigo ?? tx.subcuenta_codigo ?? null;
+
   return {
     ...tx,
     id: tx._id ? String(tx._id) : tx.id,
 
-    // ✅ fecha corregida
     fecha,
     fecha_fixed: fecha ? fecha.toISOString() : null,
     fecha_ymd: fecha ? toYMDLocal(fecha) : null,
@@ -378,6 +454,12 @@ function mapTxForUI(tx) {
       tx.cuentaPrincipalCodigo ?? tx.cuenta_principal_codigo ?? cuentaCodigo ?? null,
     cuenta_principal_codigo:
       tx.cuenta_principal_codigo ?? tx.cuentaPrincipalCodigo ?? cuentaCodigo ?? null,
+
+    // ✅ subcuenta (para UI)
+    subcuentaId: subcuentaId ?? null,
+    subcuenta_id: subcuentaId ?? null,
+    subcuentaCodigo: subcuentaCodigo ?? null,
+    subcuenta_codigo: subcuentaCodigo ?? null,
 
     clienteId: tx.clienteId ?? tx.clientId ?? tx.cliente_id ?? tx.client_id ?? null,
     clientId: tx.clientId ?? tx.clienteId ?? tx.cliente_id ?? tx.client_id ?? null,
@@ -451,6 +533,46 @@ async function buildLine(owner, { code, debit = 0, credit = 0, memo = "" }) {
   return { ...base, accountCodigo: String(code).trim() };
 }
 
+// ✅ helpers para resolver subcuenta desde refs/productos
+function isObjectId(v) {
+  return !!v && mongoose.Types.ObjectId.isValid(String(v));
+}
+
+async function resolveAccountCodeFromRef(owner, ref) {
+  if (!ref) return null;
+
+  // Si ya viene como "4001-01"
+  if (!isObjectId(ref)) return String(ref).trim();
+
+  // Si viene como ObjectId, buscamos el código
+  const acc = await Account.findOne({ owner, _id: ref })
+    .select("code codigo")
+    .lean();
+
+  const code = String(acc?.code ?? acc?.codigo ?? "").trim();
+  return code || null;
+}
+
+async function resolveSubcuentaFromProduct(owner, productId) {
+  if (!Product || !productId || !isObjectId(productId)) return { subcuentaRef: null };
+
+  const p = await Product.findOne({ owner, _id: productId })
+    .select(
+      "subcuentaId subcuenta_id subcuenta subcuentaCodigo subcuenta_codigo cuentaCodigo cuenta_codigo"
+    )
+    .lean();
+
+  const subRef =
+    p?.subcuentaId ??
+    p?.subcuenta_id ??
+    p?.subcuenta ??
+    p?.subcuentaCodigo ??
+    p?.subcuenta_codigo ??
+    null;
+
+  return { subcuentaRef: subRef || null };
+}
+
 function mapEntryForUI(entry, accountNameMap = {}) {
   const rawLines = entry.lines || entry.detalle_asientos || [];
 
@@ -515,7 +637,6 @@ function flattenDetalles(entries, accountMaps = null) {
 
     if (code) return String(code).trim();
 
-    // ✅ Si viene en modo "id" (accountId), intentamos resolverlo
     const aid = l.accountId ?? l.cuenta_id ?? l.account ?? null;
     if (aid && accountMaps?.codeById) {
       const resolved = accountMaps.codeById[String(aid)];
@@ -544,7 +665,6 @@ function flattenDetalles(entries, accountMaps = null) {
 
   return detalles;
 }
-
 
 function normalizeMetodoPago(raw) {
   let v = typeof raw === "string" ? raw.trim().toLowerCase() : "";
@@ -612,14 +732,15 @@ async function buildAccountMaps(owner, entries) {
     }
   }
 
-  // Si no hay nada, regresa maps vacíos
   if (!codes.size && !ids.size) {
     return { nameByCode: {}, codeById: {}, nameById: {} };
   }
 
   const query = { owner, $or: [] };
-  if (codes.size) query.$or.push({ $or: [{ code: { $in: [...codes] } }, { codigo: { $in: [...codes] } }] });
-  if (ids.size) query.$or.push({ _id: { $in: [...ids].map((x) => new mongoose.Types.ObjectId(x)) } });
+  if (codes.size)
+    query.$or.push({ $or: [{ code: { $in: [...codes] } }, { codigo: { $in: [...codes] } }] });
+  if (ids.size)
+    query.$or.push({ _id: { $in: [...ids].map((x) => new mongoose.Types.ObjectId(x)) } });
 
   const rows = await Account.find(query)
     .select("_id code codigo name nombre")
@@ -669,16 +790,9 @@ router.get("/asientos", ensureAuth, async (req, res) => {
       .sort({ date: -1, createdAt: -1 })
       .lean();
 
-    // ✅ Mapas para resolver cuenta por code o por accountId
     const accountMaps = await buildAccountMaps(owner, entries);
 
-    // ✅ asientos mapeados como ya los usas
-    const asientos = entries.map((e) => {
-      // reutilizamos tu mapEntryForUI, pero le pasamos un map de nombres por código
-      return mapEntryForUI(e, accountMaps.nameByCode);
-    });
-
-    // ✅ detalles aplanados (esto es lo que te faltaba)
+    const asientos = entries.map((e) => mapEntryForUI(e, accountMaps.nameByCode));
     const detalles = flattenDetalles(entries, accountMaps);
 
     return res.json({
@@ -692,7 +806,6 @@ router.get("/asientos", ensureAuth, async (req, res) => {
     return res.status(500).json({ ok: false, message: "Error cargando asientos" });
   }
 });
-
 
 /**
  * GET /api/ingresos/detalles?start=YYYY-MM-DD&end=YYYY-MM-DD
@@ -731,6 +844,7 @@ router.get("/detalles", ensureAuth, async (req, res) => {
     let items = itemsRaw.map(mapTxForUI);
 
     items = await attachAccountInfo(owner, items);
+    items = await attachSubcuentaInfo(owner, items); // ✅
     items = await attachClientInfo(owner, items);
 
     const total = itemsRaw.reduce((acc, it) => {
@@ -805,6 +919,7 @@ router.get("/recientes", ensureAuth, async (req, res) => {
 
     let items = itemsRaw.map(mapTxForUI);
     items = await attachAccountInfo(owner, items);
+    items = await attachSubcuentaInfo(owner, items); // ✅
     items = await attachClientInfo(owner, items);
 
     return res.json({ ok: true, data: items, items });
@@ -871,7 +986,28 @@ router.post("/", ensureAuth, async (req, res) => {
       req.body?.cuentaCodigo || req.body?.cuentaPrincipalCodigo || "4001"
     ).trim();
 
-    const subcuentaId = req.body?.subcuentaId ?? null;
+    // ✅ subcuenta puede venir por body o inferirse por producto
+    let subcuentaRef =
+      req.body?.subcuentaId ??
+      req.body?.subcuentaCodigo ??
+      req.body?.subcuenta_codigo ??
+      null;
+
+    const productIdRaw =
+      req.body?.productId ??
+      req.body?.productoId ??
+      req.body?.product_id ??
+      req.body?.producto_id ??
+      req.body?.itemId ??
+      req.body?.item_id ??
+      null;
+
+    if (!subcuentaRef && productIdRaw) {
+      const { subcuentaRef: subFromProduct } = await resolveSubcuentaFromProduct(owner, productIdRaw);
+      subcuentaRef = subFromProduct;
+    }
+
+    const subcuentaCodigoResolved = await resolveAccountCodeFromRef(owner, subcuentaRef);
 
     const now = new Date();
     let fecha = parseTxDateSmart(req.body?.fecha, now);
@@ -923,7 +1059,14 @@ router.post("/", ensureAuth, async (req, res) => {
       cuentaPrincipalCodigo: cuentaCodigo,
       cuenta_principal_codigo: cuentaCodigo,
 
-      subcuentaId,
+      // ✅ guardamos ambas (ref + code) para UI/compat
+      subcuentaId: subcuentaRef ?? null,
+      subcuentaCodigo: subcuentaCodigoResolved ?? null,
+      subcuenta_codigo: subcuentaCodigoResolved ?? null,
+
+      // ✅ ayuda a debug/trace
+      productId: productIdRaw ?? null,
+      product_id: productIdRaw ?? null,
 
       saldoPendiente,
       saldo_pendiente: saldoPendiente,
@@ -977,9 +1120,17 @@ router.post("/", ensureAuth, async (req, res) => {
       }
     }
 
+    // ✅ CLAVE: el haber del ingreso debe caer en subcuenta si existe
     const haberIngresos = descuento > 0 ? total : neto;
+    const codeIngreso = subcuentaCodigoResolved || cuentaCodigo;
+
     lines.push(
-      await buildLine(owner, { code: cuentaCodigo, debit: 0, credit: haberIngresos, memo: "Ingreso" })
+      await buildLine(owner, {
+        code: codeIngreso,
+        debit: 0,
+        credit: haberIngresos,
+        memo: subcuentaCodigoResolved ? "Ingreso (subcuenta)" : "Ingreso",
+      })
     );
 
     const numeroAsiento = await nextJournalNumber(owner, tx.fecha);
@@ -1004,6 +1155,7 @@ router.post("/", ensureAuth, async (req, res) => {
 
     let txUI = mapTxForUI(tx.toObject ? tx.toObject() : tx);
     txUI = (await attachAccountInfo(owner, [txUI]))[0];
+    txUI = (await attachSubcuentaInfo(owner, [txUI]))[0];
     txUI = (await attachClientInfo(owner, [txUI]))[0];
 
     return res.status(201).json({
