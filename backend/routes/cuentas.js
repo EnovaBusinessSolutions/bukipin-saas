@@ -339,16 +339,22 @@ router.get(["/", "/cuentas"], ensureAuth, async (req, res) => {
   try {
     const owner = req.user._id;
 
-    const ensureDefaults = String(req.query.ensureDefaults ?? "true") === "true";
+    const ensureDefaults = String(req.query.ensureDefaults ?? "false") === "true";
     let seedInfo = null;
     if (ensureDefaults) {
       seedInfo = await ensureDefaultChart(owner);
     }
 
     const q = { owner };
-    if (typeof req.query.active !== "undefined") {
-      q.isActive = String(req.query.active) === "true";
-    }
+    const activeParam = req.query.active;
+    // Default: solo activas
+    if (typeof activeParam === "undefined") {
+    q.isActive = true;
+    } else {
+    const v = String(activeParam).toLowerCase();
+    // active=all para traer todo
+    if (v !== "all") q.isActive = v === "true";
+  }
 
     const includeSubcuentas = String(req.query.includeSubcuentas || "false") === "true";
     const onlySubcuentas = String(req.query.onlySubcuentas || "false") === "true";
