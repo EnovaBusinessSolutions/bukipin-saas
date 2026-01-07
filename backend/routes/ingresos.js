@@ -1138,7 +1138,7 @@ router.post("/", ensureAuth, async (req, res) => {
 
     const COD_CAJA = "1001";
     const COD_BANCOS = "1002";
-    const COD_CLIENTES = "1101";
+    const COD_CXC = "1003"; // ✅ SIEMPRE aquí van los saldos pendientes
     const COD_DESCUENTOS = "4002";
     const codCobro = metodoPago === "bancos" ? COD_BANCOS : COD_CAJA;
 
@@ -1205,34 +1205,51 @@ router.post("/", ensureAuth, async (req, res) => {
     }
 
     if (tipoPago === "contado") {
-      lines.push(
-        await buildLine(owner, { code: codCobro, debit: neto, credit: 0, memo: "Cobro contado" })
-      );
-    } else {
-      if (montoPagado > 0) {
-        lines.push(
-          await buildLine(owner, { code: codCobro, debit: montoPagado, credit: 0, memo: "Cobro" })
-        );
-      }
-      if (saldoPendiente > 0) {
-        lines.push(
-          await buildLine(owner, { code: COD_CLIENTES, debit: saldoPendiente, credit: 0, memo: "Saldo pendiente" })
-        );
-      }
-    }
-
-    // ✅ CLAVE: el haber del ingreso debe caer en subcuenta si existe
-    const haberIngresos = descuento > 0 ? total : neto;
-    const codeIngreso = subcuentaCodigoResolved || cuentaCodigo;
-
+  lines.push(
+    await buildLine(owner, {
+      code: codCobro,
+      debit: neto,
+      credit: 0,
+      memo: "Cobro contado",
+    })
+  );
+} else {
+  if (montoPagado > 0) {
     lines.push(
       await buildLine(owner, {
-        code: codeIngreso,
-        debit: 0,
-        credit: haberIngresos,
-        memo: subcuentaCodigoResolved ? "Ingreso (subcuenta)" : "Ingreso",
+        code: codCobro,
+        debit: montoPagado,
+        credit: 0,
+        memo: "Cobro",
       })
     );
+  }
+
+  // ✅ SIEMPRE: saldo pendiente a 1003 (Cuentas por Cobrar Clientes)
+  if (saldoPendiente > 0) {
+    lines.push(
+      await buildLine(owner, {
+        code: COD_CXC,
+        debit: saldoPendiente,
+        credit: 0,
+        memo: "Saldo pendiente (Cuentas por Cobrar)",
+      })
+    );
+  }
+} // ✅ <-- ESTA LLAVE TE FALTABA (cierra el else)
+
+// ✅ CLAVE: el haber del ingreso debe caer en subcuenta si existe
+const haberIngresos = descuento > 0 ? total : neto;
+const codeIngreso = subcuentaCodigoResolved || cuentaCodigo;
+
+lines.push(
+  await buildLine(owner, {
+    code: codeIngreso,
+    debit: 0,
+    credit: haberIngresos,
+    memo: subcuentaCodigoResolved ? "Ingreso (subcuenta)" : "Ingreso",
+  })
+);
 
     const numeroAsiento = await nextJournalNumber(owner, tx.fecha);
 
