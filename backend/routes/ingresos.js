@@ -1298,4 +1298,149 @@ lines.push(
   }
 });
 
+/**
+ * GET /api/ingresos/highlights
+ * Devuelve totales SOLO del día/mes/año actuales (NO depende de filtros de analítica).
+ */
+router.get("/highlights", ensureAuth, async (req, res) => {
+  try {
+    const owner = req.user._id;
+
+    // --- helpers ---
+    const pad = (n) => String(n).padStart(2, "0");
+    const toYMD = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+
+    // "hoy" en timezone de la app (usa tu TZ_OFFSET_MINUTES ya definido arriba)
+    const nowUtc = new Date();
+    const nowLocal = new Date(nowUtc.getTime() + TZ_OFFSET_MINUTES * 60 * 1000);
+
+    const y = nowLocal.getUTCFullYear();
+    const m = nowLocal.getUTCMonth(); // 0-11
+    const d = nowLocal.getUTCDate();
+
+    // Rangos en UTC usando tu dateOnlyToUtc (ya existe en tu archivo)
+    const startDay = dateOnlyToUtc(toYMD(new Date(Date.UTC(y, m, d))), 0, 0, 0, 0);
+    const endDay = dateOnlyToUtc(toYMD(new Date(Date.UTC(y, m, d))), 23, 59, 59, 999);
+
+    const startMonth = dateOnlyToUtc(`${y}-${pad(m + 1)}-01`, 0, 0, 0, 0);
+    const lastDayMonth = new Date(Date.UTC(y, m + 1, 0)).getUTCDate();
+    const endMonth = dateOnlyToUtc(`${y}-${pad(m + 1)}-${pad(lastDayMonth)}`, 23, 59, 59, 999);
+
+    const startYear = dateOnlyToUtc(`${y}-01-01`, 0, 0, 0, 0);
+    const endYear = dateOnlyToUtc(`${y}-12-31`, 23, 59, 59, 999);
+
+    // --- función para calcular totales desde IncomeTransaction (tu fuente “transacciones”) ---
+    async function calcTxTotals(start, end) {
+      const txs = await IncomeTransaction.find({
+        owner,
+        fecha: { $gte: start, $lte: end },
+      }).lean();
+
+      let ventasBrutas = 0;
+      let descuentos = 0;
+      let ventasNetas = 0;
+      let otrosIngresos = 0;
+
+      for (const t of txs) {
+        const cuenta = String(
+          t.cuenta_principal_codigo ?? t.cuentaPrincipalCodigo ?? t.cuentaCodigo ?? t.cuenta_codigo ?? ""
+        ).trim();
+
+        const total = num(t.montoTotal ?? t.monto_total ?? t.total, 0);
+        const desc = num(t.montoDescuento ?? t.monto_descuento ?? t.descuento, 0);
+        const neto = num(t.montoNeto ?? t.monto_neto ?? t.neto, Math.max(0, total - Math.max(0, desc)));
+
+        // ventas = 4001
+        if (cuenta === "4001") {
+          ventasBrutas += total;
+          descuentos += Math.max(0, desc);
+          ventasNetas += neto;
+        } else if (cuenta.startsWith("4") && cuenta !== "4003") {
+          // otros ingresos = 4XXX excepto 4001 y 4003
+          otrosIngresos += neto;
+        }
+      }
+
+      return {
+        ventasBrutas,
+        descuentos,
+        ventasNetas,
+        otrosIngresos,
+        totalIngresos: ventasNetas + otrosIngresos,
+      };
+    }
+
+    // --- Opción PRO contable: incluir ingresos_directos (JournalEntry) que NO tienen transacción ---
+    async function calcDirectTotals(start, end) {
+      const entries = await JournalEntry.find({
+        owner,
+        date: { $gte: start, $lte: end },
+        source: { $in: ["ingreso_directo"] },
+      }).lean();
+
+      let otrosIngresos = 0;
+
+      for (const e of entries) {
+        const lines = Array.isArray(e.lines) ? e.lines : [];
+        // tomar líneas de HABER en cuentas 4XXX (ingreso)
+        for (const l of lines) {
+          const code = String(l.accountCodigo ?? l.accountCode ?? "").trim();
+          const haber = num(l.credit ?? l.haber, 0);
+          if (haber <= 0) continue;
+          if (code.startsWith("4") && code !== "4001" && code !== "4003") {
+            otrosIngresos += haber;
+          }
+        }
+      }
+
+      return { otrosIngresos };
+    }
+
+    const diaTx = await calcTxTotals(startDay, endDay);
+    const mesTx = await calcTxTotals(startMonth, endMonth);
+    const anoTx = await calcTxTotals(startYear, endYear);
+
+    const diaDir = await calcDirectTotals(startDay, endDay);
+    const mesDir = await calcDirectTotals(startMonth, endMonth);
+    const anoDir = await calcDirectTotals(startYear, endYear);
+
+    // sumar directos como "otros ingresos"
+    const dia = {
+      ...diaTx,
+      otrosIngresos: (diaTx.otrosIngresos || 0) + (diaDir.otrosIngresos || 0),
+    };
+    dia.totalIngresos = (dia.ventasNetas || 0) + (dia.otrosIngresos || 0);
+
+    const mes = {
+      ...mesTx,
+      otrosIngresos: (mesTx.otrosIngresos || 0) + (mesDir.otrosIngresos || 0),
+    };
+    mes.totalIngresos = (mes.ventasNetas || 0) + (mes.otrosIngresos || 0);
+
+    const ano = {
+      ...anoTx,
+      otrosIngresos: (anoTx.otrosIngresos || 0) + (anoDir.otrosIngresos || 0),
+    };
+    ano.totalIngresos = (ano.ventasNetas || 0) + (ano.otrosIngresos || 0);
+
+    return res.json({
+      ok: true,
+      data: {
+        labels: {
+          dia: `${pad(d)}/${pad(m + 1)}/${y}`,
+          mes: `${pad(m + 1)}/${y}`,
+          ano: `${y}`,
+        },
+        dia,
+        mes,
+        ano,
+      },
+    });
+  } catch (err) {
+    console.error("GET /api/ingresos/highlights error:", err);
+    return res.status(500).json({ ok: false, message: "Error cargando highlights" });
+  }
+});
+
+
 module.exports = router;
