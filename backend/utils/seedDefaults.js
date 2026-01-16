@@ -31,8 +31,6 @@ const DEFAULT_ACCOUNTS = [
   { code: "1007", name: "IVA Acreditable", type: "activo" },
   { code: "1008", name: "Gastos Pagados por Anticipado", type: "activo" },
 
-  // Legacy (lo sigues usando en flujos viejos)
-  { code: "1101", name: "Clientes", type: "activo" },
 
   // =======================
   // ACTIVOS (No circulante)
