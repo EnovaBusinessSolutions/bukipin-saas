@@ -153,8 +153,6 @@ const DEFAULT_ACCOUNTS = [
   { code: "6001", name: "Impuesto sobre la Renta", type: "gasto" },
   { code: "6002", name: "Participación de Utilidades a Trabajadores", type: "gasto" },
 
-  // Opcional (si en tu UI ya existe 7001, lo dejamos)
-  { code: "7001", name: "Impuestos", type: "gasto" },
 ];
 
 async function seedDefaultsForUser(userId) {
