@@ -24,7 +24,6 @@ const DEFAULT_ACCOUNTS = [
   { code: "1002", name: "Bancos", type: "activo" },
 
   { code: "1003", name: "Cuentas por Cobrar Clientes", type: "activo" },
-  { code: "1003-01", name: "Clientes", type: "activo", parentCode: "1003" },
 
   { code: "1004", name: "Documentos por Cobrar", type: "activo" },
   { code: "1005", name: "Inventario de Mercancías", type: "activo" },
@@ -97,13 +96,6 @@ const DEFAULT_ACCOUNTS = [
   // INGRESOS (Ventas)
   // =======================
   { code: "4001", name: "Ventas", type: "ingreso" },
-
-  // Subcuentas de Ventas
-  { code: "4001-01", name: "Ventas Contado", type: "ingreso", parentCode: "4001" },
-  { code: "4001-02", name: "Ventas Crédito", type: "ingreso", parentCode: "4001" },
-  { code: "4001-03", name: "Ventas Transferencia", type: "ingreso", parentCode: "4001" },
-  { code: "4001-04", name: "Otras Ventas", type: "ingreso", parentCode: "4001" },
-
   { code: "4002", name: "Devoluciones sobre Ventas", type: "ingreso" },
   { code: "4003", name: "Descuentos sobre Ventas", type: "ingreso" },
   { code: "4004", name: "Ventas inventarios", type: "ingreso" },
@@ -119,9 +111,9 @@ const DEFAULT_ACCOUNTS = [
   // EGRESOS (Costo de Ventas)
   // =======================
   { code: "5001", name: "Costo de Ventas", type: "gasto" },
-  { code: "5002", name: "Costo de Ventas Inventario", type: "gasto", parentCode: "5001" },
-  { code: "5003", name: "Devoluciones sobre Compras", type: "gasto", parentCode: "5001" },
-  { code: "5004", name: "Descuentos sobre Compras", type: "gasto", parentCode: "5001" },
+  { code: "5002", name: "Costo de Ventas Inventario", type: "gasto" },
+  { code: "5003", name: "Devoluciones sobre Compras", type: "gasto" },
+  { code: "5004", name: "Descuentos sobre Compras", type: "gasto" },
 
   // =======================
   // EGRESOS (Gastos de Operación)
