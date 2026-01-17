@@ -64,6 +64,24 @@ function pickBody(req, keys, def = undefined) {
   return def;
 }
 
+/**
+ * ✅ Set robusto:
+ * - Si el schema tiene 1+ nombres equivalentes, seteamos TODOS los que existan.
+ * - Si no existe ninguno, seteamos el primer candidato (por si strict=false / legacy).
+ */
+function setBySchema(payload, candidates, value) {
+  let setAny = false;
+  for (const key of candidates) {
+    if (schemaHas(key)) {
+      payload[key] = value;
+      setAny = true;
+    }
+  }
+  if (!setAny && candidates?.length) {
+    payload[candidates[0]] = value;
+  }
+}
+
 // ✅ Detecta si ExpenseTransaction usa "productoId" o "productId"
 let _txProductField = null;
 function getTxProductField() {
@@ -127,9 +145,12 @@ function mapForUI(doc, stats = null) {
     d.cuenta_contable ??
     d.cuentaContable ??
     d.cuentaCodigo ??
+    d.cuenta_codigo ??
     "";
 
-  const subcuenta_id = d.subcuentaId ? String(d.subcuentaId) : (d.subcuenta_id ? String(d.subcuenta_id) : null);
+  const subcuenta_id = d.subcuentaId
+    ? String(d.subcuentaId)
+    : (d.subcuenta_id ? String(d.subcuenta_id) : null);
 
   const imagen_url =
     d.imagen_url ??
@@ -174,6 +195,7 @@ function mapForUI(doc, stats = null) {
     transacciones: total_transacciones,
     ultimaCompra: ultima_compra,
     unidadMedida: unidad,
+    unidad_medida: unidad,
     proveedorPrincipal: proveedor_principal,
     imagenUrl: imagen_url,
     cuenta_codigo: cuenta_contable,
@@ -316,15 +338,21 @@ router.post(
 
       const descripcion = String(pickBody(req, ["descripcion"], "")).trim();
 
+      // ✅ OJO: soportar unidad_medida también
       const unidad = String(pickBody(req, ["unidad", "unidadMedida", "unidad_medida"], "")).trim();
-      const proveedor_principal = String(pickBody(req, ["proveedor_principal", "proveedorPrincipal", "proveedor"], "")).trim();
+      const proveedor_principal = String(
+        pickBody(req, ["proveedor_principal", "proveedorPrincipal", "proveedor"], "")
+      ).trim();
 
       const es_recurrente = asBool(pickBody(req, ["es_recurrente", "esRecurrente"], false), false);
 
       const subcuenta_id = pickBody(req, ["subcuenta_id", "subcuentaId"], null);
       const subcuentaId = toObjectIdOrNull(subcuenta_id);
 
-      const cuenta_contable = String(pickBody(req, ["cuenta_contable", "cuentaContable", "cuentaCodigo", "cuenta_codigo"], "")).trim();
+      // ✅ OJO: soportar cuenta_codigo también
+      const cuenta_contable = String(
+        pickBody(req, ["cuenta_contable", "cuentaContable", "cuentaCodigo", "cuenta_codigo"], "")
+      ).trim();
 
       const activo = asBool(pickBody(req, ["activo"], true), true);
 
@@ -347,7 +375,7 @@ router.post(
       // ✅ imagen (si viene)
       const imagen_url = saveImageIfAny(req.file);
 
-      // payload robusto según schema disponible
+      // payload base
       const payload = {
         owner,
         nombre,
@@ -356,36 +384,24 @@ router.post(
         activo,
       };
 
-      // cuenta contable (acepta cualquiera de los 3 nombres)
-      if (schemaHas("cuenta_contable")) payload.cuenta_contable = cuenta_contable;
-      else if (schemaHas("cuentaContable")) payload.cuentaContable = cuenta_contable;
-      else payload.cuentaCodigo = cuenta_contable;
+      // ✅ cuenta contable (incluye cuenta_codigo)
+      setBySchema(payload, ["cuenta_contable", "cuentaContable", "cuentaCodigo", "cuenta_codigo"], cuenta_contable);
 
-      // subcuenta
-      if (schemaHas("subcuentaId")) payload.subcuentaId = subcuentaId;
-      else if (schemaHas("subcuenta_id")) payload.subcuenta_id = subcuentaId;
-      else payload.subcuentaId = subcuentaId;
+      // ✅ subcuenta
+      setBySchema(payload, ["subcuentaId", "subcuenta_id"], subcuentaId);
 
-      // unidad
-      if (schemaHas("unidad")) payload.unidad = unidad;
-      else if (schemaHas("unidadMedida")) payload.unidadMedida = unidad;
-      else payload.unidad = unidad;
+      // ✅ unidad (incluye unidad_medida)
+      setBySchema(payload, ["unidad", "unidadMedida", "unidad_medida"], unidad);
 
-      // proveedor
-      if (schemaHas("proveedor_principal")) payload.proveedor_principal = proveedor_principal;
-      else if (schemaHas("proveedorPrincipal")) payload.proveedorPrincipal = proveedor_principal;
-      else payload.proveedor_principal = proveedor_principal;
+      // ✅ proveedor
+      setBySchema(payload, ["proveedor_principal", "proveedorPrincipal", "proveedor"], proveedor_principal);
 
-      // recurrente
-      if (schemaHas("es_recurrente")) payload.es_recurrente = !!es_recurrente;
-      else if (schemaHas("esRecurrente")) payload.esRecurrente = !!es_recurrente;
-      else payload.es_recurrente = !!es_recurrente;
+      // ✅ recurrente
+      setBySchema(payload, ["es_recurrente", "esRecurrente"], !!es_recurrente);
 
-      // imagen
+      // ✅ imagen
       if (imagen_url) {
-        if (schemaHas("imagen_url")) payload.imagen_url = imagen_url;
-        else if (schemaHas("imagenUrl")) payload.imagenUrl = imagen_url;
-        else payload.imagen_url = imagen_url;
+        setBySchema(payload, ["imagen_url", "imagenUrl", "imageUrl"], imagen_url);
       }
 
       const created = await ExpenseProduct.create(payload);
@@ -429,59 +445,82 @@ router.patch(
       // tipo
       const tipoRaw = pickBody(req, ["tipo", "type"], undefined);
       if (tipoRaw !== undefined) {
-        patch.tipo = normalizeTipo(tipoRaw);
-        if (patch.tipo && !["costo", "gasto"].includes(patch.tipo)) {
+        const t = normalizeTipo(tipoRaw);
+        if (t && !["costo", "gasto"].includes(t)) {
           return res.status(400).json({ ok: false, error: "VALIDATION", message: "tipo inválido." });
         }
+        patch.tipo = t;
       }
 
       // descripcion
       const descripcionRaw = pickBody(req, ["descripcion"], undefined);
       if (descripcionRaw !== undefined) patch.descripcion = String(descripcionRaw || "").trim();
 
-      // unidad
+      // ✅ unidad (incluye unidad_medida)
       const unidadRaw = pickBody(req, ["unidad", "unidadMedida", "unidad_medida"], undefined);
       if (unidadRaw !== undefined) {
         const unidad = String(unidadRaw || "").trim();
-        if (schemaHas("unidad")) patch.unidad = unidad;
-        else if (schemaHas("unidadMedida")) patch.unidadMedida = unidad;
-        else patch.unidad = unidad;
+        // seteamos TODOS los nombres que existan en schema
+        for (const k of ["unidad", "unidadMedida", "unidad_medida"]) {
+          if (schemaHas(k)) patch[k] = unidad;
+        }
+        // fallback por si ninguno existe (legacy)
+        if (!schemaHas("unidad") && !schemaHas("unidadMedida") && !schemaHas("unidad_medida")) {
+          patch.unidad = unidad;
+        }
       }
 
       // proveedor
       const provRaw = pickBody(req, ["proveedor_principal", "proveedorPrincipal", "proveedor"], undefined);
       if (provRaw !== undefined) {
         const prov = String(provRaw || "").trim();
-        if (schemaHas("proveedor_principal")) patch.proveedor_principal = prov;
-        else if (schemaHas("proveedorPrincipal")) patch.proveedorPrincipal = prov;
-        else patch.proveedor_principal = prov;
+        for (const k of ["proveedor_principal", "proveedorPrincipal", "proveedor"]) {
+          if (schemaHas(k)) patch[k] = prov;
+        }
+        if (!schemaHas("proveedor_principal") && !schemaHas("proveedorPrincipal") && !schemaHas("proveedor")) {
+          patch.proveedor_principal = prov;
+        }
       }
 
       // recurrente
       const recRaw = pickBody(req, ["es_recurrente", "esRecurrente"], undefined);
       if (recRaw !== undefined) {
         const rec = asBool(recRaw, false);
-        if (schemaHas("es_recurrente")) patch.es_recurrente = !!rec;
-        else if (schemaHas("esRecurrente")) patch.esRecurrente = !!rec;
-        else patch.es_recurrente = !!rec;
+        for (const k of ["es_recurrente", "esRecurrente"]) {
+          if (schemaHas(k)) patch[k] = !!rec;
+        }
+        if (!schemaHas("es_recurrente") && !schemaHas("esRecurrente")) {
+          patch.es_recurrente = !!rec;
+        }
       }
 
-      // cuenta contable
+      // ✅ cuenta contable (incluye cuenta_codigo)
       const ccRaw = pickBody(req, ["cuenta_contable", "cuentaContable", "cuentaCodigo", "cuenta_codigo"], undefined);
       if (ccRaw !== undefined) {
         const cc = String(ccRaw || "").trim();
-        if (schemaHas("cuenta_contable")) patch.cuenta_contable = cc;
-        else if (schemaHas("cuentaContable")) patch.cuentaContable = cc;
-        else patch.cuentaCodigo = cc;
+        for (const k of ["cuenta_contable", "cuentaContable", "cuentaCodigo", "cuenta_codigo"]) {
+          if (schemaHas(k)) patch[k] = cc;
+        }
+        if (
+          !schemaHas("cuenta_contable") &&
+          !schemaHas("cuentaContable") &&
+          !schemaHas("cuentaCodigo") &&
+          !schemaHas("cuenta_codigo")
+        ) {
+          patch.cuenta_contable = cc;
+        }
       }
 
       // subcuenta
       const subRaw = pickBody(req, ["subcuenta_id", "subcuentaId"], undefined);
       if (subRaw !== undefined) {
         const subId = toObjectIdOrNull(subRaw);
-        if (schemaHas("subcuentaId")) patch.subcuentaId = subId;
-        else if (schemaHas("subcuenta_id")) patch.subcuenta_id = subId;
-        else patch.subcuentaId = subId;
+        for (const k of ["subcuentaId", "subcuenta_id"]) {
+          if (schemaHas(k)) patch[k] = subId;
+        }
+        if (!schemaHas("subcuentaId") && !schemaHas("subcuenta_id")) {
+          patch.subcuentaId = subId;
+        }
       }
 
       // activo
@@ -491,9 +530,12 @@ router.patch(
       // imagen
       const imgUrl = saveImageIfAny(req.file);
       if (imgUrl) {
-        if (schemaHas("imagen_url")) patch.imagen_url = imgUrl;
-        else if (schemaHas("imagenUrl")) patch.imagenUrl = imgUrl;
-        else patch.imagen_url = imgUrl;
+        for (const k of ["imagen_url", "imagenUrl", "imageUrl"]) {
+          if (schemaHas(k)) patch[k] = imgUrl;
+        }
+        if (!schemaHas("imagen_url") && !schemaHas("imagenUrl") && !schemaHas("imageUrl")) {
+          patch.imagen_url = imgUrl;
+        }
       }
 
       const updated = await ExpenseProduct.findOneAndUpdate({ _id: id, owner }, patch, { new: true }).lean();
