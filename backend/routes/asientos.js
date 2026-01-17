@@ -8,7 +8,7 @@ const Account = require("../models/Account");
 const ensureAuth = require("../middleware/ensureAuth");
 
 function num(v, def = 0) {
-  const n = Number(v);
+  const n = Number(String(v ?? "").replace(/,/g, ""));
   return Number.isFinite(n) ? n : def;
 }
 
@@ -29,11 +29,21 @@ function parseYMD(s) {
   return d;
 }
 
+function dayEnd(d) {
+  const e = new Date(d);
+  e.setHours(23, 59, 59, 999);
+  return e;
+}
+
 async function getAccountNameMap(owner, codes) {
-  const unique = Array.from(new Set((codes || []).filter(Boolean).map((c) => String(c).trim())));
+  const unique = Array.from(
+    new Set((codes || []).filter(Boolean).map((c) => String(c).trim()))
+  );
   if (!unique.length) return {};
 
-  const rows = await Account.find({ owner, code: { $in: unique } }).select("code name nombre").lean();
+  const rows = await Account.find({ owner, code: { $in: unique } })
+    .select("code name nombre")
+    .lean();
 
   const map = {};
   for (const r of rows) {
@@ -43,26 +53,52 @@ async function getAccountNameMap(owner, codes) {
 }
 
 /**
- * ✅ Shape EXACTO que RegistroIngresos.tsx espera:
- * currentAsientos.descripcion
- * currentAsientos.detalles[] = { cuenta_codigo, cuenta_nombre, descripcion, debe, haber }
+ * ✅ Shape EXACTO que tus UIs esperan:
+ * asiento.descripcion
+ * asiento.detalles[] = { cuenta_codigo, cuenta_nombre, descripcion, debe, haber }
+ *
+ * Soporta líneas tipo:
+ * - { accountCodigo, debit, credit, memo }            (JournalEntry actual)
+ * - { cuentaCodigo, debe, haber, descripcion }        (legacy)
+ * - { side:"debit|credit", monto, cuentaCodigo }      (tu router egresos lo llegó a crear así)
  */
 function mapEntryForUI(entry, accountNameMap = {}) {
-  const rawLines = entry.lines || entry.detalle_asientos || [];
+  const rawLines = entry.lines || entry.detalle_asientos || entry.detalles_asiento || [];
+
   const detalle_asientos = (rawLines || []).map((l) => {
-    const cuentaCodigo = l.accountCodigo ?? l.accountCode ?? l.cuenta_codigo ?? l.code ?? "";
+    const cuentaCodigo =
+      l.accountCodigo ??
+      l.accountCode ??
+      l.cuentaCodigo ??
+      l.cuenta_codigo ??
+      l.code ??
+      "";
+
     const cuenta_codigo = cuentaCodigo ? String(cuentaCodigo).trim() : "";
+
+    const side = String(l.side || "").toLowerCase().trim();
+    const monto = num(l.monto, 0);
+
+    const debe = num(
+      l.debit ?? l.debe ?? (side === "debit" ? monto : 0),
+      0
+    );
+    const haber = num(
+      l.credit ?? l.haber ?? (side === "credit" ? monto : 0),
+      0
+    );
+
+    const memo = l.memo ?? l.descripcion ?? l.concepto ?? "";
 
     return {
       cuenta_codigo: cuenta_codigo || null,
       cuenta_nombre: cuenta_codigo ? accountNameMap[cuenta_codigo] || null : null,
-      debe: num(l.debit ?? l.debe, 0),
-      haber: num(l.credit ?? l.haber, 0),
-      memo: l.memo ?? l.descripcion ?? "",
+      debe,
+      haber,
+      memo: memo || "",
     };
   });
 
-  // 👇 UI pinta currentAsientos.detalles (NO detalle_asientos)
   const detalles = detalle_asientos.map((d) => ({
     cuenta_codigo: d.cuenta_codigo,
     cuenta_nombre: d.cuenta_nombre,
@@ -71,8 +107,20 @@ function mapEntryForUI(entry, accountNameMap = {}) {
     haber: d.haber,
   }));
 
-  const concepto = entry.concept ?? entry.concepto ?? entry.descripcion ?? "";
-  const numeroAsiento = entry.numeroAsiento ?? entry.numero_asiento ?? entry.numero ?? null;
+  const concepto =
+    entry.concept ??
+    entry.concepto ??
+    entry.descripcion ??
+    entry.memo ??
+    "";
+
+  const numeroAsiento =
+    entry.numeroAsiento ??
+    entry.numero_asiento ??
+    entry.numero ??
+    null;
+
+  const fechaReal = entry.date ?? entry.fecha ?? entry.createdAt ?? entry.created_at ?? null;
 
   return {
     id: String(entry._id),
@@ -81,36 +129,42 @@ function mapEntryForUI(entry, accountNameMap = {}) {
     numeroAsiento,
     numero_asiento: numeroAsiento,
 
-    asiento_fecha: toYMD(entry.date),
-    fecha: entry.date,
+    asiento_fecha: fechaReal ? toYMD(fechaReal) : null,
+    fecha: fechaReal,
 
-    // ✅ la UI usa currentAsientos.descripcion
-    descripcion: concepto,
-    concepto,
+    descripcion: concepto || "",
+    concepto: concepto || "",
 
     source: entry.source ?? entry.fuente ?? "",
-    transaccion_ingreso_id: entry.sourceId ? String(entry.sourceId) : entry.transaccionId ? String(entry.transaccionId) : null,
+    transaccion_ingreso_id: entry.sourceId
+      ? String(entry.sourceId)
+      : entry.transaccionId
+      ? String(entry.transaccionId)
+      : entry.source_id
+      ? String(entry.source_id)
+      : entry.transaccion_id
+      ? String(entry.transaccion_id)
+      : null,
 
     detalle_asientos,
     detalles,
 
-    created_at: entry.createdAt,
-    updated_at: entry.updatedAt,
+    created_at: entry.createdAt ?? entry.created_at ?? null,
+    updated_at: entry.updatedAt ?? entry.updated_at ?? null,
   };
 }
 
 /**
- * ✅ Legacy endpoint que tu FE pide:
+ * ✅ Endpoint que tu UI/hook usan:
  * GET /api/asientos/detalle?cuentas=1001,1002&start=YYYY-MM-DD&end=YYYY-MM-DD
  *
- * Devuelve saldos por cuenta (debe, haber, neto).
- * Esto elimina el 404 y permite al panel calcular efectivo/bancos, etc.
+ * Devuelve: [{ cuenta_codigo, cuenta_nombre, debe, haber, neto }]
  */
 router.get("/detalle", ensureAuth, async (req, res) => {
   try {
     const owner = req.user._id;
 
-    // soporta cuentas=1001,1002  o cuentas[]=1001&cuentas[]=1002
+    // cuentas=1001,1002  o cuentas[]=1001&cuentas[]=1002
     let cuentas = req.query.cuentas;
 
     if (Array.isArray(cuentas)) {
@@ -132,36 +186,66 @@ router.get("/detalle", ensureAuth, async (req, res) => {
     const start = parseYMD(req.query.start);
     const end = parseYMD(req.query.end);
 
-    const dateFilter = {};
-    if (start) dateFilter.$gte = start;
-    if (end) {
-      const e = new Date(end);
-      e.setHours(23, 59, 59, 999);
-      dateFilter.$lte = e;
+    const match = { owner };
+    if (start || end) {
+      match.date = {};
+      if (start) match.date.$gte = start;
+      if (end) match.date.$lte = dayEnd(end);
     }
 
-    const match = { owner };
-    if (start || end) match.date = dateFilter;
-
-    // Agregamos por línea contable
+    /**
+     * OJO: soporta líneas con debit/credit y también side/monto.
+     * Usamos $convert para evitar crashes si viene string.
+     */
     const agg = await JournalEntry.aggregate([
       { $match: match },
       { $unwind: "$lines" },
       {
         $project: {
-          owner: 1,
-          date: "$date",
           code: {
             $ifNull: [
               "$lines.accountCodigo",
-              { $ifNull: ["$lines.accountCode", { $ifNull: ["$lines.cuenta_codigo", "$lines.code"] }] },
+              { $ifNull: ["$lines.cuentaCodigo", { $ifNull: ["$lines.cuenta_codigo", "$lines.code"] }] },
             ],
           },
-          debe: { $ifNull: ["$lines.debit", { $ifNull: ["$lines.debe", 0] }] },
-          haber: { $ifNull: ["$lines.credit", { $ifNull: ["$lines.haber", 0] }] },
+          side: { $toLower: { $ifNull: ["$lines.side", ""] } },
+          debitRaw: { $ifNull: ["$lines.debit", { $ifNull: ["$lines.debe", null] }] },
+          creditRaw: { $ifNull: ["$lines.credit", { $ifNull: ["$lines.haber", null] }] },
+          montoRaw: { $ifNull: ["$lines.monto", 0] },
         },
       },
       { $match: { code: { $in: codes } } },
+      {
+        $project: {
+          code: 1,
+          debe: {
+            $cond: [
+              { $ne: ["$debitRaw", null] },
+              { $convert: { input: "$debitRaw", to: "double", onError: 0, onNull: 0 } },
+              {
+                $cond: [
+                  { $eq: ["$side", "debit"] },
+                  { $convert: { input: "$montoRaw", to: "double", onError: 0, onNull: 0 } },
+                  0,
+                ],
+              },
+            ],
+          },
+          haber: {
+            $cond: [
+              { $ne: ["$creditRaw", null] },
+              { $convert: { input: "$creditRaw", to: "double", onError: 0, onNull: 0 } },
+              {
+                $cond: [
+                  { $eq: ["$side", "credit"] },
+                  { $convert: { input: "$montoRaw", to: "double", onError: 0, onNull: 0 } },
+                  0,
+                ],
+              },
+            ],
+          },
+        },
+      },
       {
         $group: {
           _id: "$code",
@@ -214,7 +298,142 @@ router.get("/detalle", ensureAuth, async (req, res) => {
   }
 });
 
-// GET /api/asientos/by-transaccion?source=ingreso&id=XXXXXXXX
+/**
+ * ✅ LO QUE TU UI ESTÁ PIDIENDO (capturas):
+ * GET /api/asientos?start=YYYY-MM-DD&end=YYYY-MM-DD&include_detalles=1&limit=200
+ *
+ * Devuelve lista de asientos (con o sin detalles).
+ */
+router.get("/", ensureAuth, async (req, res) => {
+  try {
+    const owner = req.user._id;
+
+    const start = parseYMD(req.query.start);
+    const end = parseYMD(req.query.end);
+
+    const includeDetalles =
+      String(req.query.include_detalles || req.query.includeDetalles || "0").trim() === "1";
+
+    const wrap = String(req.query.wrap || "").trim() === "1";
+
+    const limitRaw = Number(req.query.limit ?? 200);
+    const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), 500) : 200;
+
+    const match = { owner };
+    if (start || end) {
+      match.date = {};
+      if (start) match.date.$gte = start;
+      if (end) match.date.$lte = dayEnd(end);
+    }
+
+    const docs = await JournalEntry.find(match)
+      .sort({ date: -1, createdAt: -1 })
+      .limit(limit)
+      .lean();
+
+    // juntar códigos para resolver nombres 1 sola vez
+    const allCodes = [];
+    for (const a of docs) {
+      const lines = a.lines || [];
+      for (const l of lines) {
+        const code =
+          l.accountCodigo ??
+          l.accountCode ??
+          l.cuentaCodigo ??
+          l.cuenta_codigo ??
+          l.code ??
+          null;
+        if (code) allCodes.push(String(code));
+      }
+    }
+
+    const accountNameMap = await getAccountNameMap(owner, allCodes);
+
+    const items = docs.map((a) => {
+      const ui = mapEntryForUI(a, accountNameMap);
+      if (!includeDetalles) {
+        // si no piden detalles, devolvemos un resumen “ligero”
+        delete ui.detalle_asientos;
+        delete ui.detalles;
+      }
+      return ui;
+    });
+
+    if (!wrap) return res.json(items);
+
+    return res.json({
+      ok: true,
+      data: items,
+      items,
+      meta: {
+        limit,
+        include_detalles: includeDetalles ? 1 : 0,
+        start: start ? toYMD(start) : null,
+        end: end ? toYMD(end) : null,
+      },
+    });
+  } catch (e) {
+    console.error("GET /api/asientos error:", e);
+    return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
+  }
+});
+
+/**
+ * ✅ Compat: buscar por número de asiento
+ * GET /api/asientos/by-numero?numero_asiento=EGR-...
+ */
+router.get("/by-numero", ensureAuth, async (req, res) => {
+  try {
+    const owner = req.user._id;
+    const numero = String(req.query.numero_asiento ?? req.query.numeroAsiento ?? req.query.numero ?? "").trim();
+
+    if (!numero) {
+      return res.status(400).json({
+        ok: false,
+        error: "VALIDATION",
+        message: "numero_asiento es requerido",
+      });
+    }
+
+    const asiento =
+      (await JournalEntry.findOne({ owner, numeroAsiento: numero }).sort({ createdAt: -1 }).lean()) ||
+      (await JournalEntry.findOne({ owner, numero: numero }).sort({ createdAt: -1 }).lean()) ||
+      (await JournalEntry.findOne({ owner, numero_asiento: numero }).sort({ createdAt: -1 }).lean());
+
+    if (!asiento) return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+
+    const codes = (asiento.lines || [])
+      .map((l) => l.accountCodigo ?? l.cuentaCodigo ?? l.cuenta_codigo ?? l.code ?? null)
+      .filter(Boolean)
+      .map(String);
+
+    const accountNameMap = await getAccountNameMap(owner, codes);
+    const asientoUI = mapEntryForUI(asiento, accountNameMap);
+
+    return res.json({ ok: true, data: asientoUI, asiento: asientoUI });
+  } catch (e) {
+    console.error("GET /api/asientos/by-numero error:", e);
+    return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
+  }
+});
+
+/**
+ * ✅ Compat LEGACY (por si tu FE aún pide /api/journal/asientos/by-ref/...):
+ * GET /api/asientos/by-ref/:numero
+ * GET /api/asientos/by-ref?numero_asiento=...
+ */
+router.get("/by-ref/:numero", ensureAuth, async (req, res) => {
+  req.query.numero_asiento = req.params.numero;
+  return router.handle({ ...req, url: "/by-numero", path: "/by-numero" }, res);
+});
+
+router.get("/by-ref", ensureAuth, async (req, res) => {
+  return router.handle({ ...req, url: "/by-numero", path: "/by-numero" }, res);
+});
+
+/**
+ * GET /api/asientos/by-transaccion?source=ingreso|egreso|...&id=XXXXXXXX
+ */
 router.get("/by-transaccion", ensureAuth, async (req, res) => {
   try {
     let { source, id } = req.query;
@@ -233,6 +452,8 @@ router.get("/by-transaccion", ensureAuth, async (req, res) => {
     const sourceAliases = new Set([source.toLowerCase()]);
     if (source.toLowerCase() === "ingresos") sourceAliases.add("ingreso");
     if (source.toLowerCase() === "ingreso") sourceAliases.add("ingresos");
+    if (source.toLowerCase() === "egresos") sourceAliases.add("egreso");
+    if (source.toLowerCase() === "egreso") sourceAliases.add("egresos");
 
     const owner = req.user._id;
 
@@ -252,14 +473,14 @@ router.get("/by-transaccion", ensureAuth, async (req, res) => {
       (await JournalEntry.findOne({
         owner,
         source: { $in: Array.from(sourceAliases) },
-        transaccionId: id,
+        transaccionId: { $in: sourceIdCandidates },
       })
         .sort({ createdAt: -1 })
         .lean()) ||
       (await JournalEntry.findOne({
         owner,
         source: { $in: Array.from(sourceAliases) },
-        transaccion_id: id,
+        source_id: { $in: sourceIdCandidates },
       })
         .sort({ createdAt: -1 })
         .lean()) ||
@@ -273,32 +494,55 @@ router.get("/by-transaccion", ensureAuth, async (req, res) => {
 
     if (!asiento) return res.status(404).json({ ok: false, error: "NOT_FOUND" });
 
-    // ✅ Enriquecer nombres de cuentas por code
     const codes = (asiento.lines || [])
-      .map((l) => l.accountCodigo ?? l.accountCode ?? l.cuenta_codigo ?? l.code ?? null)
+      .map((l) => l.accountCodigo ?? l.cuentaCodigo ?? l.cuenta_codigo ?? l.code ?? null)
       .filter(Boolean)
       .map(String);
 
     const accountNameMap = await getAccountNameMap(owner, codes);
 
     const asientoUI = mapEntryForUI(asiento, accountNameMap);
-
-    // ✅ numeroAsiento “real” si existe; si no, fallback a _id
     const numeroAsiento = asientoUI.numeroAsiento || String(asiento._id);
 
     return res.json({
       ok: true,
-      data: {
-        asiento: asientoUI,
-        numeroAsiento,
-        raw: asiento,
-      },
+      data: { asiento: asientoUI, numeroAsiento, raw: asiento },
       asiento: asientoUI,
       numeroAsiento,
       asientos: [asientoUI],
     });
   } catch (e) {
     console.error("GET /api/asientos/by-transaccion error:", e);
+    return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
+  }
+});
+
+/**
+ * GET /api/asientos/:id  (detalle por id)
+ */
+router.get("/:id", ensureAuth, async (req, res) => {
+  try {
+    const owner = req.user._id;
+    const id = String(req.params.id || "").trim();
+
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ ok: false, error: "VALIDATION", message: "id inválido" });
+    }
+
+    const asiento = await JournalEntry.findOne({ _id: id, owner }).lean();
+    if (!asiento) return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+
+    const codes = (asiento.lines || [])
+      .map((l) => l.accountCodigo ?? l.cuentaCodigo ?? l.cuenta_codigo ?? l.code ?? null)
+      .filter(Boolean)
+      .map(String);
+
+    const accountNameMap = await getAccountNameMap(owner, codes);
+    const asientoUI = mapEntryForUI(asiento, accountNameMap);
+
+    return res.json({ ok: true, data: asientoUI, asiento: asientoUI });
+  } catch (e) {
+    console.error("GET /api/asientos/:id error:", e);
     return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
   }
 });

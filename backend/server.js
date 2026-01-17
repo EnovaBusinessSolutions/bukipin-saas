@@ -72,6 +72,8 @@ app.use("/api/proveedores", require("./routes/proveedores"));
 // ✅ NUEVO: Financiamientos (tarjetas de crédito, etc. — evita 404 en egresos)
 app.use("/api/financiamientos", require("./routes/financiamientos"));
 
+app.use("/api/egresos", require("./routes/egresos"));
+
 // ✅ Nota: tu UI está pidiendo /api/asientos/detalle?cuentas=1001,1002
 // Eso se resuelve en backend/routes/asientos.js (agregaremos endpoint "detalle" en el siguiente paso).
 
