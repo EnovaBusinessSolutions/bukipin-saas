@@ -547,4 +547,9 @@ router.get("/:id", ensureAuth, async (req, res) => {
   }
 });
 
+router.get("/depreciaciones", ensureAuth, async (req, res) => {
+  return res.json({ ok: true, data: [], items: [] });
+});
+
+
 module.exports = router;
