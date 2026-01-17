@@ -60,7 +60,7 @@ async function getAccountNameMap(owner, codes) {
  * Soporta líneas tipo:
  * - { accountCodigo, debit, credit, memo }            (JournalEntry actual)
  * - { cuentaCodigo, debe, haber, descripcion }        (legacy)
- * - { side:"debit|credit", monto, cuentaCodigo }      (tu router egresos lo llegó a crear así)
+ * - { side:"debit|credit", monto, cuentaCodigo }      (legacy)
  */
 function mapEntryForUI(entry, accountNameMap = {}) {
   const rawLines = entry.lines || entry.detalle_asientos || entry.detalles_asiento || [];
@@ -120,7 +120,8 @@ function mapEntryForUI(entry, accountNameMap = {}) {
     entry.numero ??
     null;
 
-  const fechaReal = entry.date ?? entry.fecha ?? entry.createdAt ?? entry.created_at ?? null;
+  const fechaReal =
+    entry.date ?? entry.fecha ?? entry.createdAt ?? entry.created_at ?? null;
 
   return {
     id: String(entry._id),
@@ -155,6 +156,15 @@ function mapEntryForUI(entry, accountNameMap = {}) {
 }
 
 /**
+ * ✅ IMPORTANTE:
+ * /depreciaciones DEBE ir ANTES de "/:id"
+ * porque si no, Express interpreta "depreciaciones" como un id.
+ */
+router.get("/depreciaciones", ensureAuth, async (_req, res) => {
+  return res.json({ ok: true, data: [], items: [] });
+});
+
+/**
  * ✅ Endpoint que tu UI/hook usan:
  * GET /api/asientos/detalle?cuentas=1001,1002&start=YYYY-MM-DD&end=YYYY-MM-DD
  *
@@ -164,7 +174,6 @@ router.get("/detalle", ensureAuth, async (req, res) => {
   try {
     const owner = req.user._id;
 
-    // cuentas=1001,1002  o cuentas[]=1001&cuentas[]=1002
     let cuentas = req.query.cuentas;
 
     if (Array.isArray(cuentas)) {
@@ -193,10 +202,6 @@ router.get("/detalle", ensureAuth, async (req, res) => {
       if (end) match.date.$lte = dayEnd(end);
     }
 
-    /**
-     * OJO: soporta líneas con debit/credit y también side/monto.
-     * Usamos $convert para evitar crashes si viene string.
-     */
     const agg = await JournalEntry.aggregate([
       { $match: match },
       { $unwind: "$lines" },
@@ -205,7 +210,12 @@ router.get("/detalle", ensureAuth, async (req, res) => {
           code: {
             $ifNull: [
               "$lines.accountCodigo",
-              { $ifNull: ["$lines.cuentaCodigo", { $ifNull: ["$lines.cuenta_codigo", "$lines.code"] }] },
+              {
+                $ifNull: [
+                  "$lines.cuentaCodigo",
+                  { $ifNull: ["$lines.cuenta_codigo", "$lines.code"] },
+                ],
+              },
             ],
           },
           side: { $toLower: { $ifNull: ["$lines.side", ""] } },
@@ -299,10 +309,8 @@ router.get("/detalle", ensureAuth, async (req, res) => {
 });
 
 /**
- * ✅ LO QUE TU UI ESTÁ PIDIENDO (capturas):
+ * ✅ LO QUE TU UI ESTÁ PIDIENDO:
  * GET /api/asientos?start=YYYY-MM-DD&end=YYYY-MM-DD&include_detalles=1&limit=200
- *
- * Devuelve lista de asientos (con o sin detalles).
  */
 router.get("/", ensureAuth, async (req, res) => {
   try {
@@ -331,7 +339,6 @@ router.get("/", ensureAuth, async (req, res) => {
       .limit(limit)
       .lean();
 
-    // juntar códigos para resolver nombres 1 sola vez
     const allCodes = [];
     for (const a of docs) {
       const lines = a.lines || [];
@@ -352,7 +359,6 @@ router.get("/", ensureAuth, async (req, res) => {
     const items = docs.map((a) => {
       const ui = mapEntryForUI(a, accountNameMap);
       if (!includeDetalles) {
-        // si no piden detalles, devolvemos un resumen “ligero”
         delete ui.detalle_asientos;
         delete ui.detalles;
       }
@@ -378,11 +384,8 @@ router.get("/", ensureAuth, async (req, res) => {
   }
 });
 
-/**
- * ✅ Compat: buscar por número de asiento
- * GET /api/asientos/by-numero?numero_asiento=EGR-...
- */
-router.get("/by-numero", ensureAuth, async (req, res) => {
+// -------- helpers reusables para endpoints legacy ----------
+async function handleByNumero(req, res) {
   try {
     const owner = req.user._id;
     const numero = String(req.query.numero_asiento ?? req.query.numeroAsiento ?? req.query.numero ?? "").trim();
@@ -415,20 +418,26 @@ router.get("/by-numero", ensureAuth, async (req, res) => {
     console.error("GET /api/asientos/by-numero error:", e);
     return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
   }
-});
+}
 
 /**
- * ✅ Compat LEGACY (por si tu FE aún pide /api/journal/asientos/by-ref/...):
+ * ✅ Compat: buscar por número de asiento
+ * GET /api/asientos/by-numero?numero_asiento=EGR-...
+ */
+router.get("/by-numero", ensureAuth, handleByNumero);
+
+/**
+ * ✅ Compat LEGACY:
  * GET /api/asientos/by-ref/:numero
  * GET /api/asientos/by-ref?numero_asiento=...
  */
 router.get("/by-ref/:numero", ensureAuth, async (req, res) => {
   req.query.numero_asiento = req.params.numero;
-  return router.handle({ ...req, url: "/by-numero", path: "/by-numero" }, res);
+  return handleByNumero(req, res);
 });
 
 router.get("/by-ref", ensureAuth, async (req, res) => {
-  return router.handle({ ...req, url: "/by-numero", path: "/by-numero" }, res);
+  return handleByNumero(req, res);
 });
 
 /**
@@ -467,30 +476,22 @@ router.get("/by-transaccion", ensureAuth, async (req, res) => {
         owner,
         source: { $in: Array.from(sourceAliases) },
         sourceId: { $in: sourceIdCandidates },
-      })
-        .sort({ createdAt: -1 })
-        .lean()) ||
+      }).sort({ createdAt: -1 }).lean()) ||
       (await JournalEntry.findOne({
         owner,
         source: { $in: Array.from(sourceAliases) },
         transaccionId: { $in: sourceIdCandidates },
-      })
-        .sort({ createdAt: -1 })
-        .lean()) ||
+      }).sort({ createdAt: -1 }).lean()) ||
       (await JournalEntry.findOne({
         owner,
         source: { $in: Array.from(sourceAliases) },
         source_id: { $in: sourceIdCandidates },
-      })
-        .sort({ createdAt: -1 })
-        .lean()) ||
+      }).sort({ createdAt: -1 }).lean()) ||
       (await JournalEntry.findOne({
         owner,
         "references.source": { $in: Array.from(sourceAliases) },
         "references.id": id,
-      })
-        .sort({ createdAt: -1 })
-        .lean());
+      }).sort({ createdAt: -1 }).lean());
 
     if (!asiento) return res.status(404).json({ ok: false, error: "NOT_FOUND" });
 
@@ -519,6 +520,7 @@ router.get("/by-transaccion", ensureAuth, async (req, res) => {
 
 /**
  * GET /api/asientos/:id  (detalle por id)
+ * ⚠️ SIEMPRE al final, para no pisar rutas como /depreciaciones
  */
 router.get("/:id", ensureAuth, async (req, res) => {
   try {
@@ -546,10 +548,5 @@ router.get("/:id", ensureAuth, async (req, res) => {
     return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
   }
 });
-
-router.get("/depreciaciones", ensureAuth, async (req, res) => {
-  return res.json({ ok: true, data: [], items: [] });
-});
-
 
 module.exports = router;
