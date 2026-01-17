@@ -7,9 +7,8 @@ const JournalEntry = require("../models/JournalEntry");
 const Account = require("../models/Account");
 const ensureAuth = require("../middleware/ensureAuth");
 
-// -------------------- helpers --------------------
 function num(v, def = 0) {
-  const n = Number(String(v ?? "").replace(/,/g, ""));
+  const n = Number(v);
   return Number.isFinite(n) ? n : def;
 }
 
@@ -22,22 +21,10 @@ function toYMD(d) {
   return `${y}-${m}-${day}`;
 }
 
-/**
- * ✅ Evita bugs de timezone con YYYY-MM-DD
- * - Si viene YYYY-MM-DD => interpretamos local "T00:00:00"
- * - Si viene ISO => Date(ISO)
- */
-function isoDateOrNull(v) {
-  const s = String(v ?? "").trim();
-  if (!s) return null;
-
-  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
-    const d = new Date(`${s}T00:00:00`);
-    if (Number.isNaN(d.getTime())) return null;
-    return d;
-  }
-
-  const d = new Date(s);
+function parseYMD(s) {
+  const str = String(s || "").trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(str)) return null;
+  const d = new Date(`${str}T00:00:00`);
   if (Number.isNaN(d.getTime())) return null;
   return d;
 }
@@ -46,9 +33,7 @@ async function getAccountNameMap(owner, codes) {
   const unique = Array.from(new Set((codes || []).filter(Boolean).map((c) => String(c).trim())));
   if (!unique.length) return {};
 
-  const rows = await Account.find({ owner, code: { $in: unique } })
-    .select("code name nombre")
-    .lean();
+  const rows = await Account.find({ owner, code: { $in: unique } }).select("code name nombre").lean();
 
   const map = {};
   for (const r of rows) {
@@ -58,26 +43,26 @@ async function getAccountNameMap(owner, codes) {
 }
 
 /**
- * ✅ Shape EXACTO que tus modales esperan:
+ * ✅ Shape EXACTO que RegistroIngresos.tsx espera:
  * currentAsientos.descripcion
  * currentAsientos.detalles[] = { cuenta_codigo, cuenta_nombre, descripcion, debe, haber }
  */
 function mapEntryForUI(entry, accountNameMap = {}) {
   const rawLines = entry.lines || entry.detalle_asientos || [];
-
   const detalle_asientos = (rawLines || []).map((l) => {
     const cuentaCodigo = l.accountCodigo ?? l.accountCode ?? l.cuenta_codigo ?? l.code ?? "";
     const cuenta_codigo = cuentaCodigo ? String(cuentaCodigo).trim() : "";
 
     return {
       cuenta_codigo: cuenta_codigo || null,
-      cuenta_nombre: cuenta_codigo ? (accountNameMap[cuenta_codigo] || null) : null,
+      cuenta_nombre: cuenta_codigo ? accountNameMap[cuenta_codigo] || null : null,
       debe: num(l.debit ?? l.debe, 0),
       haber: num(l.credit ?? l.haber, 0),
       memo: l.memo ?? l.descripcion ?? "",
     };
   });
 
+  // 👇 UI pinta currentAsientos.detalles (NO detalle_asientos)
   const detalles = detalle_asientos.map((d) => ({
     cuenta_codigo: d.cuenta_codigo,
     cuenta_nombre: d.cuenta_nombre,
@@ -87,7 +72,7 @@ function mapEntryForUI(entry, accountNameMap = {}) {
   }));
 
   const concepto = entry.concept ?? entry.concepto ?? entry.descripcion ?? "";
-  const numeroAsiento = entry.numeroAsiento ?? entry.numero_asiento ?? null;
+  const numeroAsiento = entry.numeroAsiento ?? entry.numero_asiento ?? entry.numero ?? null;
 
   return {
     id: String(entry._id),
@@ -103,8 +88,8 @@ function mapEntryForUI(entry, accountNameMap = {}) {
     descripcion: concepto,
     concepto,
 
-    source: entry.source ?? "",
-    transaccion_ingreso_id: entry.sourceId ? String(entry.sourceId) : null,
+    source: entry.source ?? entry.fuente ?? "",
+    transaccion_ingreso_id: entry.sourceId ? String(entry.sourceId) : entry.transaccionId ? String(entry.transaccionId) : null,
 
     detalle_asientos,
     detalles,
@@ -114,157 +99,117 @@ function mapEntryForUI(entry, accountNameMap = {}) {
   };
 }
 
-// -------------------- ROUTES --------------------
-
 /**
- * ✅ GET /api/asientos/detalle?cuentas=1001,1002
- * Devuelve saldos por cuenta (para useSaldosDisponibles).
+ * ✅ Legacy endpoint que tu FE pide:
+ * GET /api/asientos/detalle?cuentas=1001,1002&start=YYYY-MM-DD&end=YYYY-MM-DD
  *
- * Respuesta:
- * [
- *   { cuenta_codigo:"1001", cuentaCodigo:"1001", debe, haber, totalDebe, totalHaber, saldo }
- * ]
+ * Devuelve saldos por cuenta (debe, haber, neto).
+ * Esto elimina el 404 y permite al panel calcular efectivo/bancos, etc.
  */
 router.get("/detalle", ensureAuth, async (req, res) => {
   try {
     const owner = req.user._id;
 
-    const cuentasRaw = String(req.query.cuentas ?? "").trim();
-    if (!cuentasRaw) {
+    // soporta cuentas=1001,1002  o cuentas[]=1001&cuentas[]=1002
+    let cuentas = req.query.cuentas;
+
+    if (Array.isArray(cuentas)) {
+      cuentas = cuentas.flatMap((x) => String(x).split(","));
+    } else {
+      cuentas = String(cuentas || "").split(",");
+    }
+
+    const codes = cuentas.map((c) => String(c || "").trim()).filter(Boolean);
+
+    if (!codes.length) {
       return res.status(400).json({
         ok: false,
-        error: "MISSING_PARAMS",
-        message: "cuentas es requerido. Ej: /api/asientos/detalle?cuentas=1001,1002",
+        error: "VALIDATION",
+        message: "Parámetro 'cuentas' es requerido. Ej: ?cuentas=1001,1002",
       });
     }
 
-    const cuentas = cuentasRaw
-      .split(",")
-      .map((s) => String(s).trim())
-      .filter(Boolean);
+    const start = parseYMD(req.query.start);
+    const end = parseYMD(req.query.end);
 
-    if (!cuentas.length) {
-      return res.json([]);
+    const dateFilter = {};
+    if (start) dateFilter.$gte = start;
+    if (end) {
+      const e = new Date(end);
+      e.setHours(23, 59, 59, 999);
+      dateFilter.$lte = e;
     }
 
-    // Agregamos por accountCodigo dentro de lines
-    const rows = await JournalEntry.aggregate([
-      { $match: { owner: new mongoose.Types.ObjectId(owner) } },
+    const match = { owner };
+    if (start || end) match.date = dateFilter;
+
+    // Agregamos por línea contable
+    const agg = await JournalEntry.aggregate([
+      { $match: match },
       { $unwind: "$lines" },
-      { $match: { "lines.accountCodigo": { $in: cuentas } } },
       {
-        $group: {
-          _id: "$lines.accountCodigo",
-          totalDebe: { $sum: "$lines.debit" },
-          totalHaber: { $sum: "$lines.credit" },
+        $project: {
+          owner: 1,
+          date: "$date",
+          code: {
+            $ifNull: [
+              "$lines.accountCodigo",
+              { $ifNull: ["$lines.accountCode", { $ifNull: ["$lines.cuenta_codigo", "$lines.code"] }] },
+            ],
+          },
+          debe: { $ifNull: ["$lines.debit", { $ifNull: ["$lines.debe", 0] }] },
+          haber: { $ifNull: ["$lines.credit", { $ifNull: ["$lines.haber", 0] }] },
         },
       },
-      { $sort: { _id: 1 } },
+      { $match: { code: { $in: codes } } },
+      {
+        $group: {
+          _id: "$code",
+          debe: { $sum: "$debe" },
+          haber: { $sum: "$haber" },
+        },
+      },
     ]);
 
-    // Asegura que regresamos todas las cuentas pedidas (aunque no haya movimientos)
-    const map = new Map(rows.map((r) => [String(r._id), r]));
-    const out = cuentas.map((codigo) => {
-      const r = map.get(codigo) || { totalDebe: 0, totalHaber: 0 };
-      const debe = num(r.totalDebe, 0);
-      const haber = num(r.totalHaber, 0);
-      const saldo = debe - haber;
-
-      return {
-        cuenta_codigo: codigo,
-        cuentaCodigo: codigo,
-        debe,
-        haber,
-        totalDebe: debe,
-        totalHaber: haber,
-        saldo,
-      };
-    });
-
-    return res.json(out);
-  } catch (e) {
-    console.error("GET /api/asientos/detalle error:", e);
-    return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
-  }
-});
-
-/**
- * ✅ GET /api/asientos?start=YYYY-MM-DD&end=YYYY-MM-DD&source=egreso&include_detalles=1&limit=200
- * Esto evita el 404 que ves en consola y te sirve para listados.
- *
- * - include_detalles=1 => devuelve asientos ya mapeados con detalles[]
- * - include_detalles=0 => devuelve rows lean “raw”
- */
-router.get("/", ensureAuth, async (req, res) => {
-  try {
-    const owner = req.user._id;
-
-    const start = isoDateOrNull(req.query.start);
-    const end = isoDateOrNull(req.query.end);
-    const source = String(req.query.source ?? "").trim();
-    const includeDetalles = String(req.query.include_detalles ?? "").trim() === "1";
-    const limit = Math.min(500, Math.max(1, num(req.query.limit, 200)));
-    const wrap = String(req.query.wrap ?? "").trim() === "1";
-
-    const filter = { owner };
-
-    if (source) filter.source = source;
-
-    if (start || end) {
-      filter.date = {};
-      if (start) filter.date.$gte = start;
-      if (end) {
-        const e = new Date(end);
-        e.setHours(23, 59, 59, 999);
-        filter.date.$lte = e;
-      }
-    }
-
-    const docs = await JournalEntry.find(filter)
-      .sort({ date: -1, createdAt: -1 })
-      .limit(limit)
-      .lean();
-
-    if (!includeDetalles) {
-      if (!wrap) return res.json(docs);
-      return res.json({ ok: true, data: docs, items: docs });
-    }
-
-    // enriquecer nombres
-    const allCodes = [];
-    for (const a of docs) {
-      for (const l of a.lines || []) {
-        if (l?.accountCodigo) allCodes.push(String(l.accountCodigo));
-      }
-    }
-    const accountNameMap = await getAccountNameMap(owner, allCodes);
-
-    const items = docs.map((a) => mapEntryForUI(a, accountNameMap));
-
-    if (!wrap) return res.json(items);
-    return res.json({ ok: true, data: items, items });
-  } catch (e) {
-    console.error("GET /api/asientos error:", e);
-    return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
-  }
-});
-
-// GET /api/asientos/:id
-router.get("/:id", ensureAuth, async (req, res) => {
-  try {
-    const owner = req.user._id;
-    const id = String(req.params.id || "").trim();
-
-    const doc = await JournalEntry.findOne({ owner, _id: id }).lean();
-    if (!doc) return res.status(404).json({ ok: false, error: "NOT_FOUND" });
-
-    const codes = (doc.lines || []).map((l) => l.accountCodigo).filter(Boolean).map(String);
     const accountNameMap = await getAccountNameMap(owner, codes);
 
-    const item = mapEntryForUI(doc, accountNameMap);
-    return res.json({ ok: true, data: item, item, ...item });
+    const byCode = {};
+    for (const code of codes) {
+      byCode[code] = {
+        cuenta_codigo: code,
+        cuenta_nombre: accountNameMap[code] || null,
+        debe: 0,
+        haber: 0,
+        neto: 0,
+      };
+    }
+
+    for (const row of agg) {
+      const code = String(row._id || "").trim();
+      if (!code) continue;
+
+      const debe = num(row.debe, 0);
+      const haber = num(row.haber, 0);
+
+      byCode[code] = {
+        cuenta_codigo: code,
+        cuenta_nombre: accountNameMap[code] || null,
+        debe,
+        haber,
+        neto: debe - haber,
+      };
+    }
+
+    const items = Object.values(byCode);
+
+    return res.json({
+      ok: true,
+      data: items,
+      items,
+      byCode,
+    });
   } catch (e) {
-    console.error("GET /api/asientos/:id error:", e);
+    console.error("GET /api/asientos/detalle error:", e);
     return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
   }
 });
@@ -328,14 +273,17 @@ router.get("/by-transaccion", ensureAuth, async (req, res) => {
 
     if (!asiento) return res.status(404).json({ ok: false, error: "NOT_FOUND" });
 
+    // ✅ Enriquecer nombres de cuentas por code
     const codes = (asiento.lines || [])
-      .map((l) => l.accountCodigo ?? l.accountCode ?? l.cuenta_codigo ?? null)
+      .map((l) => l.accountCodigo ?? l.accountCode ?? l.cuenta_codigo ?? l.code ?? null)
       .filter(Boolean)
       .map(String);
 
     const accountNameMap = await getAccountNameMap(owner, codes);
 
     const asientoUI = mapEntryForUI(asiento, accountNameMap);
+
+    // ✅ numeroAsiento “real” si existe; si no, fallback a _id
     const numeroAsiento = asientoUI.numeroAsiento || String(asiento._id);
 
     return res.json({
