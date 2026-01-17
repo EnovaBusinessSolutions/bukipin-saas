@@ -13,7 +13,6 @@ const ExpenseTransactionSchema = new mongoose.Schema(
     tipo: { type: String, enum: ["costo", "gasto"], required: true, index: true },
 
     // ✅ Compat / preferencia del frontend (no requerido)
-    //    Lo guardamos para que puedas depurar y para compat con implementaciones previas.
     tipoEgreso: { type: String, enum: ["costo", "gasto"], default: null, index: true },
 
     // ✅ Subtipo (precargado, inventariado, etc.)
@@ -33,7 +32,6 @@ const ExpenseTransactionSchema = new mongoose.Schema(
     montoPendiente: { type: Number, default: 0 },
 
     // ✅ Legacy/compat (tu modelo viejo usaba total)
-    //    Lo mantenemos para no romper lecturas viejas.
     total: { type: Number, default: 0 },
 
     // ✅ Contabilidad (para generar asiento / analítica)
@@ -55,6 +53,16 @@ const ExpenseTransactionSchema = new mongoose.Schema(
     // ✅ Texto
     descripcion: { type: String, default: "", trim: true },
     comentarios: { type: String, default: null, trim: true },
+
+    // ==========================================================
+    // ✅ CANCELACIÓN (CRÍTICO para que “Cancelar transacción” funcione)
+    // ==========================================================
+    estado: { type: String, enum: ["activo", "cancelado"], default: "activo", index: true },
+    motivoCancelacion: { type: String, default: "", trim: true },
+    canceladoAt: { type: Date, default: null },
+
+    // ✅ Para ligar la reversión contable creada al cancelar
+    numeroAsientoReversion: { type: String, default: null, trim: true, index: true },
   },
   { timestamps: true }
 );
@@ -63,9 +71,11 @@ const ExpenseTransactionSchema = new mongoose.Schema(
 // ✅ Índices recomendados
 // =============================
 ExpenseTransactionSchema.index({ owner: 1, fecha: -1 });
+ExpenseTransactionSchema.index({ owner: 1, estado: 1, fecha: -1 }); // 🔥 listado por estado
 ExpenseTransactionSchema.index({ owner: 1, tipo: 1, fecha: -1 });
 ExpenseTransactionSchema.index({ owner: 1, productoId: 1, fecha: -1 });
 ExpenseTransactionSchema.index({ owner: 1, numeroAsiento: 1 }, { unique: true, sparse: true });
+ExpenseTransactionSchema.index({ owner: 1, numeroAsientoReversion: 1 }, { sparse: true });
 
 // =============================
 // ✅ Normalizaciones automáticas

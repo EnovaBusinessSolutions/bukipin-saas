@@ -59,6 +59,14 @@ function normalizeMetodoPago(v) {
   return s;
 }
 
+function normalizeEstado(v) {
+  const s = asTrim(v).toLowerCase();
+  if (!s) return "";
+  if (["activo", "activa", "active"].includes(s)) return "activo";
+  if (["cancelado", "cancelada", "canceled"].includes(s)) return "cancelado";
+  return s;
+}
+
 function toObjectIdOrNull(v) {
   if (v === undefined || v === null) return null;
   if (v instanceof mongoose.Types.ObjectId) return v;
@@ -102,13 +110,15 @@ function mapTxForUI(doc) {
   const d = doc?.toObject ? doc.toObject() : doc;
 
   const tipoResolved =
-    d.tipoEgreso ?? d.tipo_egreso ?? d.tipo ?? d.tipoEgreso ?? d.tipo_egreso ?? ""; // ✅ FIX: soportar `tipo`
+    d.tipoEgreso ?? d.tipo_egreso ?? d.tipo ?? d.tipoEgreso ?? d.tipo_egreso ?? "";
+
+  const estadoResolved = d.estado ?? d.status ?? "activo";
 
   const item = {
     id: String(d._id),
     _id: d._id,
 
-    tipo_egreso: tipoResolved, // ✅ FIX
+    tipo_egreso: tipoResolved,
     subtipo_egreso: d.subtipoEgreso ?? d.subtipo_egreso ?? "",
 
     descripcion: d.descripcion ?? "",
@@ -120,7 +130,7 @@ function mapTxForUI(doc) {
       ? String(d.subcuenta_id)
       : null,
 
-    monto_total: toNum(d.montoTotal ?? d.monto_total, 0),
+    monto_total: toNum(d.montoTotal ?? d.monto_total ?? d.total ?? 0, 0),
     cantidad: toNum(d.cantidad, 0),
     precio_unitario: toNum(d.precioUnitario ?? d.precio_unitario, 0),
 
@@ -157,6 +167,12 @@ function mapTxForUI(doc) {
 
     numero_asiento: d.numeroAsiento ?? d.numero_asiento ?? null,
 
+    // ✅ NUEVO: estado/cancelación
+    estado: estadoResolved,
+    motivo_cancelacion: d.motivoCancelacion ?? d.motivo_cancelacion ?? null,
+    cancelado_at: d.canceladoAt ? new Date(d.canceladoAt).toISOString() : d.cancelado_at ? new Date(d.cancelado_at).toISOString() : null,
+    numero_asiento_reversion: d.numeroAsientoReversion ?? d.numero_asiento_reversion ?? null,
+
     created_at: d.createdAt ?? d.created_at ?? null,
     updated_at: d.updatedAt ?? d.updated_at ?? null,
   };
@@ -175,6 +191,10 @@ function mapTxForUI(doc) {
   item.fechaVencimiento = item.fecha_vencimiento;
   item.proveedorId = item.proveedor_id;
   item.productoId = item.producto_egreso_id;
+
+  item.motivoCancelacion = item.motivo_cancelacion;
+  item.canceladoAt = item.cancelado_at;
+  item.numeroAsientoReversion = item.numero_asiento_reversion;
 
   return item;
 }
@@ -210,8 +230,6 @@ function resolveCreditAccountByMetodoPago(metodoPago) {
 
 /**
  * Detecta si viene del flujo "precargados"
- * - subtipo_egreso: precargado / precargados
- * - source/origen: precargados
  */
 function isPrecargadosFlow(subtipoEgreso, reqBody) {
   const sub = String(subtipoEgreso || "").trim().toLowerCase();
@@ -219,23 +237,20 @@ function isPrecargadosFlow(subtipoEgreso, reqBody) {
 
   if (src === "precargados" || src === "precargado") return true;
   if (sub === "precargado" || sub === "precargados") return true;
-
-  // por compat con nombres que a veces usan en UI
   if (sub.includes("precarg")) return true;
 
   return false;
 }
 
 /**
- * POST /api/transacciones/egresos
+ * POST /api/egresos/transacciones
  * Crea la transacción de egreso y (si existe el modelo) su asiento contable.
  */
 router.post("/", ensureAuth, async (req, res) => {
   try {
     const owner = req.user._id;
 
-    // Acepta snake_case y camelCase
-    const tipoEgreso = normalizeTipoEgreso(req.body?.tipo_egreso ?? req.body?.tipoEgreso ?? req.body?.tipo); // ✅ FIX: leer `tipo`
+    const tipoEgreso = normalizeTipoEgreso(req.body?.tipo_egreso ?? req.body?.tipoEgreso ?? req.body?.tipo);
     const subtipoEgreso = asTrim(req.body?.subtipo_egreso ?? req.body?.subtipoEgreso ?? "precargado");
     const descripcion = asTrim(req.body?.descripcion);
 
@@ -292,7 +307,6 @@ router.post("/", ensureAuth, async (req, res) => {
       return res.status(400).json({ ok: false, error: "VALIDATION", message: "tipo_pago inválido (contado|credito|parcial)." });
     }
 
-    // Contado/parcial requieren método de pago (para registrar el pago)
     if (tipoPago === "contado" || tipoPago === "parcial") {
       if (!metodoPago) {
         return res.status(400).json({
@@ -338,10 +352,8 @@ router.post("/", ensureAuth, async (req, res) => {
     const txPayload = {
       owner,
 
-      // ✅ FIX: el schema puede requerir `tipo`
       tipo: tipoEgreso,
 
-      // ✅ mantenemos estos para compat con tu UI/rutas actuales
       tipoEgreso,
       subtipoEgreso,
       descripcion,
@@ -371,9 +383,10 @@ router.post("/", ensureAuth, async (req, res) => {
       comentarios: comentarios || null,
 
       numeroAsiento,
+
+      // ✅ estado por default (en schema) = activo
     };
 
-    // ✅ Ligar producto en el campo correcto del schema
     const txProductField = getTxProductField();
     if (productoEgresoId) txPayload[txProductField] = productoEgresoId;
 
@@ -382,7 +395,7 @@ router.post("/", ensureAuth, async (req, res) => {
     // ✅ Crear asiento contable (si existe modelo)
     let asiento = null;
     if (JournalEntry) {
-      const CXP = process.env.CTA_CXP || "2001"; // ✅ Proveedores (Pasivo Circulante)
+      const CXP = process.env.CTA_CXP || "2001";
       const creditInfo = resolveCreditAccountByMetodoPago(metodoPago);
 
       const lines = [];
@@ -397,8 +410,6 @@ router.post("/", ensureAuth, async (req, res) => {
       });
 
       if (forceCxp2001) {
-        // ✅ REGLA: Precargados SIEMPRE a 2001
-        // (2) HABER: 2001 por el total
         lines.push({
           side: "credit",
           cuentaCodigo: CXP,
@@ -407,9 +418,7 @@ router.post("/", ensureAuth, async (req, res) => {
           descripcion: `Precargados → Proveedores (CXP ${CXP})`,
         });
 
-        // (3) Si hubo pago (contado o parcial), registramos el pago contra 2001 en el mismo asiento
         if (fixedMontoPagado > 0) {
-          // DEBE: 2001 (se reduce la deuda)
           lines.push({
             side: "debit",
             cuentaCodigo: CXP,
@@ -418,7 +427,6 @@ router.post("/", ensureAuth, async (req, res) => {
             descripcion: `Aplicación de pago a CXP (${CXP})`,
           });
 
-          // HABER: Bancos/Efectivo/Tarjeta
           lines.push({
             side: "credit",
             cuentaCodigo: creditInfo.cuentaCodigo,
@@ -429,7 +437,6 @@ router.post("/", ensureAuth, async (req, res) => {
           });
         }
       } else {
-        // ✅ comportamiento normal (NO precargados)
         if (tipoPago === "contado") {
           lines.push({
             side: "credit",
@@ -470,7 +477,6 @@ router.post("/", ensureAuth, async (req, res) => {
         }
       }
 
-      // Totales (debe/haber) por suma real de líneas
       const totalDebe = lines.filter((l) => l.side === "debit").reduce((a, l) => a + toNum(l.monto, 0), 0);
       const totalHaber = lines.filter((l) => l.side === "credit").reduce((a, l) => a + toNum(l.monto, 0), 0);
 
@@ -513,13 +519,13 @@ router.post("/", ensureAuth, async (req, res) => {
       ...item,
     });
   } catch (err) {
-    console.error("POST /api/transacciones/egresos error:", err);
+    console.error("POST /api/egresos/transacciones error:", err);
     return res.status(500).json({ ok: false, error: "SERVER_ERROR", message: err?.message || "SERVER_ERROR" });
   }
 });
 
 /**
- * GET /api/transacciones/egresos?start=YYYY-MM-DD&end=YYYY-MM-DD&tipo=costo|gasto
+ * GET /api/egresos/transacciones?estado=activo|cancelado&start=YYYY-MM-DD&end=YYYY-MM-DD&tipo=costo|gasto&limit=200
  */
 router.get("/", ensureAuth, async (req, res) => {
   try {
@@ -528,9 +534,18 @@ router.get("/", ensureAuth, async (req, res) => {
 
     const start = isoDateOrNull(req.query.start);
     const end = isoDateOrNull(req.query.end);
+
     const tipo = normalizeTipoEgreso(req.query.tipo);
+    const estado = normalizeEstado(req.query.estado);
+
+    const includeCancelados =
+      String(req.query.include_cancelados ?? req.query.includeCancelados ?? "0").trim() === "1";
+
+    const limitRaw = Number(req.query.limit ?? 200);
+    const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), 500) : 200;
 
     const filter = { owner };
+
     if (start || end) {
       filter.fecha = {};
       if (start) filter.fecha.$gte = start;
@@ -546,19 +561,32 @@ router.get("/", ensureAuth, async (req, res) => {
       filter.$or = [{ tipoEgreso: tipo }, { tipo: tipo }];
     }
 
-    const docs = await ExpenseTransaction.find(filter).sort({ fecha: -1, createdAt: -1 }).lean();
+    // ✅ CRÍTICO: estado
+    // - si mandan estado=activo|cancelado, filtramos exacto
+    // - si NO mandan estado, por default EXCLUIMOS cancelados (a menos que include_cancelados=1)
+    if (estado && ["activo", "cancelado"].includes(estado)) {
+      filter.estado = estado;
+    } else if (!includeCancelados) {
+      filter.estado = { $ne: "cancelado" };
+    }
+
+    const docs = await ExpenseTransaction.find(filter)
+      .sort({ fecha: -1, createdAt: -1 })
+      .limit(limit)
+      .lean();
+
     const items = docs.map(mapTxForUI);
 
     if (!wrap) return res.json(items);
-    return res.json({ ok: true, data: items, items });
+    return res.json({ ok: true, data: items, items, meta: { limit } });
   } catch (err) {
-    console.error("GET /api/transacciones/egresos error:", err);
+    console.error("GET /api/egresos/transacciones error:", err);
     return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
   }
 });
 
 /**
- * GET /api/transacciones/egresos/:id
+ * GET /api/egresos/transacciones/:id
  */
 router.get("/:id", ensureAuth, async (req, res) => {
   try {
@@ -571,7 +599,7 @@ router.get("/:id", ensureAuth, async (req, res) => {
     const item = mapTxForUI(doc);
     return res.json({ ok: true, data: item, item, ...item });
   } catch (err) {
-    console.error("GET /api/transacciones/egresos/:id error:", err);
+    console.error("GET /api/egresos/transacciones/:id error:", err);
     return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
   }
 });
