@@ -17,7 +17,6 @@ const ExpenseProductSchema = new mongoose.Schema(
 
     /**
      * ✅ Catálogo (E2E con UI)
-     * Estos campos son los que el frontend muestra y el backend ya intenta guardar.
      */
     unidad: { type: String, default: "", trim: true }, // ej. "kg", "piezas", "servicios"
     proveedor_principal: { type: String, default: "", trim: true },
@@ -25,24 +24,17 @@ const ExpenseProductSchema = new mongoose.Schema(
 
     /**
      * ✅ Imagen (opcional)
-     * Guardamos URL pública relativa: /uploads/egresos/archivo.jpg
      */
     imagen_url: { type: String, default: null, trim: true },
 
     /**
-     * ✅ Contabilidad
-     * - cuentaCodigo ya existe y lo dejamos por compat (tu backend lo usa).
-     * - cuenta_contable es el nombre snake_case que tu UI/hooks usan.
-     *
-     * Nota: puedes usar solo uno, pero mantener ambos evita romper código legacy.
+     * ✅ Contabilidad (compat camel + snake)
      */
-    cuentaCodigo: { type: String, default: "", trim: true },       // legacy/camel
-    cuenta_contable: { type: String, default: "", trim: true },    // snake_case (UI)
+    cuentaCodigo: { type: String, default: "", trim: true }, // legacy/camel
+    cuenta_contable: { type: String, default: "", trim: true }, // snake_case (UI)
 
     /**
-     * ✅ Subcuenta
-     * - subcuentaId ya existe y lo dejamos.
-     * - subcuenta_id es el nombre snake_case que UI/hooks usan.
+     * ✅ Subcuenta (compat camel + snake)
      */
     subcuentaId: { type: mongoose.Schema.Types.ObjectId, ref: "Account", default: null },
     subcuenta_id: { type: mongoose.Schema.Types.ObjectId, ref: "Account", default: null },
@@ -52,21 +44,32 @@ const ExpenseProductSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-ExpenseProductSchema.index({ owner: 1, tipo: 1, nombre: 1 });
+// ✅ Índices (catálogo típico: owner + tipo + activo + nombre)
+ExpenseProductSchema.index({ owner: 1, tipo: 1, activo: 1, nombre: 1 });
+
+// ✅ Helper interno para espejar campos
+function mirrorCompat(doc) {
+  // cuenta
+  if (!doc.cuenta_contable && doc.cuentaCodigo) doc.cuenta_contable = doc.cuentaCodigo;
+  if (!doc.cuentaCodigo && doc.cuenta_contable) doc.cuentaCodigo = doc.cuenta_contable;
+
+  // subcuenta
+  if (!doc.subcuenta_id && doc.subcuentaId) doc.subcuenta_id = doc.subcuentaId;
+  if (!doc.subcuentaId && doc.subcuenta_id) doc.subcuentaId = doc.subcuenta_id;
+}
 
 /**
  * ✅ Mantener consistencia entre campos duplicados (compat)
- * Si se setea uno, espejamos al otro.
+ * - validate: cubre create/save con validación
+ * - save: deja todo persistido correctamente
  */
+ExpenseProductSchema.pre("validate", function (next) {
+  mirrorCompat(this);
+  next();
+});
+
 ExpenseProductSchema.pre("save", function (next) {
-  // cuenta
-  if (!this.cuenta_contable && this.cuentaCodigo) this.cuenta_contable = this.cuentaCodigo;
-  if (!this.cuentaCodigo && this.cuenta_contable) this.cuentaCodigo = this.cuenta_contable;
-
-  // subcuenta
-  if (!this.subcuenta_id && this.subcuentaId) this.subcuenta_id = this.subcuentaId;
-  if (!this.subcuentaId && this.subcuenta_id) this.subcuentaId = this.subcuenta_id;
-
+  mirrorCompat(this);
   next();
 });
 

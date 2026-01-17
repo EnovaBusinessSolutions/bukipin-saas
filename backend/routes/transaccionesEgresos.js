@@ -101,11 +101,14 @@ function getTxProductField() {
 function mapTxForUI(doc) {
   const d = doc?.toObject ? doc.toObject() : doc;
 
+  const tipoResolved =
+    d.tipoEgreso ?? d.tipo_egreso ?? d.tipo ?? d.tipoEgreso ?? d.tipo_egreso ?? ""; // ✅ FIX: soportar `tipo`
+
   const item = {
     id: String(d._id),
     _id: d._id,
 
-    tipo_egreso: d.tipoEgreso ?? d.tipo_egreso ?? "",
+    tipo_egreso: tipoResolved, // ✅ FIX
     subtipo_egreso: d.subtipoEgreso ?? d.subtipo_egreso ?? "",
 
     descripcion: d.descripcion ?? "",
@@ -232,7 +235,7 @@ router.post("/", ensureAuth, async (req, res) => {
     const owner = req.user._id;
 
     // Acepta snake_case y camelCase
-    const tipoEgreso = normalizeTipoEgreso(req.body?.tipo_egreso ?? req.body?.tipoEgreso);
+    const tipoEgreso = normalizeTipoEgreso(req.body?.tipo_egreso ?? req.body?.tipoEgreso ?? req.body?.tipo); // ✅ FIX: leer `tipo`
     const subtipoEgreso = asTrim(req.body?.subtipo_egreso ?? req.body?.subtipoEgreso ?? "precargado");
     const descripcion = asTrim(req.body?.descripcion);
 
@@ -335,6 +338,10 @@ router.post("/", ensureAuth, async (req, res) => {
     const txPayload = {
       owner,
 
+      // ✅ FIX: el schema puede requerir `tipo`
+      tipo: tipoEgreso,
+
+      // ✅ mantenemos estos para compat con tu UI/rutas actuales
       tipoEgreso,
       subtipoEgreso,
       descripcion,
@@ -533,7 +540,11 @@ router.get("/", ensureAuth, async (req, res) => {
         filter.fecha.$lte = e;
       }
     }
-    if (tipo && ["costo", "gasto"].includes(tipo)) filter.tipoEgreso = tipo;
+
+    // ✅ FIX: filtra por cualquiera de los dos campos (compat)
+    if (tipo && ["costo", "gasto"].includes(tipo)) {
+      filter.$or = [{ tipoEgreso: tipo }, { tipo: tipo }];
+    }
 
     const docs = await ExpenseTransaction.find(filter).sort({ fecha: -1, createdAt: -1 }).lean();
     const items = docs.map(mapTxForUI);
