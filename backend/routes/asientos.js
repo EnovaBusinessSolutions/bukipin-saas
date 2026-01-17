@@ -21,13 +21,19 @@ function toYMD(d) {
   return `${y}-${m}-${day}`;
 }
 
+function parseYMD(s) {
+  const str = String(s || "").trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(str)) return null;
+  const d = new Date(`${str}T00:00:00`);
+  if (Number.isNaN(d.getTime())) return null;
+  return d;
+}
+
 async function getAccountNameMap(owner, codes) {
   const unique = Array.from(new Set((codes || []).filter(Boolean).map((c) => String(c).trim())));
   if (!unique.length) return {};
 
-  const rows = await Account.find({ owner, code: { $in: unique } })
-    .select("code name nombre")
-    .lean();
+  const rows = await Account.find({ owner, code: { $in: unique } }).select("code name nombre").lean();
 
   const map = {};
   for (const r of rows) {
@@ -44,13 +50,12 @@ async function getAccountNameMap(owner, codes) {
 function mapEntryForUI(entry, accountNameMap = {}) {
   const rawLines = entry.lines || entry.detalle_asientos || [];
   const detalle_asientos = (rawLines || []).map((l) => {
-    const cuentaCodigo =
-      l.accountCodigo ?? l.accountCode ?? l.cuenta_codigo ?? l.code ?? "";
+    const cuentaCodigo = l.accountCodigo ?? l.accountCode ?? l.cuenta_codigo ?? l.code ?? "";
     const cuenta_codigo = cuentaCodigo ? String(cuentaCodigo).trim() : "";
 
     return {
       cuenta_codigo: cuenta_codigo || null,
-      cuenta_nombre: cuenta_codigo ? (accountNameMap[cuenta_codigo] || null) : null,
+      cuenta_nombre: cuenta_codigo ? accountNameMap[cuenta_codigo] || null : null,
       debe: num(l.debit ?? l.debe, 0),
       haber: num(l.credit ?? l.haber, 0),
       memo: l.memo ?? l.descripcion ?? "",
@@ -66,8 +71,8 @@ function mapEntryForUI(entry, accountNameMap = {}) {
     haber: d.haber,
   }));
 
-  const concepto = entry.concept ?? entry.concepto ?? "";
-  const numeroAsiento = entry.numeroAsiento ?? entry.numero_asiento ?? null;
+  const concepto = entry.concept ?? entry.concepto ?? entry.descripcion ?? "";
+  const numeroAsiento = entry.numeroAsiento ?? entry.numero_asiento ?? entry.numero ?? null;
 
   return {
     id: String(entry._id),
@@ -83,8 +88,8 @@ function mapEntryForUI(entry, accountNameMap = {}) {
     descripcion: concepto,
     concepto,
 
-    source: entry.source ?? "",
-    transaccion_ingreso_id: entry.sourceId ? String(entry.sourceId) : null,
+    source: entry.source ?? entry.fuente ?? "",
+    transaccion_ingreso_id: entry.sourceId ? String(entry.sourceId) : entry.transaccionId ? String(entry.transaccionId) : null,
 
     detalle_asientos,
     detalles,
@@ -93,6 +98,121 @@ function mapEntryForUI(entry, accountNameMap = {}) {
     updated_at: entry.updatedAt,
   };
 }
+
+/**
+ * ✅ Legacy endpoint que tu FE pide:
+ * GET /api/asientos/detalle?cuentas=1001,1002&start=YYYY-MM-DD&end=YYYY-MM-DD
+ *
+ * Devuelve saldos por cuenta (debe, haber, neto).
+ * Esto elimina el 404 y permite al panel calcular efectivo/bancos, etc.
+ */
+router.get("/detalle", ensureAuth, async (req, res) => {
+  try {
+    const owner = req.user._id;
+
+    // soporta cuentas=1001,1002  o cuentas[]=1001&cuentas[]=1002
+    let cuentas = req.query.cuentas;
+
+    if (Array.isArray(cuentas)) {
+      cuentas = cuentas.flatMap((x) => String(x).split(","));
+    } else {
+      cuentas = String(cuentas || "").split(",");
+    }
+
+    const codes = cuentas.map((c) => String(c || "").trim()).filter(Boolean);
+
+    if (!codes.length) {
+      return res.status(400).json({
+        ok: false,
+        error: "VALIDATION",
+        message: "Parámetro 'cuentas' es requerido. Ej: ?cuentas=1001,1002",
+      });
+    }
+
+    const start = parseYMD(req.query.start);
+    const end = parseYMD(req.query.end);
+
+    const dateFilter = {};
+    if (start) dateFilter.$gte = start;
+    if (end) {
+      const e = new Date(end);
+      e.setHours(23, 59, 59, 999);
+      dateFilter.$lte = e;
+    }
+
+    const match = { owner };
+    if (start || end) match.date = dateFilter;
+
+    // Agregamos por línea contable
+    const agg = await JournalEntry.aggregate([
+      { $match: match },
+      { $unwind: "$lines" },
+      {
+        $project: {
+          owner: 1,
+          date: "$date",
+          code: {
+            $ifNull: [
+              "$lines.accountCodigo",
+              { $ifNull: ["$lines.accountCode", { $ifNull: ["$lines.cuenta_codigo", "$lines.code"] }] },
+            ],
+          },
+          debe: { $ifNull: ["$lines.debit", { $ifNull: ["$lines.debe", 0] }] },
+          haber: { $ifNull: ["$lines.credit", { $ifNull: ["$lines.haber", 0] }] },
+        },
+      },
+      { $match: { code: { $in: codes } } },
+      {
+        $group: {
+          _id: "$code",
+          debe: { $sum: "$debe" },
+          haber: { $sum: "$haber" },
+        },
+      },
+    ]);
+
+    const accountNameMap = await getAccountNameMap(owner, codes);
+
+    const byCode = {};
+    for (const code of codes) {
+      byCode[code] = {
+        cuenta_codigo: code,
+        cuenta_nombre: accountNameMap[code] || null,
+        debe: 0,
+        haber: 0,
+        neto: 0,
+      };
+    }
+
+    for (const row of agg) {
+      const code = String(row._id || "").trim();
+      if (!code) continue;
+
+      const debe = num(row.debe, 0);
+      const haber = num(row.haber, 0);
+
+      byCode[code] = {
+        cuenta_codigo: code,
+        cuenta_nombre: accountNameMap[code] || null,
+        debe,
+        haber,
+        neto: debe - haber,
+      };
+    }
+
+    const items = Object.values(byCode);
+
+    return res.json({
+      ok: true,
+      data: items,
+      items,
+      byCode,
+    });
+  } catch (e) {
+    console.error("GET /api/asientos/detalle error:", e);
+    return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
+  }
+});
 
 // GET /api/asientos/by-transaccion?source=ingreso&id=XXXXXXXX
 router.get("/by-transaccion", ensureAuth, async (req, res) => {
@@ -155,7 +275,7 @@ router.get("/by-transaccion", ensureAuth, async (req, res) => {
 
     // ✅ Enriquecer nombres de cuentas por code
     const codes = (asiento.lines || [])
-      .map((l) => l.accountCodigo ?? l.accountCode ?? l.cuenta_codigo ?? null)
+      .map((l) => l.accountCodigo ?? l.accountCode ?? l.cuenta_codigo ?? l.code ?? null)
       .filter(Boolean)
       .map(String);
 

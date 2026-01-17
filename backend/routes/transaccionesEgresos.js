@@ -10,7 +10,6 @@ const ExpenseProduct = require("../models/ExpenseProduct");
 // ✅ Opcional: si existe en tu proyecto, lo usamos para crear el asiento contable
 let JournalEntry = null;
 try {
-  // Ajusta el nombre si tu modelo se llama distinto (Asiento, JournalEntry, Poliza, etc.)
   // eslint-disable-next-line global-require
   JournalEntry = require("../models/JournalEntry");
 } catch (e) {
@@ -70,8 +69,6 @@ function toObjectIdOrNull(v) {
 
 /**
  * ✅ Evita bugs de timezone con YYYY-MM-DD
- * - Si viene YYYY-MM-DD => interpretamos local "T00:00:00"
- * - Si viene ISO => Date(ISO)
  */
 function isoDateOrNull(v) {
   const s = asTrim(v);
@@ -88,7 +85,7 @@ function isoDateOrNull(v) {
   return d;
 }
 
-// ✅ Detecta campo en schema de ExpenseTransaction para ligar el producto (productoId/productId/producto_egreso_id…)
+// ✅ Detecta campo en schema de ExpenseTransaction para ligar el producto
 let _txProductField = null;
 function getTxProductField() {
   if (_txProductField) return _txProductField;
@@ -96,7 +93,7 @@ function getTxProductField() {
   if (paths.productoId) _txProductField = "productoId";
   else if (paths.productId) _txProductField = "productId";
   else if (paths.producto_egreso_id) _txProductField = "producto_egreso_id";
-  else _txProductField = "productoId"; // fallback
+  else _txProductField = "productoId";
   return _txProductField;
 }
 
@@ -169,7 +166,7 @@ function mapTxForUI(doc) {
   item.montoTotal = item.monto_total;
   item.precioUnitario = item.precio_unitario;
   item.tipoPago = item.tipo_pago;
-  item.metodoPago = item.metodo_pago; // ya canonical ("bancos"/"efectivo"/"tarjeta_credito_*")
+  item.metodoPago = item.metodo_pago;
   item.montoPagado = item.monto_pagado;
   item.montoPendiente = item.monto_pendiente;
   item.fechaVencimiento = item.fecha_vencimiento;
@@ -180,8 +177,7 @@ function mapTxForUI(doc) {
 }
 
 /**
- * Genera un número de asiento “humano” sin depender de counters.
- * Si ya tienes un contador real, reemplaza esta función por tu implementación.
+ * Genera un número de asiento “humano”
  */
 function genNumeroAsiento(ownerId) {
   const ymd = new Date().toISOString().slice(0, 10).replace(/-/g, "");
@@ -191,16 +187,13 @@ function genNumeroAsiento(ownerId) {
 }
 
 /**
- * Resuelve cuenta contra la que acreditas según método de pago.
- * Ajusta estos códigos a tu catálogo contable real si ya lo tienes.
+ * Resuelve cuenta de pago según método
  */
 function resolveCreditAccountByMetodoPago(metodoPago) {
   const CASH = process.env.CTA_EFECTIVO || "1001";
   const BANK = process.env.CTA_BANCOS || "1002";
-  const CXP = process.env.CTA_CXP || "2001"; // no se usa aquí directo pero queda documentado
 
   if (!metodoPago) return { tipo: "unknown", cuentaCodigo: BANK, meta: {} };
-
   if (metodoPago === "efectivo") return { tipo: "cash", cuentaCodigo: CASH, meta: {} };
   if (metodoPago === "bancos") return { tipo: "bank", cuentaCodigo: BANK, meta: {} };
 
@@ -210,6 +203,24 @@ function resolveCreditAccountByMetodoPago(metodoPago) {
   }
 
   return { tipo: "other", cuentaCodigo: BANK, meta: {} };
+}
+
+/**
+ * Detecta si viene del flujo "precargados"
+ * - subtipo_egreso: precargado / precargados
+ * - source/origen: precargados
+ */
+function isPrecargadosFlow(subtipoEgreso, reqBody) {
+  const sub = String(subtipoEgreso || "").trim().toLowerCase();
+  const src = String(reqBody?.source ?? reqBody?.origen ?? reqBody?.from ?? "").trim().toLowerCase();
+
+  if (src === "precargados" || src === "precargado") return true;
+  if (sub === "precargado" || sub === "precargados") return true;
+
+  // por compat con nombres que a veces usan en UI
+  if (sub.includes("precarg")) return true;
+
+  return false;
 }
 
 /**
@@ -253,7 +264,9 @@ router.post("/", ensureAuth, async (req, res) => {
 
     const comentarios = asTrim(req.body?.comentarios ?? "");
 
-    // ✅ Validaciones principales (sin tocar tu lógica existente más de lo necesario)
+    const forceCxp2001 = isPrecargadosFlow(subtipoEgreso, req.body);
+
+    // ✅ Validaciones
     if (!["costo", "gasto"].includes(tipoEgreso)) {
       return res.status(400).json({ ok: false, error: "VALIDATION", message: "tipo_egreso inválido (usa costo|gasto)." });
     }
@@ -276,16 +289,18 @@ router.post("/", ensureAuth, async (req, res) => {
       return res.status(400).json({ ok: false, error: "VALIDATION", message: "tipo_pago inválido (contado|credito|parcial)." });
     }
 
-    if (tipoPago === "contado") {
+    // Contado/parcial requieren método de pago (para registrar el pago)
+    if (tipoPago === "contado" || tipoPago === "parcial") {
       if (!metodoPago) {
-        return res.status(400).json({ ok: false, error: "VALIDATION", message: "metodo_pago es requerido para contado." });
+        return res.status(400).json({
+          ok: false,
+          error: "VALIDATION",
+          message: "metodo_pago es requerido para contado/parcial.",
+        });
       }
     }
 
     if (tipoPago === "parcial") {
-      if (!metodoPago) {
-        return res.status(400).json({ ok: false, error: "VALIDATION", message: "metodo_pago es requerido para pago parcial." });
-      }
       if (!(montoPagado > 0) || !(montoPagado < montoTotal)) {
         return res.status(400).json({
           ok: false,
@@ -295,7 +310,7 @@ router.post("/", ensureAuth, async (req, res) => {
       }
     }
 
-    // ✅ Validar que el producto exista y pertenezca al owner (si viene)
+    // ✅ Validar producto si viene
     let productDoc = null;
     if (productoEgresoId) {
       productDoc = await ExpenseProduct.findOne({ _id: productoEgresoId, owner }).lean();
@@ -332,7 +347,7 @@ router.post("/", ensureAuth, async (req, res) => {
       precioUnitario,
 
       tipoPago,
-      metodoPago: metodoPago || null, // canonical: efectivo | bancos | tarjeta_credito_*
+      metodoPago: metodoPago || null,
 
       montoPagado: fixedMontoPagado,
       montoPendiente: fixedMontoPendiente,
@@ -353,21 +368,19 @@ router.post("/", ensureAuth, async (req, res) => {
 
     // ✅ Ligar producto en el campo correcto del schema
     const txProductField = getTxProductField();
-    if (productoEgresoId) {
-      txPayload[txProductField] = productoEgresoId;
-    }
+    if (productoEgresoId) txPayload[txProductField] = productoEgresoId;
 
     const created = await ExpenseTransaction.create(txPayload);
 
     // ✅ Crear asiento contable (si existe modelo)
     let asiento = null;
     if (JournalEntry) {
-      const CXP = process.env.CTA_CXP || "2001";
+      const CXP = process.env.CTA_CXP || "2001"; // ✅ Proveedores (Pasivo Circulante)
       const creditInfo = resolveCreditAccountByMetodoPago(metodoPago);
 
       const lines = [];
 
-      // DEBE: gasto/costo
+      // (1) DEBE: gasto/costo
       lines.push({
         side: "debit",
         cuentaCodigo,
@@ -376,45 +389,83 @@ router.post("/", ensureAuth, async (req, res) => {
         descripcion: `Egreso (${tipoEgreso}) - ${descripcion}`,
       });
 
-      // HABER: según tipo de pago
-      if (tipoPago === "contado") {
-        lines.push({
-          side: "credit",
-          cuentaCodigo: creditInfo.cuentaCodigo,
-          subcuentaId: null,
-          monto: montoTotal,
-          descripcion: `Pago contado (${creditInfo.tipo})`,
-          meta: creditInfo.meta || {},
-        });
-      } else if (tipoPago === "credito") {
+      if (forceCxp2001) {
+        // ✅ REGLA: Precargados SIEMPRE a 2001
+        // (2) HABER: 2001 por el total
         lines.push({
           side: "credit",
           cuentaCodigo: CXP,
           subcuentaId: null,
           monto: montoTotal,
-          descripcion: `Egreso a crédito (CXP)`,
+          descripcion: `Precargados → Proveedores (CXP ${CXP})`,
         });
-      } else if (tipoPago === "parcial") {
+
+        // (3) Si hubo pago (contado o parcial), registramos el pago contra 2001 en el mismo asiento
         if (fixedMontoPagado > 0) {
+          // DEBE: 2001 (se reduce la deuda)
+          lines.push({
+            side: "debit",
+            cuentaCodigo: CXP,
+            subcuentaId: null,
+            monto: fixedMontoPagado,
+            descripcion: `Aplicación de pago a CXP (${CXP})`,
+          });
+
+          // HABER: Bancos/Efectivo/Tarjeta
           lines.push({
             side: "credit",
             cuentaCodigo: creditInfo.cuentaCodigo,
             subcuentaId: null,
             monto: fixedMontoPagado,
-            descripcion: `Pago parcial (${creditInfo.tipo})`,
+            descripcion: `Pago (${creditInfo.tipo})`,
             meta: creditInfo.meta || {},
           });
         }
-        if (fixedMontoPendiente > 0) {
+      } else {
+        // ✅ comportamiento normal (NO precargados)
+        if (tipoPago === "contado") {
+          lines.push({
+            side: "credit",
+            cuentaCodigo: creditInfo.cuentaCodigo,
+            subcuentaId: null,
+            monto: montoTotal,
+            descripcion: `Pago contado (${creditInfo.tipo})`,
+            meta: creditInfo.meta || {},
+          });
+        } else if (tipoPago === "credito") {
           lines.push({
             side: "credit",
             cuentaCodigo: CXP,
             subcuentaId: null,
-            monto: fixedMontoPendiente,
-            descripcion: `Saldo pendiente (CXP)`,
+            monto: montoTotal,
+            descripcion: `Egreso a crédito (CXP)`,
           });
+        } else if (tipoPago === "parcial") {
+          if (fixedMontoPagado > 0) {
+            lines.push({
+              side: "credit",
+              cuentaCodigo: creditInfo.cuentaCodigo,
+              subcuentaId: null,
+              monto: fixedMontoPagado,
+              descripcion: `Pago parcial (${creditInfo.tipo})`,
+              meta: creditInfo.meta || {},
+            });
+          }
+          if (fixedMontoPendiente > 0) {
+            lines.push({
+              side: "credit",
+              cuentaCodigo: CXP,
+              subcuentaId: null,
+              monto: fixedMontoPendiente,
+              descripcion: `Saldo pendiente (CXP)`,
+            });
+          }
         }
       }
+
+      // Totales (debe/haber) por suma real de líneas
+      const totalDebe = lines.filter((l) => l.side === "debit").reduce((a, l) => a + toNum(l.monto, 0), 0);
+      const totalHaber = lines.filter((l) => l.side === "credit").reduce((a, l) => a + toNum(l.monto, 0), 0);
 
       asiento = await JournalEntry.create({
         owner,
@@ -429,14 +480,16 @@ router.post("/", ensureAuth, async (req, res) => {
         proveedorId: proveedorId || null,
         proveedorNombre: proveedorNombre || null,
         lines,
-        totalDebe: montoTotal,
-        totalHaber: montoTotal,
+        totalDebe,
+        totalHaber,
         meta: {
           tipoEgreso,
           subtipoEgreso,
           tipoPago,
           metodoPago: metodoPago || null,
           productoEgresoId: productoEgresoId ? String(productoEgresoId) : null,
+          forceCxp2001: !!forceCxp2001,
+          cxpCuenta: process.env.CTA_CXP || "2001",
         },
       });
     }
@@ -450,17 +503,16 @@ router.post("/", ensureAuth, async (req, res) => {
       asiento_id: asiento ? String(asiento._id) : null,
       data: item,
       item,
-      ...item, // root (compat)
+      ...item,
     });
   } catch (err) {
     console.error("POST /api/transacciones/egresos error:", err);
-    return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
+    return res.status(500).json({ ok: false, error: "SERVER_ERROR", message: err?.message || "SERVER_ERROR" });
   }
 });
 
 /**
  * GET /api/transacciones/egresos?start=YYYY-MM-DD&end=YYYY-MM-DD&tipo=costo|gasto
- * Devuelve lista (array) por defecto; wrap=1 => {ok,data}
  */
 router.get("/", ensureAuth, async (req, res) => {
   try {

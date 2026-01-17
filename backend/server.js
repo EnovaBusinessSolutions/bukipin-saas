@@ -25,10 +25,7 @@ app.use(cookieParser());
 
 // ✅ No-cache SOLO para /api (evita respuestas 304 con body vacío)
 app.use("/api", (req, res, next) => {
-  res.setHeader(
-    "Cache-Control",
-    "no-store, no-cache, must-revalidate, proxy-revalidate"
-  );
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
   res.setHeader("Pragma", "no-cache");
   res.setHeader("Expires", "0");
   res.setHeader("Surrogate-Control", "no-store");
@@ -43,7 +40,7 @@ app.use(express.static(publicRoot));
 // ✅ API
 // ==============================
 
-// Healthcheck para Render / monitoreo (ponlo arriba para debugging rápido)
+// Healthcheck para Render / monitoreo
 app.get("/api/health", (req, res) => {
   res.json({
     status: "ok",
@@ -55,7 +52,7 @@ app.get("/api/health", (req, res) => {
 // Auth
 app.use("/api/auth", require("./routes/auth"));
 
-// Registros / Catálogos (rutas en español)
+// Registros / Catálogos
 app.use("/api/cuentas", require("./routes/cuentas"));
 app.use("/api/subcuentas", require("./routes/subcuentas"));
 app.use("/api/productos", require("./routes/productos"));
@@ -69,11 +66,14 @@ app.use("/api/movimientos-inventario", require("./routes/movimientosInventario")
 app.use("/api/asientos", require("./routes/asientos"));
 app.use("/api/productos-egresos", require("./routes/productosEgresos"));
 
+// ✅ NUEVO: Proveedores (evita 404 del panel de egresos)
+app.use("/api/proveedores", require("./routes/proveedores"));
 
+// ✅ NUEVO: Financiamientos (tarjetas de crédito, etc. — evita 404 en egresos)
+app.use("/api/financiamientos", require("./routes/financiamientos"));
 
-// ✅ Legacy endpoints (agrégalos aquí cuando los crees)
-// Ejemplo: UI está pidiendo /api/movimientos-inventario (404 hoy)
-// app.use("/api/movimientos-inventario", require("./routes/movimientosInventario"));
+// ✅ Nota: tu UI está pidiendo /api/asientos/detalle?cuentas=1001,1002
+// Eso se resuelve en backend/routes/asientos.js (agregaremos endpoint "detalle" en el siguiente paso).
 
 // ✅ Placeholders temporales (para que el dashboard no reviente con 404 mientras migras)
 // OJO: deben ir al final de /api para no “pisar” rutas reales.
@@ -98,6 +98,4 @@ app.get("/dashboard*", (req, res) => {
 // Catch-all
 app.use((req, res) => res.status(404).send("Ruta no encontrada"));
 
-app.listen(PORT, () =>
-  console.log(`🚀 Bukipin backend escuchando en puerto ${PORT}`)
-);
+app.listen(PORT, () => console.log(`🚀 Bukipin backend escuchando en puerto ${PORT}`));
