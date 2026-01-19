@@ -408,8 +408,35 @@ router.post("/", ensureAuth, async (req, res) => {
 
       const lines = [];
 
+      // ✅ Helper: GUARDA SHAPE CANONICAL + COMPAT (para que NUNCA se rompa el UI)
+      const pushLine = ({ side, cuentaCodigo: code, monto, descripcion: memoText, subcuentaId: subId, meta }) => {
+        const m = toNum(monto, 0);
+        const s = String(side || "").toLowerCase().trim();
+        const isDebit = s === "debit";
+        const isCredit = s === "credit";
+
+        lines.push({
+          // --- CANONICAL (lo que casi todo espera) ---
+          accountCodigo: String(code || "").trim(),
+          debit: isDebit ? m : 0,
+          credit: isCredit ? m : 0,
+          memo: memoText || "",
+
+          // --- COMPAT (lo que tú ya estabas mandando) ---
+          side: isDebit ? "debit" : isCredit ? "credit" : "",
+          monto: m,
+          cuentaCodigo: String(code || "").trim(),
+          cuenta_codigo: String(code || "").trim(),
+
+          // --- extras (si existen en schema nuevo, se guardan; si no, se ignoran) ---
+          subcuentaId: subId || null,
+          descripcion: memoText || "",
+          meta: meta || {},
+        });
+      };
+
       // (1) DEBE: gasto/costo
-      lines.push({
+      pushLine({
         side: "debit",
         cuentaCodigo,
         subcuentaId: subcuentaId || null,
@@ -419,7 +446,7 @@ router.post("/", ensureAuth, async (req, res) => {
 
       if (forceCxp2001) {
         // ✅ Precargados siempre a 2001
-        lines.push({
+        pushLine({
           side: "credit",
           cuentaCodigo: CXP,
           subcuentaId: null,
@@ -429,7 +456,7 @@ router.post("/", ensureAuth, async (req, res) => {
 
         // Si hubo pago, se aplica contra 2001
         if (fixedMontoPagado > 0) {
-          lines.push({
+          pushLine({
             side: "debit",
             cuentaCodigo: CXP,
             subcuentaId: null,
@@ -437,7 +464,7 @@ router.post("/", ensureAuth, async (req, res) => {
             descripcion: `Aplicación de pago a CXP (${CXP})`,
           });
 
-          lines.push({
+          pushLine({
             side: "credit",
             cuentaCodigo: creditInfo.cuentaCodigo,
             subcuentaId: null,
@@ -449,7 +476,7 @@ router.post("/", ensureAuth, async (req, res) => {
       } else {
         // ✅ comportamiento normal
         if (tipoPago === "contado") {
-          lines.push({
+          pushLine({
             side: "credit",
             cuentaCodigo: creditInfo.cuentaCodigo,
             subcuentaId: null,
@@ -458,7 +485,7 @@ router.post("/", ensureAuth, async (req, res) => {
             meta: creditInfo.meta || {},
           });
         } else if (tipoPago === "credito") {
-          lines.push({
+          pushLine({
             side: "credit",
             cuentaCodigo: CXP,
             subcuentaId: null,
@@ -467,7 +494,7 @@ router.post("/", ensureAuth, async (req, res) => {
           });
         } else if (tipoPago === "parcial") {
           if (fixedMontoPagado > 0) {
-            lines.push({
+            pushLine({
               side: "credit",
               cuentaCodigo: creditInfo.cuentaCodigo,
               subcuentaId: null,
@@ -477,7 +504,7 @@ router.post("/", ensureAuth, async (req, res) => {
             });
           }
           if (fixedMontoPendiente > 0) {
-            lines.push({
+            pushLine({
               side: "credit",
               cuentaCodigo: CXP,
               subcuentaId: null,
@@ -488,46 +515,28 @@ router.post("/", ensureAuth, async (req, res) => {
         }
       }
 
-      const totalDebe = lines.filter((l) => l.side === "debit").reduce((a, l) => a + toNum(l.monto, 0), 0);
-      const totalHaber = lines.filter((l) => l.side === "credit").reduce((a, l) => a + toNum(l.monto, 0), 0);
+      const totalDebe = lines.reduce((a, l) => a + toNum(l.debit, 0), 0);
+      const totalHaber = lines.reduce((a, l) => a + toNum(l.credit, 0), 0);
+
+      // ✅ Concepto: que SI se persista y lo pueda leer el UI
+      const conceptText = `Egreso: ${descripcion}`;
 
       asiento = await JournalEntry.create({
         owner,
 
-        // ✅ compat de source
-        fuente: "egreso",
-        source: "egreso",
+        // ✅ CAMPOS CANONICAL del JournalEntry
+        date: fecha,
+        concept: conceptText,
+        numeroAsiento,
 
-        // ✅ MUY IMPORTANTE: guardar sourceId (ya lo haces)
+        source: "egreso",
         sourceId: created._id,
+
+        // ✅ compat (si el schema lo soporta, se guarda; si no, se ignora)
         transaccionId: created._id,
         source_id: created._id,
 
-        // ✅ números
-        numero: numeroAsiento,
-        numeroAsiento,
-
-        // ✅ fecha/desc
-        date: fecha,          // <-- por si tu schema usa "date"
-        fecha,                // <-- por si tu schema usa "fecha"
-        descripcion: `Egreso: ${descripcion}`,
-
-        proveedorId: proveedorId || null,
-        proveedorNombre: proveedorNombre || null,
-
         lines,
-        totalDebe,
-        totalHaber,
-
-        meta: {
-          tipoEgreso,
-          subtipoEgreso,
-          tipoPago,
-          metodoPago: metodoPago || null,
-          productoEgresoId: productoEgresoId ? String(productoEgresoId) : null,
-          forceCxp2001: !!forceCxp2001,
-          cxpCuenta: process.env.CTA_CXP || "2001",
-        },
       });
 
       // ✅ CLAVE E2E: guardar el asientoId en la transacción

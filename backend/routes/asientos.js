@@ -51,6 +51,80 @@ async function getAccountNameMap(owner, codes) {
 }
 
 /**
+ * ✅ NUEVO: Mapa por CODE y por ID (para cuando las líneas traen accountId pero NO traen code).
+ * Esto es lo que te está causando cuenta_codigo:null y debe/haber:0 en egresos.
+ */
+async function getAccountMaps(owner, rawLines) {
+  const byCode = {};
+  const byId = {};
+
+  const lines = Array.isArray(rawLines) ? rawLines : [];
+  const codes = [];
+  const ids = [];
+
+  for (const l of lines) {
+    // code por variantes
+    const code =
+      l?.accountCodigo ??
+      l?.accountCode ??
+      l?.cuentaCodigo ??
+      l?.cuenta_codigo ??
+      l?.code ??
+      l?.cuenta?.code ??
+      l?.cuenta?.codigo ??
+      l?.account?.code ??
+      l?.account?.codigo ??
+      null;
+
+    if (code) codes.push(String(code).trim());
+
+    // id por variantes
+    const idCandidate =
+      l?.accountId ??
+      l?.account_id ??
+      l?.accountID ??
+      l?.cuentaId ??
+      l?.cuenta_id ??
+      l?.subcuentaId ??
+      l?.subcuenta_id ??
+      l?.account?._id ??
+      l?.cuenta?._id ??
+      null;
+
+    if (idCandidate) {
+      const sid = String(idCandidate).trim();
+      if (mongoose.Types.ObjectId.isValid(sid)) ids.push(new mongoose.Types.ObjectId(sid));
+    }
+  }
+
+  const uniqueCodes = Array.from(new Set(codes.filter(Boolean)));
+  const uniqueIds = Array.from(new Set(ids.map((x) => String(x)))).map((x) => new mongoose.Types.ObjectId(x));
+
+  if (!uniqueCodes.length && !uniqueIds.length) {
+    return { byCode, byId };
+  }
+
+  const or = [];
+  if (uniqueCodes.length) or.push({ code: { $in: uniqueCodes } });
+  if (uniqueIds.length) or.push({ _id: { $in: uniqueIds } });
+
+  const rows = await Account.find({ owner, $or: or })
+    .select("_id code name nombre")
+    .lean();
+
+  for (const r of rows) {
+    const code = String(r.code || "").trim();
+    const name = r.name ?? r.nombre ?? "";
+    if (code) byCode[code] = name;
+
+    const id = String(r._id || "").trim();
+    if (id) byId[id] = { code: code || null, name: name || null };
+  }
+
+  return { byCode, byId };
+}
+
+/**
  * ✅ Shape EXACTO que tus UIs esperan:
  * asiento.descripcion
  * asiento.detalles[] = { cuenta_codigo, cuenta_nombre, descripcion, debe, haber }
@@ -58,33 +132,93 @@ async function getAccountNameMap(owner, codes) {
  * Soporta líneas tipo:
  * - { accountCodigo, debit, credit, memo }            (JournalEntry)
  * - { cuentaCodigo, debe, haber, descripcion }        (legacy)
- * - { side:"debit|credit", monto, cuentaCodigo }      (egresos actuales)
+ * - { side:"debit|credit", monto, cuentaCodigo }      (egresos)
+ * - { accountId, debit/credit }                       (cuando guardas solo el id de la cuenta)
  */
-function mapEntryForUI(entry, accountNameMap = {}) {
+function mapEntryForUI(entry, accountMapsOrNameMap = {}) {
+  // ✅ compat: si te pasan el map viejo (code->name), funciona igual
+  const byCode = accountMapsOrNameMap?.byCode ? accountMapsOrNameMap.byCode : accountMapsOrNameMap;
+  const byId = accountMapsOrNameMap?.byId ? accountMapsOrNameMap.byId : {};
+
   const rawLines = entry.lines || entry.detalle_asientos || entry.detalles_asiento || [];
 
   const detalle_asientos = (rawLines || []).map((l) => {
-    const cuentaCodigo =
-      l.accountCodigo ??
-      l.accountCode ??
-      l.cuentaCodigo ??
-      l.cuenta_codigo ??
-      l.code ??
+    // 1) intentar sacar code directo
+    let cuentaCodigo =
+      l?.accountCodigo ??
+      l?.accountCode ??
+      l?.cuentaCodigo ??
+      l?.cuenta_codigo ??
+      l?.code ??
+      l?.cuenta?.code ??
+      l?.cuenta?.codigo ??
+      l?.account?.code ??
+      l?.account?.codigo ??
       "";
 
-    const cuenta_codigo = cuentaCodigo ? String(cuentaCodigo).trim() : "";
+    let cuenta_codigo = cuentaCodigo ? String(cuentaCodigo).trim() : "";
 
-    const side = String(l.side || "").toLowerCase().trim();
-    const monto = num(l.monto, 0);
+    // 2) si no hay code, intentar resolver por ID
+    const idCandidate =
+      l?.accountId ??
+      l?.account_id ??
+      l?.accountID ??
+      l?.cuentaId ??
+      l?.cuenta_id ??
+      l?.subcuentaId ??
+      l?.subcuenta_id ??
+      l?.account?._id ??
+      l?.cuenta?._id ??
+      null;
 
-    const debe = num(l.debit ?? l.debe ?? (side === "debit" ? monto : 0), 0);
-    const haber = num(l.credit ?? l.haber ?? (side === "credit" ? monto : 0), 0);
+    const sid = idCandidate ? String(idCandidate).trim() : "";
+    if (!cuenta_codigo && sid && byId[sid]?.code) {
+      cuenta_codigo = String(byId[sid].code || "").trim();
+    }
 
-    const memo = l.memo ?? l.descripcion ?? l.concepto ?? "";
+    // nombre: preferir el de la línea si viene, si no usar mapa
+    const nameFromLine =
+      l?.cuenta_nombre ??
+      l?.cuentaNombre ??
+      l?.accountName ??
+      l?.account_name ??
+      l?.cuenta?.name ??
+      l?.cuenta?.nombre ??
+      l?.account?.name ??
+      l?.account?.nombre ??
+      null;
+
+    const cuenta_nombre =
+      nameFromLine != null && String(nameFromLine).trim()
+        ? String(nameFromLine).trim()
+        : cuenta_codigo
+        ? byCode[cuenta_codigo] || (sid && byId[sid]?.name ? byId[sid].name : null)
+        : (sid && byId[sid]?.name ? byId[sid].name : null);
+
+    // montos: soportar varias formas
+    const side = String(l?.side || "").toLowerCase().trim();
+    const monto =
+      num(l?.monto, 0) ||
+      num(l?.amount, 0) ||
+      num(l?.importe, 0) ||
+      num(l?.valor, 0) ||
+      0;
+
+    const debe =
+      num(l?.debit, 0) ||
+      num(l?.debe, 0) ||
+      (side === "debit" ? monto : 0);
+
+    const haber =
+      num(l?.credit, 0) ||
+      num(l?.haber, 0) ||
+      (side === "credit" ? monto : 0);
+
+    const memo = l?.memo ?? l?.descripcion ?? l?.concepto ?? l?.description ?? "";
 
     return {
       cuenta_codigo: cuenta_codigo || null,
-      cuenta_nombre: cuenta_codigo ? accountNameMap[cuenta_codigo] || null : null,
+      cuenta_nombre: cuenta_nombre || null,
       debe,
       haber,
 
@@ -334,25 +468,18 @@ router.get("/", ensureAuth, async (req, res) => {
       .limit(limit)
       .lean();
 
-    const allCodes = [];
+    // ✅ juntar TODAS las líneas para resolver codes e ids
+    const allLines = [];
     for (const a of docs) {
-      const lines = a.lines || [];
-      for (const l of lines) {
-        const code =
-          l.accountCodigo ??
-          l.accountCode ??
-          l.cuentaCodigo ??
-          l.cuenta_codigo ??
-          l.code ??
-          null;
-        if (code) allCodes.push(String(code));
-      }
+      const lines = a.lines || a.detalle_asientos || a.detalles_asiento || [];
+      if (Array.isArray(lines) && lines.length) allLines.push(...lines);
     }
 
-    const accountNameMap = await getAccountNameMap(owner, allCodes);
+    // ✅ maps por code e id (no rompe si solo hay codes)
+    const accountMaps = await getAccountMaps(owner, allLines);
 
     const items = docs.map((a) => {
-      const ui = mapEntryForUI(a, accountNameMap);
+      const ui = mapEntryForUI(a, accountMaps);
       if (!includeDetalles) {
         delete ui.detalle_asientos;
         delete ui.detalles;
@@ -400,13 +527,9 @@ async function handleByNumero(req, res) {
 
     if (!asiento) return res.status(404).json({ ok: false, error: "NOT_FOUND" });
 
-    const codes = (asiento.lines || [])
-      .map((l) => l.accountCodigo ?? l.cuentaCodigo ?? l.cuenta_codigo ?? l.code ?? null)
-      .filter(Boolean)
-      .map(String);
-
-    const accountNameMap = await getAccountNameMap(owner, codes);
-    const asientoUI = mapEntryForUI(asiento, accountNameMap);
+    const rawLines = asiento.lines || asiento.detalle_asientos || asiento.detalles_asiento || [];
+    const accountMaps = await getAccountMaps(owner, rawLines);
+    const asientoUI = mapEntryForUI(asiento, accountMaps);
 
     // ✅ SHAPE COMPAT
     return res.json({ ok: true, data: asientoUI, asiento: asientoUI, item: asientoUI, ...asientoUI });
@@ -501,13 +624,10 @@ router.get("/by-transaccion", ensureAuth, async (req, res) => {
 
     if (!asiento) return res.status(404).json({ ok: false, error: "NOT_FOUND" });
 
-    const codes = (asiento.lines || [])
-      .map((l) => l.accountCodigo ?? l.cuentaCodigo ?? l.cuenta_codigo ?? l.code ?? null)
-      .filter(Boolean)
-      .map(String);
+    const rawLines = asiento.lines || asiento.detalle_asientos || asiento.detalles_asiento || [];
+    const accountMaps = await getAccountMaps(owner, rawLines);
 
-    const accountNameMap = await getAccountNameMap(owner, codes);
-    const asientoUI = mapEntryForUI(asiento, accountNameMap);
+    const asientoUI = mapEntryForUI(asiento, accountMaps);
 
     const numeroAsiento = asientoUI.numeroAsiento || asientoUI.numero_asiento || String(asiento._id);
 
@@ -543,13 +663,10 @@ router.get("/:id", ensureAuth, async (req, res) => {
     const asiento = await JournalEntry.findOne({ _id: id, owner }).lean();
     if (!asiento) return res.status(404).json({ ok: false, error: "NOT_FOUND" });
 
-    const codes = (asiento.lines || [])
-      .map((l) => l.accountCodigo ?? l.cuentaCodigo ?? l.cuenta_codigo ?? l.code ?? null)
-      .filter(Boolean)
-      .map(String);
+    const rawLines = asiento.lines || asiento.detalle_asientos || asiento.detalles_asiento || [];
+    const accountMaps = await getAccountMaps(owner, rawLines);
 
-    const accountNameMap = await getAccountNameMap(owner, codes);
-    const asientoUI = mapEntryForUI(asiento, accountNameMap);
+    const asientoUI = mapEntryForUI(asiento, accountMaps);
 
     // ✅ SHAPE COMPAT
     return res.json({ ok: true, data: asientoUI, asiento: asientoUI, item: asientoUI, ...asientoUI });
