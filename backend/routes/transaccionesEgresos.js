@@ -32,6 +32,7 @@ function normalizeTipoEgreso(v) {
   const s = asTrim(v).toLowerCase();
   if (["costo", "costos"].includes(s)) return "costo";
   if (["gasto", "gastos"].includes(s)) return "gasto";
+  if (["otro", "otros"].includes(s)) return "otro"; // ✅ soporte FE "otro"
   return s;
 }
 function normalizeTipoPago(v) {
@@ -109,15 +110,21 @@ function getTxProductField() {
 function mapTxForUI(doc) {
   const d = doc?.toObject ? doc.toObject() : doc;
 
-  const tipoResolved = d.tipoEgreso ?? d.tipo_egreso ?? d.tipo ?? d.tipoEgreso ?? d.tipo_egreso ?? "";
+  const subtipoResolved = d.subtipoEgreso ?? d.subtipo_egreso ?? "";
+  let tipoResolved = d.tipoEgreso ?? d.tipo_egreso ?? d.tipo ?? d.tipoEgreso ?? d.tipo_egreso ?? "";
   const estadoResolved = d.estado ?? d.status ?? "activo";
+
+  // ✅ Si es "otros_gastos", lo reflejamos como tipo_egreso = "otro" hacia el FE
+  if (String(subtipoResolved || "").toLowerCase() === "otros_gastos") {
+    tipoResolved = "otro";
+  }
 
   const item = {
     id: String(d._id),
     _id: d._id,
 
     tipo_egreso: tipoResolved,
-    subtipo_egreso: d.subtipoEgreso ?? d.subtipo_egreso ?? "",
+    subtipo_egreso: subtipoResolved,
 
     descripcion: d.descripcion ?? "",
 
@@ -258,23 +265,58 @@ function wantsForceProveedores2001(reqBody) {
 }
 
 /**
- * POST /api/egresos/transacciones
+ * Detecta "Otros gastos"
+ * - tipo_egreso: "otro"
+ * - subtipo_egreso: "otros_gastos"
+ */
+function isOtrosGastos(tipoEgresoRaw, subtipoEgreso) {
+  const t = String(tipoEgresoRaw || "").toLowerCase().trim();
+  const s = String(subtipoEgreso || "").toLowerCase().trim();
+  return t === "otro" || s === "otros_gastos";
+}
+
+/**
+ * POST /
  * Crea la transacción de egreso y (si existe el modelo) su asiento contable.
  */
 router.post("/", ensureAuth, async (req, res) => {
   try {
     const owner = req.user._id;
 
-    const tipoEgreso = normalizeTipoEgreso(req.body?.tipo_egreso ?? req.body?.tipoEgreso ?? req.body?.tipo);
+    const tipoEgresoRaw = normalizeTipoEgreso(req.body?.tipo_egreso ?? req.body?.tipoEgreso ?? req.body?.tipo);
     const subtipoEgreso = asTrim(req.body?.subtipo_egreso ?? req.body?.subtipoEgreso ?? "precargado");
-    const descripcion = asTrim(req.body?.descripcion);
+    const descripcion = asTrim(req.body?.descripcion ?? req.body?.concepto ?? req.body?.concept);
 
-    const cuentaCodigo = asTrim(req.body?.cuenta_codigo ?? req.body?.cuentaCodigo);
+    const otrosGastos = isOtrosGastos(tipoEgresoRaw, subtipoEgreso);
+
+    // ✅ Para storage/reportes: "Otros" se considera un "gasto"
+    const tipoEgreso = otrosGastos ? "gasto" : tipoEgresoRaw;
+
+    // ✅ cuenta_codigo: acepta aliases del FE
+    let cuentaCodigo = asTrim(
+      req.body?.cuenta_codigo ??
+        req.body?.cuentaCodigo ??
+        req.body?.cuentaPrincipalCodigo ??
+        req.body?.cuenta_principal_codigo
+    );
+
+    // ✅ Forzar cuenta 5204 para "Otros gastos"
+    if (otrosGastos) {
+      cuentaCodigo = "5204";
+    }
+
     const subcuentaId = toObjectIdOrNull(req.body?.subcuenta_id ?? req.body?.subcuentaId);
 
     const montoTotal = toNum(req.body?.monto_total ?? req.body?.montoTotal, 0);
-    const cantidad = toNum(req.body?.cantidad, 0);
-    const precioUnitario = toNum(req.body?.precio_unitario ?? req.body?.precioUnitario, 0);
+
+    // ✅ Para "otros_gastos" (no inventariados), FE no manda cantidad/precio_unitario.
+    //    Hacemos defaults seguros: cantidad=1, precio_unitario=monto_total
+    let cantidad = toNum(req.body?.cantidad, 0);
+    let precioUnitario = toNum(req.body?.precio_unitario ?? req.body?.precioUnitario, 0);
+    if (otrosGastos) {
+      cantidad = 1;
+      precioUnitario = montoTotal;
+    }
 
     const tipoPago = normalizeTipoPago(req.body?.tipo_pago ?? req.body?.tipoPago);
     const metodoPago = normalizeMetodoPago(req.body?.metodo_pago ?? req.body?.metodoPago);
@@ -302,7 +344,9 @@ router.post("/", ensureAuth, async (req, res) => {
 
     // ✅ Validaciones
     if (!["costo", "gasto"].includes(tipoEgreso)) {
-      return res.status(400).json({ ok: false, error: "VALIDATION", message: "tipo_egreso inválido (usa costo|gasto)." });
+      return res
+        .status(400)
+        .json({ ok: false, error: "VALIDATION", message: "tipo_egreso inválido (usa costo|gasto|otro)." });
     }
     if (!descripcion) {
       return res.status(400).json({ ok: false, error: "VALIDATION", message: "descripcion es requerida." });
@@ -313,14 +357,19 @@ router.post("/", ensureAuth, async (req, res) => {
     if (!(montoTotal > 0)) {
       return res.status(400).json({ ok: false, error: "VALIDATION", message: "monto_total debe ser > 0." });
     }
+
+    // ✅ Para "otros_gastos" ya forzamos cantidad/precio_unitario
     if (!(cantidad > 0)) {
       return res.status(400).json({ ok: false, error: "VALIDATION", message: "cantidad debe ser > 0." });
     }
     if (!(precioUnitario > 0)) {
       return res.status(400).json({ ok: false, error: "VALIDATION", message: "precio_unitario debe ser > 0." });
     }
+
     if (!["contado", "credito", "parcial"].includes(tipoPago)) {
-      return res.status(400).json({ ok: false, error: "VALIDATION", message: "tipo_pago inválido (contado|credito|parcial)." });
+      return res
+        .status(400)
+        .json({ ok: false, error: "VALIDATION", message: "tipo_pago inválido (contado|credito|parcial)." });
     }
 
     // Contado/parcial requieren método de pago
@@ -335,7 +384,12 @@ router.post("/", ensureAuth, async (req, res) => {
     }
 
     if (tipoPago === "parcial") {
-      if (!(montoPagado > 0) || !(montoPagado < montoTotal)) {
+      // ✅ Para parcial: pagado >0 y < total
+      const fijoPagado = toNum(
+        req.body?.monto_pagado ?? req.body?.montoPagado ?? req.body?.montoPagadoParcial ?? montoPagado,
+        0
+      );
+      if (!(fijoPagado > 0) || !(fijoPagado < montoTotal)) {
         return res.status(400).json({
           ok: false,
           error: "VALIDATION",
@@ -344,7 +398,7 @@ router.post("/", ensureAuth, async (req, res) => {
       }
     }
 
-    // ✅ Validar producto si viene
+    // ✅ Validar producto si viene (solo aplica si viene producto)
     if (productoEgresoId) {
       const productDoc = await ExpenseProduct.findOne({ _id: productoEgresoId, owner }).lean();
       if (!productDoc) {
@@ -356,7 +410,7 @@ router.post("/", ensureAuth, async (req, res) => {
       }
     }
 
-    // ✅ Normalizaciones finales
+    // ✅ Normalizaciones finales (pagos)
     const fixedMontoPagado = tipoPago === "contado" ? montoTotal : tipoPago === "parcial" ? montoPagado : 0;
     const fixedMontoPendiente =
       tipoPago === "contado" ? 0 : tipoPago === "parcial" ? Math.max(0, montoTotal - fixedMontoPagado) : montoTotal;
@@ -367,6 +421,8 @@ router.post("/", ensureAuth, async (req, res) => {
     const txPayload = {
       owner,
 
+      // Nota: mantenemos tipo/tipoEgreso en "gasto" para que entre en reportes,
+      // y el FE identifica "otro" por subtipoEgreso === "otros_gastos".
       tipo: tipoEgreso,
 
       tipoEgreso,
@@ -428,28 +484,21 @@ router.post("/", ensureAuth, async (req, res) => {
         });
       };
 
-      // (1) DEBE: gasto/costo
+      // (1) DEBE: gasto/costo (para otros_gastos ya forzamos cuentaCodigo=5204)
       pushLine({
         side: "debit",
         cuentaCodigo,
         monto: montoTotal,
-        memo: `Egreso (${tipoEgreso}) - ${descripcion}`,
+        memo: `Egreso (${subtipoEgreso || tipoEgreso}) - ${descripcion}`,
       });
 
       /**
-       * ✅ REGLA LIMPIA + SIN "CXP" EN TEXTO
-       *
-       * - Contado: acredita Caja/Bancos/Tarjeta (sale el dinero directo)
+       * ✅ REGLA LIMPIA:
+       * - Contado: acredita Caja/Bancos/Tarjeta
        * - Crédito: acredita Proveedores (2001)
-       * - Parcial: acredita pago (Caja/Bancos/Tarjeta) por lo pagado + Proveedores (2001) por lo pendiente
-       *
-       * Nota:
-       * - "forceProveedores2001" se usa para “Generales” y/o cuando tú lo pidas desde FE.
-       * - "isPrecargados" se conserva por si luego quieres comportamientos especiales,
-       *   pero NO obliga a meter 2001 en contado (eso fue el origen del “doble” asiento).
+       * - Parcial: acredita pago + Proveedores (pendiente)
        */
       if (tipoPago === "contado") {
-        // Contado: pagar directo (aunque sea precargado o general)
         pushLine({
           side: "credit",
           cuentaCodigo: creditInfo.cuentaCodigo,
@@ -457,15 +506,13 @@ router.post("/", ensureAuth, async (req, res) => {
           memo: `Pago contado (${creditInfo.tipo})`,
         });
       } else if (tipoPago === "credito") {
-        // Crédito: todo a Proveedores (2001)
         pushLine({
           side: "credit",
           cuentaCodigo: PROVEEDORES,
           monto: montoTotal,
-          memo: `Proveedores (${PROVEEDORES}) - a crédito`,
+          memo: `A crédito - Proveedores (${PROVEEDORES})`,
         });
       } else if (tipoPago === "parcial") {
-        // Parcial: pagado a caja/bancos/tarjeta + pendiente a Proveedores (2001)
         if (fixedMontoPagado > 0) {
           pushLine({
             side: "credit",
@@ -475,8 +522,6 @@ router.post("/", ensureAuth, async (req, res) => {
           });
         }
         if (fixedMontoPendiente > 0) {
-          // ✅ aquí es donde “Generales” debe reflejar el saldo pendiente en 2001
-          // (igual aplica para precargados si lo registras como parcial)
           pushLine({
             side: "credit",
             cuentaCodigo: PROVEEDORES,
@@ -486,7 +531,7 @@ router.post("/", ensureAuth, async (req, res) => {
         }
       }
 
-      // ✅ Concepto: que SI se persista y lo pueda leer el UI
+      // ✅ Concepto
       const conceptText = `Egreso: ${descripcion}`;
 
       asiento = await JournalEntry.create({
@@ -503,17 +548,10 @@ router.post("/", ensureAuth, async (req, res) => {
         source_id: created._id,
 
         lines,
-
-        // Nota: NO guardamos flags (tu schema actual no tiene esos campos).
-        // forceProveedores2001 / isPrecargados se usan solo para decidir el asiento.
-        _debug: undefined, // no se guarda realmente (solo para dejar claro que no hay meta)
       });
 
       // ✅ CLAVE E2E: guardar el asientoId en la transacción
-      await ExpenseTransaction.updateOne(
-        { _id: created._id, owner },
-        { $set: { asientoId: asiento._id } }
-      );
+      await ExpenseTransaction.updateOne({ _id: created._id, owner }, { $set: { asientoId: asiento._id } });
 
       // refrescar created (para que el mapper incluya asientoId)
       created.asientoId = asiento._id;
@@ -527,10 +565,10 @@ router.post("/", ensureAuth, async (req, res) => {
       numero_asiento: numeroAsiento,
 
       // ✅ FE-friendly
-      asiento_id: asiento ? String(asiento._id) : (item.asiento_id || null),
-      asientoId: asiento ? String(asiento._id) : (item.asiento_id || null),
+      asiento_id: asiento ? String(asiento._id) : item.asiento_id || null,
+      asientoId: asiento ? String(asiento._id) : item.asiento_id || null,
 
-      // ✅ opcional: mandar un preview del asiento (evita fetch extra)
+      // ✅ opcional: preview
       asiento: asiento
         ? {
             _id: asiento._id,
@@ -541,10 +579,11 @@ router.post("/", ensureAuth, async (req, res) => {
           }
         : null,
 
-      // debug útil para QA (no rompe FE)
       meta: {
         isPrecargados,
         forceProveedores2001,
+        otrosGastos,
+        forcedCuentaCodigo: otrosGastos ? "5204" : null,
       },
 
       data: item,
@@ -558,7 +597,7 @@ router.post("/", ensureAuth, async (req, res) => {
 });
 
 /**
- * GET /api/egresos/transacciones?estado=activo|cancelado&start=YYYY-MM-DD&end=YYYY-MM-DD&tipo=costo|gasto&limit=200
+ * GET /?estado=activo|cancelado&start=YYYY-MM-DD&end=YYYY-MM-DD&tipo=costo|gasto&limit=200
  */
 router.get("/", ensureAuth, async (req, res) => {
   try {
@@ -571,8 +610,7 @@ router.get("/", ensureAuth, async (req, res) => {
     const tipo = normalizeTipoEgreso(req.query.tipo);
     const estado = normalizeEstado(req.query.estado);
 
-    const includeCancelados =
-      String(req.query.include_cancelados ?? req.query.includeCancelados ?? "0").trim() === "1";
+    const includeCancelados = String(req.query.include_cancelados ?? req.query.includeCancelados ?? "0").trim() === "1";
 
     const limitRaw = Number(req.query.limit ?? 200);
     const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), 500) : 200;
@@ -589,6 +627,8 @@ router.get("/", ensureAuth, async (req, res) => {
       }
     }
 
+    // ✅ Nota: aquí el filtro solo aplica a costo/gasto.
+    // "Otros gastos" se guarda como tipoEgreso="gasto", así que entra cuando tipo=gasto.
     if (tipo && ["costo", "gasto"].includes(tipo)) {
       filter.$or = [{ tipoEgreso: tipo }, { tipo: tipo }];
     }
@@ -599,10 +639,7 @@ router.get("/", ensureAuth, async (req, res) => {
       filter.estado = { $ne: "cancelado" };
     }
 
-    const docs = await ExpenseTransaction.find(filter)
-      .sort({ fecha: -1, createdAt: -1 })
-      .limit(limit)
-      .lean();
+    const docs = await ExpenseTransaction.find(filter).sort({ fecha: -1, createdAt: -1 }).limit(limit).lean();
 
     const items = docs.map(mapTxForUI);
 
@@ -615,7 +652,7 @@ router.get("/", ensureAuth, async (req, res) => {
 });
 
 /**
- * GET /api/egresos/transacciones/:id
+ * GET /:id
  */
 router.get("/:id", ensureAuth, async (req, res) => {
   try {
