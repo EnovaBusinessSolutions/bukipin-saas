@@ -258,7 +258,6 @@ function isPrecargadosFlow(subtipoEgreso, reqBody) {
 
 /**
  * Detecta si el frontend pide forzar Proveedores(2001)
- * (tu RegistroEgresosGenerales ya manda force_proveedores_2001:true)
  */
 function wantsForceProveedores2001(reqBody) {
   return reqBody?.force_proveedores_2001 === true || reqBody?.forceProveedores2001 === true;
@@ -310,7 +309,7 @@ router.post("/", ensureAuth, async (req, res) => {
     const montoTotal = toNum(req.body?.monto_total ?? req.body?.montoTotal, 0);
 
     // ✅ Para "otros_gastos" (no inventariados), FE no manda cantidad/precio_unitario.
-    //    Hacemos defaults seguros: cantidad=1, precio_unitario=monto_total
+    //    Defaults seguros: cantidad=1, precio_unitario=monto_total
     let cantidad = toNum(req.body?.cantidad, 0);
     let precioUnitario = toNum(req.body?.precio_unitario ?? req.body?.precioUnitario, 0);
     if (otrosGastos) {
@@ -322,7 +321,6 @@ router.post("/", ensureAuth, async (req, res) => {
     const metodoPago = normalizeMetodoPago(req.body?.metodo_pago ?? req.body?.metodoPago);
 
     const montoPagado = toNum(req.body?.monto_pagado ?? req.body?.montoPagado, 0);
-    const montoPendiente = toNum(req.body?.monto_pendiente ?? req.body?.montoPendiente, 0);
 
     const fechaVencimiento = isoDateOrNull(req.body?.fecha_vencimiento ?? req.body?.fechaVencimiento);
     const fecha = isoDateOrNull(req.body?.fecha) || new Date();
@@ -357,15 +355,12 @@ router.post("/", ensureAuth, async (req, res) => {
     if (!(montoTotal > 0)) {
       return res.status(400).json({ ok: false, error: "VALIDATION", message: "monto_total debe ser > 0." });
     }
-
-    // ✅ Para "otros_gastos" ya forzamos cantidad/precio_unitario
     if (!(cantidad > 0)) {
       return res.status(400).json({ ok: false, error: "VALIDATION", message: "cantidad debe ser > 0." });
     }
     if (!(precioUnitario > 0)) {
       return res.status(400).json({ ok: false, error: "VALIDATION", message: "precio_unitario debe ser > 0." });
     }
-
     if (!["contado", "credito", "parcial"].includes(tipoPago)) {
       return res
         .status(400)
@@ -384,12 +379,7 @@ router.post("/", ensureAuth, async (req, res) => {
     }
 
     if (tipoPago === "parcial") {
-      // ✅ Para parcial: pagado >0 y < total
-      const fijoPagado = toNum(
-        req.body?.monto_pagado ?? req.body?.montoPagado ?? req.body?.montoPagadoParcial ?? montoPagado,
-        0
-      );
-      if (!(fijoPagado > 0) || !(fijoPagado < montoTotal)) {
+      if (!(montoPagado > 0) || !(montoPagado < montoTotal)) {
         return res.status(400).json({
           ok: false,
           error: "VALIDATION",
@@ -420,9 +410,6 @@ router.post("/", ensureAuth, async (req, res) => {
     // ✅ Construcción del documento (camelCase canonical)
     const txPayload = {
       owner,
-
-      // Nota: mantenemos tipo/tipoEgreso en "gasto" para que entre en reportes,
-      // y el FE identifica "otro" por subtipoEgreso === "otros_gastos".
       tipo: tipoEgreso,
 
       tipoEgreso,
@@ -454,7 +441,6 @@ router.post("/", ensureAuth, async (req, res) => {
       comentarios: comentarios || null,
 
       numeroAsiento,
-      // asientoId se setea después (cuando creemos el asiento)
     };
 
     const txProductField = getTxProductField();
@@ -465,12 +451,16 @@ router.post("/", ensureAuth, async (req, res) => {
     // ✅ Crear asiento contable (si existe modelo)
     let asiento = null;
     if (JournalEntry) {
-      const PROVEEDORES = process.env.CTA_CXP || "2001"; // 2001 Proveedores
+      const PROVEEDORES_2001 = process.env.CTA_CXP || "2001"; // default
+      const OTROS_ACREEDORES_2003 = process.env.CTA_OTROS_ACREEDORES || "2003"; // ✅ regla otros gastos
+
+      // ✅ Regla: SOLO Otros Gastos + (credito|parcial) => 2003
+      const cuentaPendiente =
+        otrosGastos && (tipoPago === "credito" || tipoPago === "parcial") ? OTROS_ACREEDORES_2003 : PROVEEDORES_2001;
+
       const creditInfo = resolveCreditAccountByMetodoPago(metodoPago);
 
       const lines = [];
-
-      // ✅ helper: SOLO fields que tu JournalEntry HOY sí persiste (accountCodigo/debit/credit/memo)
       const pushLine = ({ side, cuentaCodigo: code, monto, memo }) => {
         const m = toNum(monto, 0);
         const s = String(side || "").toLowerCase().trim();
@@ -492,13 +482,9 @@ router.post("/", ensureAuth, async (req, res) => {
         memo: `Egreso (${subtipoEgreso || tipoEgreso}) - ${descripcion}`,
       });
 
-      /**
-       * ✅ REGLA LIMPIA:
-       * - Contado: acredita Caja/Bancos/Tarjeta
-       * - Crédito: acredita Proveedores (2001)
-       * - Parcial: acredita pago + Proveedores (pendiente)
-       */
+      // (2) HABER según pago
       if (tipoPago === "contado") {
+        // Contado: pagar directo (Caja/Bancos/Tarjeta)
         pushLine({
           side: "credit",
           cuentaCodigo: creditInfo.cuentaCodigo,
@@ -506,13 +492,18 @@ router.post("/", ensureAuth, async (req, res) => {
           memo: `Pago contado (${creditInfo.tipo})`,
         });
       } else if (tipoPago === "credito") {
+        // Crédito: TODO a cuenta pendiente (2003 para otros gastos / 2001 en resto)
         pushLine({
           side: "credit",
-          cuentaCodigo: PROVEEDORES,
+          cuentaCodigo: cuentaPendiente,
           monto: montoTotal,
-          memo: `A crédito - Proveedores (${PROVEEDORES})`,
+          memo:
+            cuentaPendiente === OTROS_ACREEDORES_2003
+              ? `A crédito - Otros acreedores (${cuentaPendiente})`
+              : `A crédito - Proveedores (${cuentaPendiente})`,
         });
       } else if (tipoPago === "parcial") {
+        // Parcial: pagado directo + pendiente a cuenta pendiente (2003 para otros gastos)
         if (fixedMontoPagado > 0) {
           pushLine({
             side: "credit",
@@ -524,14 +515,16 @@ router.post("/", ensureAuth, async (req, res) => {
         if (fixedMontoPendiente > 0) {
           pushLine({
             side: "credit",
-            cuentaCodigo: PROVEEDORES,
+            cuentaCodigo: cuentaPendiente,
             monto: fixedMontoPendiente,
-            memo: `Saldo pendiente - Proveedores (${PROVEEDORES})`,
+            memo:
+              cuentaPendiente === OTROS_ACREEDORES_2003
+                ? `Saldo pendiente - Otros acreedores (${cuentaPendiente})`
+                : `Saldo pendiente - Proveedores (${cuentaPendiente})`,
           });
         }
       }
 
-      // ✅ Concepto
       const conceptText = `Egreso: ${descripcion}`;
 
       asiento = await JournalEntry.create({
@@ -543,17 +536,13 @@ router.post("/", ensureAuth, async (req, res) => {
         source: "egreso",
         sourceId: created._id,
 
-        // compat (si el schema lo soporta, se guarda; si no, se ignora)
         transaccionId: created._id,
         source_id: created._id,
 
         lines,
       });
 
-      // ✅ CLAVE E2E: guardar el asientoId en la transacción
       await ExpenseTransaction.updateOne({ _id: created._id, owner }, { $set: { asientoId: asiento._id } });
-
-      // refrescar created (para que el mapper incluya asientoId)
       created.asientoId = asiento._id;
     }
 
@@ -564,11 +553,9 @@ router.post("/", ensureAuth, async (req, res) => {
       egreso_id: String(created._id),
       numero_asiento: numeroAsiento,
 
-      // ✅ FE-friendly
       asiento_id: asiento ? String(asiento._id) : item.asiento_id || null,
       asientoId: asiento ? String(asiento._id) : item.asiento_id || null,
 
-      // ✅ opcional: preview
       asiento: asiento
         ? {
             _id: asiento._id,
@@ -584,6 +571,7 @@ router.post("/", ensureAuth, async (req, res) => {
         forceProveedores2001,
         otrosGastos,
         forcedCuentaCodigo: otrosGastos ? "5204" : null,
+        reglaPendienteOtrosGastos: otrosGastos ? "credito/parcial => 2003" : null,
       },
 
       data: item,
@@ -627,8 +615,7 @@ router.get("/", ensureAuth, async (req, res) => {
       }
     }
 
-    // ✅ Nota: aquí el filtro solo aplica a costo/gasto.
-    // "Otros gastos" se guarda como tipoEgreso="gasto", así que entra cuando tipo=gasto.
+    // "Otros gastos" se guarda como "gasto", así que entra aquí cuando tipo=gasto.
     if (tipo && ["costo", "gasto"].includes(tipo)) {
       filter.$or = [{ tipoEgreso: tipo }, { tipo: tipo }];
     }
