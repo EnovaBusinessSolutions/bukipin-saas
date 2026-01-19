@@ -39,6 +39,9 @@ const ExpenseTransactionSchema = new mongoose.Schema(
     subcuentaId: { type: mongoose.Schema.Types.ObjectId, ref: "Account", default: null, index: true },
     numeroAsiento: { type: String, default: null, index: true },
 
+    // ✅ Link directo al asiento (CLAVE para que “Registros Contables” funcione E2E)
+    asientoId: { type: mongoose.Schema.Types.ObjectId, ref: "JournalEntry", default: null, index: true },
+
     // ✅ Pago
     tipoPago: { type: String, enum: ["contado", "credito", "parcial"], default: "contado", index: true },
     metodoPago: { type: String, default: null, trim: true, index: true },
@@ -76,6 +79,9 @@ ExpenseTransactionSchema.index({ owner: 1, tipo: 1, fecha: -1 });
 ExpenseTransactionSchema.index({ owner: 1, productoId: 1, fecha: -1 });
 ExpenseTransactionSchema.index({ owner: 1, numeroAsiento: 1 }, { unique: true, sparse: true });
 ExpenseTransactionSchema.index({ owner: 1, numeroAsientoReversion: 1 }, { sparse: true });
+
+// ✅ Index extra (lookup directo del asiento desde la transacción)
+ExpenseTransactionSchema.index({ owner: 1, asientoId: 1 });
 
 // =============================
 // ✅ Normalizaciones automáticas

@@ -36,9 +36,7 @@ function dayEnd(d) {
 }
 
 async function getAccountNameMap(owner, codes) {
-  const unique = Array.from(
-    new Set((codes || []).filter(Boolean).map((c) => String(c).trim()))
-  );
+  const unique = Array.from(new Set((codes || []).filter(Boolean).map((c) => String(c).trim())));
   if (!unique.length) return {};
 
   const rows = await Account.find({ owner, code: { $in: unique } })
@@ -58,9 +56,9 @@ async function getAccountNameMap(owner, codes) {
  * asiento.detalles[] = { cuenta_codigo, cuenta_nombre, descripcion, debe, haber }
  *
  * Soporta líneas tipo:
- * - { accountCodigo, debit, credit, memo }            (JournalEntry actual)
+ * - { accountCodigo, debit, credit, memo }            (JournalEntry)
  * - { cuentaCodigo, debe, haber, descripcion }        (legacy)
- * - { side:"debit|credit", monto, cuentaCodigo }      (legacy)
+ * - { side:"debit|credit", monto, cuentaCodigo }      (egresos actuales)
  */
 function mapEntryForUI(entry, accountNameMap = {}) {
   const rawLines = entry.lines || entry.detalle_asientos || entry.detalles_asiento || [];
@@ -79,14 +77,8 @@ function mapEntryForUI(entry, accountNameMap = {}) {
     const side = String(l.side || "").toLowerCase().trim();
     const monto = num(l.monto, 0);
 
-    const debe = num(
-      l.debit ?? l.debe ?? (side === "debit" ? monto : 0),
-      0
-    );
-    const haber = num(
-      l.credit ?? l.haber ?? (side === "credit" ? monto : 0),
-      0
-    );
+    const debe = num(l.debit ?? l.debe ?? (side === "debit" ? monto : 0), 0);
+    const haber = num(l.credit ?? l.haber ?? (side === "credit" ? monto : 0), 0);
 
     const memo = l.memo ?? l.descripcion ?? l.concepto ?? "";
 
@@ -95,6 +87,9 @@ function mapEntryForUI(entry, accountNameMap = {}) {
       cuenta_nombre: cuenta_codigo ? accountNameMap[cuenta_codigo] || null : null,
       debe,
       haber,
+
+      // ✅ compat: algunos UIs esperan "descripcion" en detalle_asientos
+      descripcion: memo || "",
       memo: memo || "",
     };
   });
@@ -102,26 +97,32 @@ function mapEntryForUI(entry, accountNameMap = {}) {
   const detalles = detalle_asientos.map((d) => ({
     cuenta_codigo: d.cuenta_codigo,
     cuenta_nombre: d.cuenta_nombre,
-    descripcion: d.memo || "",
+    descripcion: d.descripcion || "",
     debe: d.debe,
     haber: d.haber,
   }));
 
-  const concepto =
-    entry.concept ??
-    entry.concepto ??
-    entry.descripcion ??
-    entry.memo ??
-    "";
+  const concepto = entry.concept ?? entry.concepto ?? entry.descripcion ?? entry.memo ?? "";
 
-  const numeroAsiento =
-    entry.numeroAsiento ??
-    entry.numero_asiento ??
-    entry.numero ??
-    null;
+  const numeroAsiento = entry.numeroAsiento ?? entry.numero_asiento ?? entry.numero ?? null;
 
-  const fechaReal =
-    entry.date ?? entry.fecha ?? entry.createdAt ?? entry.created_at ?? null;
+  // ✅ FECHA: soporta date/fecha
+  const fechaReal = entry.date ?? entry.fecha ?? entry.createdAt ?? entry.created_at ?? null;
+
+  // ✅ Fuente/source
+  const source = entry.source ?? entry.fuente ?? "";
+
+  // ✅ SourceId/transaccionId
+  const txId =
+    entry.sourceId
+      ? String(entry.sourceId)
+      : entry.transaccionId
+      ? String(entry.transaccionId)
+      : entry.source_id
+      ? String(entry.source_id)
+      : entry.transaccion_id
+      ? String(entry.transaccion_id)
+      : null;
 
   return {
     id: String(entry._id),
@@ -136,16 +137,10 @@ function mapEntryForUI(entry, accountNameMap = {}) {
     descripcion: concepto || "",
     concepto: concepto || "",
 
-    source: entry.source ?? entry.fuente ?? "",
-    transaccion_ingreso_id: entry.sourceId
-      ? String(entry.sourceId)
-      : entry.transaccionId
-      ? String(entry.transaccionId)
-      : entry.source_id
-      ? String(entry.source_id)
-      : entry.transaccion_id
-      ? String(entry.transaccion_id)
-      : null,
+    source,
+
+    // ✅ compat (no lo renombres aunque diga "ingreso", varias UIs ya lo usan así)
+    transaccion_ingreso_id: txId,
 
     detalle_asientos,
     detalles,
@@ -413,7 +408,8 @@ async function handleByNumero(req, res) {
     const accountNameMap = await getAccountNameMap(owner, codes);
     const asientoUI = mapEntryForUI(asiento, accountNameMap);
 
-    return res.json({ ok: true, data: asientoUI, asiento: asientoUI });
+    // ✅ SHAPE COMPAT
+    return res.json({ ok: true, data: asientoUI, asiento: asientoUI, item: asientoUI, ...asientoUI });
   } catch (e) {
     console.error("GET /api/asientos/by-numero error:", e);
     return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
@@ -441,7 +437,11 @@ router.get("/by-ref", ensureAuth, async (req, res) => {
 });
 
 /**
+ * ✅ CLAVE PARA EGRESOS/INGRESOS:
  * GET /api/asientos/by-transaccion?source=ingreso|egreso|...&id=XXXXXXXX
+ *
+ * - Si source viene vacío, hacemos fallback buscando solo por owner+sourceId.
+ * - Respuesta en SHAPE COMPAT (asientoUI plano)
  */
 router.get("/by-transaccion", ensureAuth, async (req, res) => {
   try {
@@ -450,19 +450,13 @@ router.get("/by-transaccion", ensureAuth, async (req, res) => {
     source = String(source || "").trim();
     id = String(id || "").trim();
 
-    if (!source || !id) {
+    if (!id) {
       return res.status(400).json({
         ok: false,
         error: "MISSING_PARAMS",
-        details: "source e id son requeridos",
+        details: "id es requerido",
       });
     }
-
-    const sourceAliases = new Set([source.toLowerCase()]);
-    if (source.toLowerCase() === "ingresos") sourceAliases.add("ingreso");
-    if (source.toLowerCase() === "ingreso") sourceAliases.add("ingresos");
-    if (source.toLowerCase() === "egresos") sourceAliases.add("egreso");
-    if (source.toLowerCase() === "egreso") sourceAliases.add("egresos");
 
     const owner = req.user._id;
 
@@ -471,27 +465,39 @@ router.get("/by-transaccion", ensureAuth, async (req, res) => {
       sourceIdCandidates.push(new mongoose.Types.ObjectId(id));
     }
 
-    const asiento =
-      (await JournalEntry.findOne({
-        owner,
-        source: { $in: Array.from(sourceAliases) },
-        sourceId: { $in: sourceIdCandidates },
-      }).sort({ createdAt: -1 }).lean()) ||
-      (await JournalEntry.findOne({
-        owner,
-        source: { $in: Array.from(sourceAliases) },
-        transaccionId: { $in: sourceIdCandidates },
-      }).sort({ createdAt: -1 }).lean()) ||
-      (await JournalEntry.findOne({
-        owner,
-        source: { $in: Array.from(sourceAliases) },
-        source_id: { $in: sourceIdCandidates },
-      }).sort({ createdAt: -1 }).lean()) ||
-      (await JournalEntry.findOne({
-        owner,
-        "references.source": { $in: Array.from(sourceAliases) },
-        "references.id": id,
-      }).sort({ createdAt: -1 }).lean());
+    // ✅ aliases (si source viene)
+    const sourceAliases = new Set();
+    if (source) {
+      sourceAliases.add(source.toLowerCase());
+      if (source.toLowerCase() === "ingresos") sourceAliases.add("ingreso");
+      if (source.toLowerCase() === "ingreso") sourceAliases.add("ingresos");
+      if (source.toLowerCase() === "egresos") sourceAliases.add("egreso");
+      if (source.toLowerCase() === "egreso") sourceAliases.add("egresos");
+    }
+
+    // ✅ builder: con source o sin source
+    const findBy = async (q) => JournalEntry.findOne(q).sort({ createdAt: -1 }).lean();
+
+    let asiento = null;
+
+    if (sourceAliases.size) {
+      const srcList = Array.from(sourceAliases);
+
+      asiento =
+        (await findBy({ owner, source: { $in: srcList }, sourceId: { $in: sourceIdCandidates } })) ||
+        (await findBy({ owner, source: { $in: srcList }, transaccionId: { $in: sourceIdCandidates } })) ||
+        (await findBy({ owner, source: { $in: srcList }, source_id: { $in: sourceIdCandidates } })) ||
+        (await findBy({ owner, "references.source": { $in: srcList }, "references.id": id }));
+    }
+
+    // ✅ fallback si no hubo source o no encontró
+    if (!asiento) {
+      asiento =
+        (await findBy({ owner, sourceId: { $in: sourceIdCandidates } })) ||
+        (await findBy({ owner, transaccionId: { $in: sourceIdCandidates } })) ||
+        (await findBy({ owner, source_id: { $in: sourceIdCandidates } })) ||
+        (await findBy({ owner, "references.id": id }));
+    }
 
     if (!asiento) return res.status(404).json({ ok: false, error: "NOT_FOUND" });
 
@@ -501,16 +507,19 @@ router.get("/by-transaccion", ensureAuth, async (req, res) => {
       .map(String);
 
     const accountNameMap = await getAccountNameMap(owner, codes);
-
     const asientoUI = mapEntryForUI(asiento, accountNameMap);
-    const numeroAsiento = asientoUI.numeroAsiento || String(asiento._id);
 
+    const numeroAsiento = asientoUI.numeroAsiento || asientoUI.numero_asiento || String(asiento._id);
+
+    // ✅ SHAPE COMPAT (MUY IMPORTANTE para FE)
     return res.json({
       ok: true,
-      data: { asiento: asientoUI, numeroAsiento, raw: asiento },
+      data: asientoUI,
       asiento: asientoUI,
+      item: asientoUI,
       numeroAsiento,
       asientos: [asientoUI],
+      ...asientoUI,
     });
   } catch (e) {
     console.error("GET /api/asientos/by-transaccion error:", e);
@@ -542,7 +551,8 @@ router.get("/:id", ensureAuth, async (req, res) => {
     const accountNameMap = await getAccountNameMap(owner, codes);
     const asientoUI = mapEntryForUI(asiento, accountNameMap);
 
-    return res.json({ ok: true, data: asientoUI, asiento: asientoUI });
+    // ✅ SHAPE COMPAT
+    return res.json({ ok: true, data: asientoUI, asiento: asientoUI, item: asientoUI, ...asientoUI });
   } catch (e) {
     console.error("GET /api/asientos/:id error:", e);
     return res.status(500).json({ ok: false, error: "SERVER_ERROR" });

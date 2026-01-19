@@ -167,10 +167,17 @@ function mapTxForUI(doc) {
 
     numero_asiento: d.numeroAsiento ?? d.numero_asiento ?? null,
 
+    // ✅ CLAVE: asiento ligado
+    asiento_id: d.asientoId ? String(d.asientoId) : d.asiento_id ? String(d.asiento_id) : null,
+
     // ✅ NUEVO: estado/cancelación
     estado: estadoResolved,
     motivo_cancelacion: d.motivoCancelacion ?? d.motivo_cancelacion ?? null,
-    cancelado_at: d.canceladoAt ? new Date(d.canceladoAt).toISOString() : d.cancelado_at ? new Date(d.cancelado_at).toISOString() : null,
+    cancelado_at: d.canceladoAt
+      ? new Date(d.canceladoAt).toISOString()
+      : d.cancelado_at
+      ? new Date(d.cancelado_at).toISOString()
+      : null,
     numero_asiento_reversion: d.numeroAsientoReversion ?? d.numero_asiento_reversion ?? null,
 
     created_at: d.createdAt ?? d.created_at ?? null,
@@ -191,6 +198,8 @@ function mapTxForUI(doc) {
   item.fechaVencimiento = item.fecha_vencimiento;
   item.proveedorId = item.proveedor_id;
   item.productoId = item.producto_egreso_id;
+
+  item.asientoId = item.asiento_id;
 
   item.motivoCancelacion = item.motivo_cancelacion;
   item.canceladoAt = item.cancelado_at;
@@ -307,6 +316,7 @@ router.post("/", ensureAuth, async (req, res) => {
       return res.status(400).json({ ok: false, error: "VALIDATION", message: "tipo_pago inválido (contado|credito|parcial)." });
     }
 
+    // Contado/parcial requieren método de pago
     if (tipoPago === "contado" || tipoPago === "parcial") {
       if (!metodoPago) {
         return res.status(400).json({
@@ -328,9 +338,8 @@ router.post("/", ensureAuth, async (req, res) => {
     }
 
     // ✅ Validar producto si viene
-    let productDoc = null;
     if (productoEgresoId) {
-      productDoc = await ExpenseProduct.findOne({ _id: productoEgresoId, owner }).lean();
+      const productDoc = await ExpenseProduct.findOne({ _id: productoEgresoId, owner }).lean();
       if (!productDoc) {
         return res.status(404).json({
           ok: false,
@@ -383,8 +392,7 @@ router.post("/", ensureAuth, async (req, res) => {
       comentarios: comentarios || null,
 
       numeroAsiento,
-
-      // ✅ estado por default (en schema) = activo
+      // asientoId se setea después (cuando creemos el asiento)
     };
 
     const txProductField = getTxProductField();
@@ -410,6 +418,7 @@ router.post("/", ensureAuth, async (req, res) => {
       });
 
       if (forceCxp2001) {
+        // ✅ Precargados siempre a 2001
         lines.push({
           side: "credit",
           cuentaCodigo: CXP,
@@ -418,6 +427,7 @@ router.post("/", ensureAuth, async (req, res) => {
           descripcion: `Precargados → Proveedores (CXP ${CXP})`,
         });
 
+        // Si hubo pago, se aplica contra 2001
         if (fixedMontoPagado > 0) {
           lines.push({
             side: "debit",
@@ -437,6 +447,7 @@ router.post("/", ensureAuth, async (req, res) => {
           });
         }
       } else {
+        // ✅ comportamiento normal
         if (tipoPago === "contado") {
           lines.push({
             side: "credit",
@@ -482,19 +493,32 @@ router.post("/", ensureAuth, async (req, res) => {
 
       asiento = await JournalEntry.create({
         owner,
+
+        // ✅ compat de source
         fuente: "egreso",
         source: "egreso",
+
+        // ✅ MUY IMPORTANTE: guardar sourceId (ya lo haces)
+        sourceId: created._id,
         transaccionId: created._id,
         source_id: created._id,
+
+        // ✅ números
         numero: numeroAsiento,
         numeroAsiento,
-        fecha,
+
+        // ✅ fecha/desc
+        date: fecha,          // <-- por si tu schema usa "date"
+        fecha,                // <-- por si tu schema usa "fecha"
         descripcion: `Egreso: ${descripcion}`,
+
         proveedorId: proveedorId || null,
         proveedorNombre: proveedorNombre || null,
+
         lines,
         totalDebe,
         totalHaber,
+
         meta: {
           tipoEgreso,
           subtipoEgreso,
@@ -505,6 +529,15 @@ router.post("/", ensureAuth, async (req, res) => {
           cxpCuenta: process.env.CTA_CXP || "2001",
         },
       });
+
+      // ✅ CLAVE E2E: guardar el asientoId en la transacción
+      await ExpenseTransaction.updateOne(
+        { _id: created._id, owner },
+        { $set: { asientoId: asiento._id } }
+      );
+
+      // refrescar created (para que el mapper incluya asientoId)
+      created.asientoId = asiento._id;
     }
 
     const item = mapTxForUI(created);
@@ -513,7 +546,22 @@ router.post("/", ensureAuth, async (req, res) => {
       ok: true,
       egreso_id: String(created._id),
       numero_asiento: numeroAsiento,
-      asiento_id: asiento ? String(asiento._id) : null,
+
+      // ✅ FE-friendly
+      asiento_id: asiento ? String(asiento._id) : (item.asiento_id || null),
+      asientoId: asiento ? String(asiento._id) : (item.asiento_id || null),
+
+      // ✅ opcional: mandar un preview del asiento (evita fetch extra)
+      asiento: asiento
+        ? {
+            _id: asiento._id,
+            id: String(asiento._id),
+            numeroAsiento: asiento.numeroAsiento ?? asiento.numero ?? null,
+            numero_asiento: asiento.numeroAsiento ?? asiento.numero ?? null,
+            source: asiento.source ?? asiento.fuente ?? "egreso",
+          }
+        : null,
+
       data: item,
       item,
       ...item,
@@ -556,14 +604,10 @@ router.get("/", ensureAuth, async (req, res) => {
       }
     }
 
-    // ✅ FIX: filtra por cualquiera de los dos campos (compat)
     if (tipo && ["costo", "gasto"].includes(tipo)) {
       filter.$or = [{ tipoEgreso: tipo }, { tipo: tipo }];
     }
 
-    // ✅ CRÍTICO: estado
-    // - si mandan estado=activo|cancelado, filtramos exacto
-    // - si NO mandan estado, por default EXCLUIMOS cancelados (a menos que include_cancelados=1)
     if (estado && ["activo", "cancelado"].includes(estado)) {
       filter.estado = estado;
     } else if (!includeCancelados) {
