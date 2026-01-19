@@ -291,7 +291,7 @@ router.post("/", ensureAuth, async (req, res) => {
 
     const comentarios = asTrim(req.body?.comentarios ?? "");
 
-    const forceCxp2001 = isPrecargadosFlow(subtipoEgreso, req.body);
+    const isPrecargados = isPrecargadosFlow(subtipoEgreso, req.body);
 
     // ✅ Validaciones
     if (!["costo", "gasto"].includes(tipoEgreso)) {
@@ -408,30 +408,17 @@ router.post("/", ensureAuth, async (req, res) => {
 
       const lines = [];
 
-      // ✅ Helper: GUARDA SHAPE CANONICAL + COMPAT (para que NUNCA se rompa el UI)
-      const pushLine = ({ side, cuentaCodigo: code, monto, descripcion: memoText, subcuentaId: subId, meta }) => {
+      // ✅ helper: SOLO fields que tu JournalEntry HOY sí persiste (accountCodigo/debit/credit/memo)
+      const pushLine = ({ side, cuentaCodigo: code, monto, memo }) => {
         const m = toNum(monto, 0);
         const s = String(side || "").toLowerCase().trim();
         const isDebit = s === "debit";
         const isCredit = s === "credit";
-
         lines.push({
-          // --- CANONICAL (lo que casi todo espera) ---
           accountCodigo: String(code || "").trim(),
           debit: isDebit ? m : 0,
           credit: isCredit ? m : 0,
-          memo: memoText || "",
-
-          // --- COMPAT (lo que tú ya estabas mandando) ---
-          side: isDebit ? "debit" : isCredit ? "credit" : "",
-          monto: m,
-          cuentaCodigo: String(code || "").trim(),
-          cuenta_codigo: String(code || "").trim(),
-
-          // --- extras (si existen en schema nuevo, se guardan; si no, se ignoran) ---
-          subcuentaId: subId || null,
-          descripcion: memoText || "",
-          meta: meta || {},
+          memo: memo || "",
         });
       };
 
@@ -439,84 +426,52 @@ router.post("/", ensureAuth, async (req, res) => {
       pushLine({
         side: "debit",
         cuentaCodigo,
-        subcuentaId: subcuentaId || null,
         monto: montoTotal,
-        descripcion: `Egreso (${tipoEgreso}) - ${descripcion}`,
+        memo: `Egreso (${tipoEgreso}) - ${descripcion}`,
       });
 
-      if (forceCxp2001) {
-        // ✅ Precargados siempre a 2001
+      /**
+       * ✅ CAMBIO “LIMPIO”:
+       * - Si es PRECARGADOS + CONTADO: NO pasa por Proveedores (2001). Va directo a Caja/Bancos/Tarjeta.
+       * - Si es PRECARGADOS + PARCIAL/CREDITO: sí usa 2001 para el saldo pendiente (lo normal).
+       *
+       * Esto evita el “doble movimiento” y elimina el texto de “CXP” cuando no hace falta.
+       */
+      if (tipoPago === "contado") {
+        // Contado (incluye precargados): pagar directo
+        pushLine({
+          side: "credit",
+          cuentaCodigo: creditInfo.cuentaCodigo,
+          monto: montoTotal,
+          memo: `Pago contado (${creditInfo.tipo})`,
+        });
+      } else if (tipoPago === "credito") {
+        // Crédito: todo a proveedores (2001)
         pushLine({
           side: "credit",
           cuentaCodigo: CXP,
-          subcuentaId: null,
           monto: montoTotal,
-          descripcion: `Precargados → Proveedores (CXP ${CXP})`,
+          memo: `Proveedores (${CXP}) - a crédito`,
         });
-
-        // Si hubo pago, se aplica contra 2001
+      } else if (tipoPago === "parcial") {
+        // Parcial: una parte se paga, el resto queda en proveedores (2001)
         if (fixedMontoPagado > 0) {
           pushLine({
-            side: "debit",
-            cuentaCodigo: CXP,
-            subcuentaId: null,
-            monto: fixedMontoPagado,
-            descripcion: `Aplicación de pago a CXP (${CXP})`,
-          });
-
-          pushLine({
             side: "credit",
             cuentaCodigo: creditInfo.cuentaCodigo,
-            subcuentaId: null,
             monto: fixedMontoPagado,
-            descripcion: `Pago (${creditInfo.tipo})`,
-            meta: creditInfo.meta || {},
+            memo: `Pago parcial (${creditInfo.tipo})`,
           });
         }
-      } else {
-        // ✅ comportamiento normal
-        if (tipoPago === "contado") {
-          pushLine({
-            side: "credit",
-            cuentaCodigo: creditInfo.cuentaCodigo,
-            subcuentaId: null,
-            monto: montoTotal,
-            descripcion: `Pago contado (${creditInfo.tipo})`,
-            meta: creditInfo.meta || {},
-          });
-        } else if (tipoPago === "credito") {
+        if (fixedMontoPendiente > 0) {
           pushLine({
             side: "credit",
             cuentaCodigo: CXP,
-            subcuentaId: null,
-            monto: montoTotal,
-            descripcion: `Egreso a crédito (CXP)`,
+            monto: fixedMontoPendiente,
+            memo: `Saldo pendiente - Proveedores (${CXP})`,
           });
-        } else if (tipoPago === "parcial") {
-          if (fixedMontoPagado > 0) {
-            pushLine({
-              side: "credit",
-              cuentaCodigo: creditInfo.cuentaCodigo,
-              subcuentaId: null,
-              monto: fixedMontoPagado,
-              descripcion: `Pago parcial (${creditInfo.tipo})`,
-              meta: creditInfo.meta || {},
-            });
-          }
-          if (fixedMontoPendiente > 0) {
-            pushLine({
-              side: "credit",
-              cuentaCodigo: CXP,
-              subcuentaId: null,
-              monto: fixedMontoPendiente,
-              descripcion: `Saldo pendiente (CXP)`,
-            });
-          }
         }
       }
-
-      const totalDebe = lines.reduce((a, l) => a + toNum(l.debit, 0), 0);
-      const totalHaber = lines.reduce((a, l) => a + toNum(l.credit, 0), 0);
 
       // ✅ Concepto: que SI se persista y lo pueda leer el UI
       const conceptText = `Egreso: ${descripcion}`;
@@ -537,6 +492,10 @@ router.post("/", ensureAuth, async (req, res) => {
         source_id: created._id,
 
         lines,
+
+        // Nota: “isPrecargados” no se guarda en el asiento hoy (tu schema no tiene meta),
+        // pero lo dejamos calculado arriba por si luego quieres usarlo para auditoría/UX.
+        // (No afecta nada si no lo usas.)
       });
 
       // ✅ CLAVE E2E: guardar el asientoId en la transacción
