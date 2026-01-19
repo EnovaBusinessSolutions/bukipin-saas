@@ -109,9 +109,7 @@ function getTxProductField() {
 function mapTxForUI(doc) {
   const d = doc?.toObject ? doc.toObject() : doc;
 
-  const tipoResolved =
-    d.tipoEgreso ?? d.tipo_egreso ?? d.tipo ?? d.tipoEgreso ?? d.tipo_egreso ?? "";
-
+  const tipoResolved = d.tipoEgreso ?? d.tipo_egreso ?? d.tipo ?? d.tipoEgreso ?? d.tipo_egreso ?? "";
   const estadoResolved = d.estado ?? d.status ?? "activo";
 
   const item = {
@@ -170,7 +168,7 @@ function mapTxForUI(doc) {
     // ✅ CLAVE: asiento ligado
     asiento_id: d.asientoId ? String(d.asientoId) : d.asiento_id ? String(d.asiento_id) : null,
 
-    // ✅ NUEVO: estado/cancelación
+    // ✅ estado/cancelación
     estado: estadoResolved,
     motivo_cancelacion: d.motivoCancelacion ?? d.motivo_cancelacion ?? null,
     cancelado_at: d.canceladoAt
@@ -252,6 +250,14 @@ function isPrecargadosFlow(subtipoEgreso, reqBody) {
 }
 
 /**
+ * Detecta si el frontend pide forzar Proveedores(2001)
+ * (tu RegistroEgresosGenerales ya manda force_proveedores_2001:true)
+ */
+function wantsForceProveedores2001(reqBody) {
+  return reqBody?.force_proveedores_2001 === true || reqBody?.forceProveedores2001 === true;
+}
+
+/**
  * POST /api/egresos/transacciones
  * Crea la transacción de egreso y (si existe el modelo) su asiento contable.
  */
@@ -292,6 +298,7 @@ router.post("/", ensureAuth, async (req, res) => {
     const comentarios = asTrim(req.body?.comentarios ?? "");
 
     const isPrecargados = isPrecargadosFlow(subtipoEgreso, req.body);
+    const forceProveedores2001 = wantsForceProveedores2001(req.body);
 
     // ✅ Validaciones
     if (!["costo", "gasto"].includes(tipoEgreso)) {
@@ -351,7 +358,6 @@ router.post("/", ensureAuth, async (req, res) => {
 
     // ✅ Normalizaciones finales
     const fixedMontoPagado = tipoPago === "contado" ? montoTotal : tipoPago === "parcial" ? montoPagado : 0;
-
     const fixedMontoPendiente =
       tipoPago === "contado" ? 0 : tipoPago === "parcial" ? Math.max(0, montoTotal - fixedMontoPagado) : montoTotal;
 
@@ -403,7 +409,7 @@ router.post("/", ensureAuth, async (req, res) => {
     // ✅ Crear asiento contable (si existe modelo)
     let asiento = null;
     if (JournalEntry) {
-      const CXP = process.env.CTA_CXP || "2001";
+      const PROVEEDORES = process.env.CTA_CXP || "2001"; // 2001 Proveedores
       const creditInfo = resolveCreditAccountByMetodoPago(metodoPago);
 
       const lines = [];
@@ -431,14 +437,19 @@ router.post("/", ensureAuth, async (req, res) => {
       });
 
       /**
-       * ✅ CAMBIO “LIMPIO”:
-       * - Si es PRECARGADOS + CONTADO: NO pasa por Proveedores (2001). Va directo a Caja/Bancos/Tarjeta.
-       * - Si es PRECARGADOS + PARCIAL/CREDITO: sí usa 2001 para el saldo pendiente (lo normal).
+       * ✅ REGLA LIMPIA + SIN "CXP" EN TEXTO
        *
-       * Esto evita el “doble movimiento” y elimina el texto de “CXP” cuando no hace falta.
+       * - Contado: acredita Caja/Bancos/Tarjeta (sale el dinero directo)
+       * - Crédito: acredita Proveedores (2001)
+       * - Parcial: acredita pago (Caja/Bancos/Tarjeta) por lo pagado + Proveedores (2001) por lo pendiente
+       *
+       * Nota:
+       * - "forceProveedores2001" se usa para “Generales” y/o cuando tú lo pidas desde FE.
+       * - "isPrecargados" se conserva por si luego quieres comportamientos especiales,
+       *   pero NO obliga a meter 2001 en contado (eso fue el origen del “doble” asiento).
        */
       if (tipoPago === "contado") {
-        // Contado (incluye precargados): pagar directo
+        // Contado: pagar directo (aunque sea precargado o general)
         pushLine({
           side: "credit",
           cuentaCodigo: creditInfo.cuentaCodigo,
@@ -446,15 +457,15 @@ router.post("/", ensureAuth, async (req, res) => {
           memo: `Pago contado (${creditInfo.tipo})`,
         });
       } else if (tipoPago === "credito") {
-        // Crédito: todo a proveedores (2001)
+        // Crédito: todo a Proveedores (2001)
         pushLine({
           side: "credit",
-          cuentaCodigo: CXP,
+          cuentaCodigo: PROVEEDORES,
           monto: montoTotal,
-          memo: `Proveedores (${CXP}) - a crédito`,
+          memo: `Proveedores (${PROVEEDORES}) - a crédito`,
         });
       } else if (tipoPago === "parcial") {
-        // Parcial: una parte se paga, el resto queda en proveedores (2001)
+        // Parcial: pagado a caja/bancos/tarjeta + pendiente a Proveedores (2001)
         if (fixedMontoPagado > 0) {
           pushLine({
             side: "credit",
@@ -464,11 +475,13 @@ router.post("/", ensureAuth, async (req, res) => {
           });
         }
         if (fixedMontoPendiente > 0) {
+          // ✅ aquí es donde “Generales” debe reflejar el saldo pendiente en 2001
+          // (igual aplica para precargados si lo registras como parcial)
           pushLine({
             side: "credit",
-            cuentaCodigo: CXP,
+            cuentaCodigo: PROVEEDORES,
             monto: fixedMontoPendiente,
-            memo: `Saldo pendiente - Proveedores (${CXP})`,
+            memo: `Saldo pendiente - Proveedores (${PROVEEDORES})`,
           });
         }
       }
@@ -478,8 +491,6 @@ router.post("/", ensureAuth, async (req, res) => {
 
       asiento = await JournalEntry.create({
         owner,
-
-        // ✅ CAMPOS CANONICAL del JournalEntry
         date: fecha,
         concept: conceptText,
         numeroAsiento,
@@ -487,15 +498,15 @@ router.post("/", ensureAuth, async (req, res) => {
         source: "egreso",
         sourceId: created._id,
 
-        // ✅ compat (si el schema lo soporta, se guarda; si no, se ignora)
+        // compat (si el schema lo soporta, se guarda; si no, se ignora)
         transaccionId: created._id,
         source_id: created._id,
 
         lines,
 
-        // Nota: “isPrecargados” no se guarda en el asiento hoy (tu schema no tiene meta),
-        // pero lo dejamos calculado arriba por si luego quieres usarlo para auditoría/UX.
-        // (No afecta nada si no lo usas.)
+        // Nota: NO guardamos flags (tu schema actual no tiene esos campos).
+        // forceProveedores2001 / isPrecargados se usan solo para decidir el asiento.
+        _debug: undefined, // no se guarda realmente (solo para dejar claro que no hay meta)
       });
 
       // ✅ CLAVE E2E: guardar el asientoId en la transacción
@@ -529,6 +540,12 @@ router.post("/", ensureAuth, async (req, res) => {
             source: asiento.source ?? asiento.fuente ?? "egreso",
           }
         : null,
+
+      // debug útil para QA (no rompe FE)
+      meta: {
+        isPrecargados,
+        forceProveedores2001,
+      },
 
       data: item,
       item,
