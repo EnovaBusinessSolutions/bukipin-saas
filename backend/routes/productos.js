@@ -39,6 +39,11 @@ function toBool(v, fallback = true) {
   return fallback;
 }
 
+// ✅ Evita regex injection y fallos por caracteres especiales
+function escapeRegex(str) {
+  return String(str || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 function normalizeOut(doc) {
   return {
     id: String(doc._id),
@@ -135,8 +140,12 @@ router.get("/", ensureAuth, async (req, res) => {
     const activo = boolFromQuery(req.query.activo);
     const cuentaCodigo = req.query.cuenta_codigo ? String(req.query.cuenta_codigo).trim() : null;
     const includeSubcuentas = boolFromQuery(req.query.include_subcuentas);
+
     const qText = req.query.q ? String(req.query.q).trim() : "";
-    const limit = Math.min(2000, Number(req.query.limit || 500));
+
+    let limit = Number(req.query.limit || 500);
+    if (!Number.isFinite(limit) || limit <= 0) limit = 500;
+    limit = Math.min(2000, limit);
 
     const q = { owner };
     const and = [];
@@ -156,14 +165,14 @@ router.get("/", ensureAuth, async (req, res) => {
           .select("code codigo")
           .lean();
 
-        const childCodes = children.map((a) => String(a.code ?? a.codigo ?? "").trim()).filter(Boolean);
+        const childCodes = children
+          .map((a) => String(a.code ?? a.codigo ?? "").trim())
+          .filter(Boolean);
+
         const codes = [cuentaCodigo, ...childCodes];
 
         and.push({
-          $or: [
-            { cuentaCodigo: { $in: codes } },
-            { accountCode: { $in: codes } },
-          ],
+          $or: [{ cuentaCodigo: { $in: codes } }, { accountCode: { $in: codes } }],
         });
       } else {
         and.push({
@@ -172,14 +181,15 @@ router.get("/", ensureAuth, async (req, res) => {
       }
     }
 
-    // búsqueda simple
+    // ✅ búsqueda segura
     if (qText) {
+      const rx = new RegExp(escapeRegex(qText), "i");
       and.push({
         $or: [
-          { nombre: { $regex: qText, $options: "i" } },
-          { name: { $regex: qText, $options: "i" } },
-          { descripcion: { $regex: qText, $options: "i" } },
-          { description: { $regex: qText, $options: "i" } },
+          { nombre: rx },
+          { name: rx },
+          { descripcion: rx },
+          { description: rx },
         ],
       });
     }
@@ -191,6 +201,38 @@ router.get("/", ensureAuth, async (req, res) => {
   } catch (err) {
     console.error("GET /api/productos error:", err);
     return res.status(500).json({ ok: false, message: "Error cargando productos" });
+  }
+});
+
+/**
+ * ✅ GET /api/productos/lookup?nombre=...
+ * Este endpoint lo está pidiendo tu frontend (según tu consola).
+ * Regresa un solo producto (o null) buscando por nombre (case-insensitive).
+ */
+router.get("/lookup", ensureAuth, async (req, res) => {
+  try {
+    const owner = req.user._id;
+
+    const nombre = req.query.nombre ? String(req.query.nombre).trim() : "";
+    const name = req.query.name ? String(req.query.name).trim() : ""; // compat opcional
+    const finalName = nombre || name;
+
+    if (!finalName) {
+      return res.status(400).json({ ok: false, message: "Falta el parámetro nombre." });
+    }
+
+    // match exacto (ignorando espacios, case-insensitive)
+    const rxExact = new RegExp(`^\\s*${escapeRegex(finalName)}\\s*$`, "i");
+
+    const doc = await Product.findOne({
+      owner,
+      $or: [{ nombre: rxExact }, { name: rxExact }],
+    }).lean();
+
+    return res.json({ ok: true, data: doc ? normalizeOut(doc) : null });
+  } catch (err) {
+    console.error("GET /api/productos/lookup error:", err);
+    return res.status(500).json({ ok: false, message: "Error buscando producto" });
   }
 });
 
