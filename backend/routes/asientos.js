@@ -303,6 +303,29 @@ router.get("/detalle", ensureAuth, async (req, res) => {
   try {
     const owner = req.user._id;
 
+    // ✅ Compat: aceptar start/end o from/to
+    const startRaw = req.query.start ?? req.query.from ?? null;
+    const endRaw = req.query.end ?? req.query.to ?? null;
+
+    // Si el param viene pero es inválido, sí es error (para no ocultar bugs)
+    if (startRaw && !parseYMD(startRaw)) {
+      return res.status(400).json({
+        ok: false,
+        error: "VALIDATION",
+        message: "Fecha 'start/from' inválida. Usa YYYY-MM-DD",
+      });
+    }
+    if (endRaw && !parseYMD(endRaw)) {
+      return res.status(400).json({
+        ok: false,
+        error: "VALIDATION",
+        message: "Fecha 'end/to' inválida. Usa YYYY-MM-DD",
+      });
+    }
+
+    const start = parseYMD(startRaw);
+    const end = parseYMD(endRaw);
+
     let cuentas = req.query.cuentas;
 
     if (Array.isArray(cuentas)) {
@@ -311,18 +334,30 @@ router.get("/detalle", ensureAuth, async (req, res) => {
       cuentas = String(cuentas || "").split(",");
     }
 
-    const codes = cuentas.map((c) => String(c || "").trim()).filter(Boolean);
+    let codes = (cuentas || [])
+      .map((c) => String(c || "").trim())
+      .filter(Boolean);
 
+    // ✅ NUEVO: si NO mandan cuentas (como Analítica de Egresos),
+    // inferimos las cuentas típicas de egresos del catálogo contable.
+    // (50xx costos, 51xx gastos, 52xx otros gastos)
     if (!codes.length) {
-      return res.status(400).json({
-        ok: false,
-        error: "VALIDATION",
-        message: "Parámetro 'cuentas' es requerido. Ej: ?cuentas=1001,1002",
-      });
+      const rows = await Account.find({
+        owner,
+        $or: [{ code: /^50/ }, { code: /^51/ }, { code: /^52/ }],
+      })
+        .select("code")
+        .lean();
+
+      codes = Array.from(
+        new Set((rows || []).map((r) => String(r.code || "").trim()).filter(Boolean))
+      );
     }
 
-    const start = parseYMD(req.query.start);
-    const end = parseYMD(req.query.end);
+    // ✅ Si aún no hay cuentas, NO rompas la UI: regresa vacío OK
+    if (!codes.length) {
+      return res.json({ ok: true, data: [], items: [], byCode: {} });
+    }
 
     const match = { owner };
     if (start || end) {
