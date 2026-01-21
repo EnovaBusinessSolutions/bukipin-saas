@@ -1,7 +1,6 @@
 // backend/routes/asientos.js
 const express = require("express");
 const router = express.Router();
-
 const mongoose = require("mongoose");
 const JournalEntry = require("../models/JournalEntry");
 const Account = require("../models/Account");
@@ -24,6 +23,7 @@ function toYMD(d) {
 function parseYMD(s) {
   const str = String(s || "").trim();
   if (!/^\d{4}-\d{2}-\d{2}$/.test(str)) return null;
+  // ojo: es local, pero para filtros diarios nos funciona bien si usamos dayEnd()
   const d = new Date(`${str}T00:00:00`);
   if (Number.isNaN(d.getTime())) return null;
   return d;
@@ -35,13 +35,20 @@ function dayEnd(d) {
   return e;
 }
 
+// ✅ Determinar el campo de fecha real en JournalEntry
+function pickDateField() {
+  const p = JournalEntry?.schema?.paths || {};
+  if (p.date) return "date";
+  if (p.fecha) return "fecha";
+  if (p.entryDate) return "entryDate";
+  return "createdAt";
+}
+
 async function getAccountNameMap(owner, codes) {
   const unique = Array.from(new Set((codes || []).filter(Boolean).map((c) => String(c).trim())));
   if (!unique.length) return {};
 
-  const rows = await Account.find({ owner, code: { $in: unique } })
-    .select("code name nombre")
-    .lean();
+  const rows = await Account.find({ owner, code: { $in: unique } }).select("code name nombre").lean();
 
   const map = {};
   for (const r of rows) {
@@ -51,12 +58,11 @@ async function getAccountNameMap(owner, codes) {
 }
 
 /**
- * ✅ NUEVO: Mapa por CODE y por ID (para cuando las líneas traen accountId pero NO traen code).
+ * ✅ NUEVO: Mapa por CODE y por ID
  */
 async function getAccountMaps(owner, rawLines) {
   const byCode = {};
   const byId = {};
-
   const lines = Array.isArray(rawLines) ? rawLines : [];
   const codes = [];
   const ids = [];
@@ -103,9 +109,7 @@ async function getAccountMaps(owner, rawLines) {
   if (uniqueCodes.length) or.push({ code: { $in: uniqueCodes } });
   if (uniqueIds.length) or.push({ _id: { $in: uniqueIds } });
 
-  const rows = await Account.find({ owner, $or: or })
-    .select("_id code name nombre")
-    .lean();
+  const rows = await Account.find({ owner, $or: or }).select("_id code name nombre").lean();
 
   for (const r of rows) {
     const code = String(r.code || "").trim();
@@ -120,9 +124,7 @@ async function getAccountMaps(owner, rawLines) {
 }
 
 /**
- * ✅ Shape EXACTO que tus UIs esperan:
- * asiento.descripcion
- * asiento.detalles[] = { cuenta_codigo, cuenta_nombre, descripcion, debe, haber }
+ * ✅ UI mapper (lo mantengo igual que tú lo tienes)
  */
 function mapEntryForUI(entry, accountMapsOrNameMap = {}) {
   const byCode = accountMapsOrNameMap?.byCode ? accountMapsOrNameMap.byCode : accountMapsOrNameMap;
@@ -156,6 +158,7 @@ function mapEntryForUI(entry, accountMapsOrNameMap = {}) {
       null;
 
     const sid = idCandidate ? String(idCandidate).trim() : "";
+
     if (!cuenta_codigo && sid && byId[sid]?.code) {
       cuenta_codigo = String(byId[sid].code || "").trim();
     }
@@ -175,8 +178,10 @@ function mapEntryForUI(entry, accountMapsOrNameMap = {}) {
       nameFromLine != null && String(nameFromLine).trim()
         ? String(nameFromLine).trim()
         : cuenta_codigo
-        ? byCode[cuenta_codigo] || (sid && byId[sid]?.name ? byId[sid].name : null)
-        : (sid && byId[sid]?.name ? byId[sid].name : null);
+          ? byCode[cuenta_codigo] || (sid && byId[sid]?.name ? byId[sid].name : null)
+          : sid && byId[sid]?.name
+            ? byId[sid].name
+            : null;
 
     const side = String(l?.side || "").toLowerCase().trim();
     const monto =
@@ -215,36 +220,29 @@ function mapEntryForUI(entry, accountMapsOrNameMap = {}) {
   const fechaReal = entry.date ?? entry.fecha ?? entry.createdAt ?? entry.created_at ?? null;
   const source = entry.source ?? entry.fuente ?? "";
 
-  const txId =
-    entry.sourceId
-      ? String(entry.sourceId)
-      : entry.transaccionId
+  const txId = entry.sourceId
+    ? String(entry.sourceId)
+    : entry.transaccionId
       ? String(entry.transaccionId)
       : entry.source_id
-      ? String(entry.source_id)
-      : entry.transaccion_id
-      ? String(entry.transaccion_id)
-      : null;
+        ? String(entry.source_id)
+        : entry.transaccion_id
+          ? String(entry.transaccion_id)
+          : null;
 
   return {
     id: String(entry._id),
     _id: entry._id,
-
     numeroAsiento,
     numero_asiento: numeroAsiento,
-
     asiento_fecha: fechaReal ? toYMD(fechaReal) : null,
     fecha: fechaReal,
-
     descripcion: concepto || "",
     concepto: concepto || "",
-
     source,
     transaccion_ingreso_id: txId,
-
     detalle_asientos,
     detalles,
-
     created_at: entry.createdAt ?? entry.created_at ?? null,
     updated_at: entry.updatedAt ?? entry.updated_at ?? null,
   };
@@ -259,293 +257,163 @@ router.get("/depreciaciones", ensureAuth, async (_req, res) => {
 });
 
 /**
- * ✅ Endpoint que tu UI/hook usan:
+ * ✅ Endpoint saldo por cuentas:
  * GET /api/asientos/detalle?cuentas=1001,1002&start=YYYY-MM-DD&end=YYYY-MM-DD
  *
- * Devuelve: [{ cuenta_codigo, cuenta_nombre, debe, haber, neto, saldo }]
+ * Devuelve: [{ cuenta_codigo, cuenta_nombre, debe, haber, neto }]
  *
- * ✅ FIX CRÍTICO:
- * - Si las líneas traen accountId (y no code), resolvemos code con $lookup a Account
- * - Soportamos variantes: accountCode, cuenta.code, account._id, etc.
- * - Soportamos asientos con campo date o fecha
+ * ✅ FIX E2E:
+ * - soporta líneas con code o con accountId
+ * - usa dateField real (date/fecha/createdAt)
  */
 router.get("/detalle", ensureAuth, async (req, res) => {
   try {
     const owner = req.user._id;
-    const ownerObjId = new mongoose.Types.ObjectId(String(owner));
+    const dateField = pickDateField();
 
-    // ✅ Compat: aceptar start/end o from/to
     const startRaw = req.query.start ?? req.query.from ?? null;
-    const endRaw = req.query.end ?? req.query.to ?? null;
+    const endRaw = req.query.end ?? req.query.to ?? req.query.until ?? null;
 
     if (startRaw && !parseYMD(startRaw)) {
-      return res.status(400).json({
-        ok: false,
-        error: "VALIDATION",
-        message: "Fecha 'start/from' inválida. Usa YYYY-MM-DD",
-      });
+      return res.status(400).json({ ok: false, error: "VALIDATION", message: "Fecha 'start/from' inválida. Usa YYYY-MM-DD" });
     }
     if (endRaw && !parseYMD(endRaw)) {
-      return res.status(400).json({
-        ok: false,
-        error: "VALIDATION",
-        message: "Fecha 'end/to' inválida. Usa YYYY-MM-DD",
-      });
+      return res.status(400).json({ ok: false, error: "VALIDATION", message: "Fecha 'end/to' inválida. Usa YYYY-MM-DD" });
     }
 
     const start = parseYMD(startRaw);
     const end = parseYMD(endRaw);
 
+    // cuentas=1001,1002
     let cuentas = req.query.cuentas;
-
     if (Array.isArray(cuentas)) {
       cuentas = cuentas.flatMap((x) => String(x).split(","));
     } else {
       cuentas = String(cuentas || "").split(",");
     }
 
-    let codes = (cuentas || [])
-      .map((c) => String(c || "").trim())
-      .filter(Boolean);
+    let codes = (cuentas || []).map((c) => String(c || "").trim()).filter(Boolean);
 
-    // ✅ Si NO mandan cuentas (otros paneles), inferimos 50xx/51xx/52xx
+    // Si no mandan cuentas, inferimos 50/51/52 (egresos)
     if (!codes.length) {
       const rows = await Account.find({
         owner,
         $or: [{ code: /^50/ }, { code: /^51/ }, { code: /^52/ }],
-      })
-        .select("code")
-        .lean();
+      }).select("code").lean();
 
-      codes = Array.from(
-        new Set((rows || []).map((r) => String(r.code || "").trim()).filter(Boolean))
-      );
+      codes = Array.from(new Set((rows || []).map((r) => String(r.code || "").trim()).filter(Boolean)));
     }
 
     if (!codes.length) {
       return res.json({ ok: true, data: [], items: [], byCode: {} });
     }
 
-    // ✅ Match por owner y rango, soportando date o fecha
-    const match = { owner: ownerObjId };
+    // Construir filtro base
+    const match = { owner };
     if (start || end) {
-      const range = {};
-      if (start) range.$gte = start;
-      if (end) range.$lte = dayEnd(end);
-
-      match.$or = [
-        { date: range },
-        { fecha: range },
-      ];
+      match[dateField] = {};
+      if (start) match[dateField].$gte = start;
+      if (end) match[dateField].$lte = dayEnd(end);
     }
 
-    const pipeline = [
-      { $match: match },
-      { $unwind: "$lines" },
+    // Traemos SOLO lo necesario (para calcular saldos bien aunque venga accountId sin code)
+    const docs = await JournalEntry.find(match).select(`${dateField} lines detalle_asientos detalles_asiento`).lean();
 
-      // 1) extraer code directo desde muchas variantes
-      {
-        $addFields: {
-          _codeDirect: {
-            $ifNull: [
-              "$lines.accountCodigo",
-              {
-                $ifNull: [
-                  "$lines.accountCode",
-                  {
-                    $ifNull: [
-                      "$lines.cuentaCodigo",
-                      {
-                        $ifNull: [
-                          "$lines.cuenta_codigo",
-                          {
-                            $ifNull: [
-                              "$lines.code",
-                              {
-                                $ifNull: [
-                                  "$lines.cuenta.code",
-                                  {
-                                    $ifNull: [
-                                      "$lines.cuenta.codigo",
-                                      {
-                                        $ifNull: [
-                                          "$lines.account.code",
-                                          "$lines.account.codigo",
-                                        ],
-                                      },
-                                    ],
-                                  },
-                                ],
-                              },
-                            ],
-                          },
-                        ],
-                      },
-                    ],
-                  },
-                ],
-              },
-            ],
-          },
+    // juntar líneas para resolver mapas
+    const allLines = [];
+    for (const e of docs) {
+      const lines = e.lines || e.detalle_asientos || e.detalles_asiento || [];
+      if (Array.isArray(lines) && lines.length) allLines.push(...lines);
+    }
 
-          // 2) extraer accountId desde muchas variantes
-          _accountId: {
-            $ifNull: [
-              "$lines.accountId",
-              {
-                $ifNull: [
-                  "$lines.account_id",
-                  {
-                    $ifNull: [
-                      "$lines.cuentaId",
-                      {
-                        $ifNull: [
-                          "$lines.cuenta_id",
-                          {
-                            $ifNull: [
-                              "$lines.account._id",
-                              "$lines.cuenta._id",
-                            ],
-                          },
-                        ],
-                      },
-                    ],
-                  },
-                ],
-              },
-            ],
-          },
+    const accountMaps = await getAccountMaps(owner, allLines);
+    const nameMap = await getAccountNameMap(owner, codes);
 
-          _side: { $toLower: { $ifNull: ["$lines.side", ""] } },
-          _debitRaw: { $ifNull: ["$lines.debit", { $ifNull: ["$lines.debe", null] }] },
-          _creditRaw: { $ifNull: ["$lines.credit", { $ifNull: ["$lines.haber", null] }] },
-          _montoRaw: { $ifNull: ["$lines.monto", { $ifNull: ["$lines.amount", 0] }] },
-        },
-      },
-
-      // 3) lookup a Accounts SOLO si hace falta (si _codeDirect viene vacío)
-      {
-        $lookup: {
-          from: "accounts",
-          let: { aid: "$_accountId" },
-          pipeline: [
-            {
-              $match: {
-                $expr: {
-                  $and: [
-                    { $eq: ["$owner", ownerObjId] },
-                    { $eq: ["$_id", { $toObjectId: "$$aid" }] },
-                  ],
-                },
-              },
-            },
-            { $project: { code: 1, name: 1, nombre: 1 } },
-          ],
-          as: "_acc",
-        },
-      },
-      { $addFields: { _acc0: { $arrayElemAt: ["$_acc", 0] } } },
-
-      // 4) code final (directo o resuelto por id)
-      {
-        $addFields: {
-          code: {
-            $trim: {
-              input: {
-                $ifNull: ["$_codeDirect", "$_acc0.code"],
-              },
-            },
-          },
-        },
-      },
-
-      // 5) quedarnos solo con códigos que nos pidieron
-      { $match: { code: { $in: codes } } },
-
-      // 6) calcular debe/haber robusto
-      {
-        $project: {
-          code: 1,
-          debe: {
-            $cond: [
-              { $ne: ["$_debitRaw", null] },
-              { $convert: { input: "$_debitRaw", to: "double", onError: 0, onNull: 0 } },
-              {
-                $cond: [
-                  { $eq: ["$_side", "debit"] },
-                  { $convert: { input: "$_montoRaw", to: "double", onError: 0, onNull: 0 } },
-                  0,
-                ],
-              },
-            ],
-          },
-          haber: {
-            $cond: [
-              { $ne: ["$_creditRaw", null] },
-              { $convert: { input: "$_creditRaw", to: "double", onError: 0, onNull: 0 } },
-              {
-                $cond: [
-                  { $eq: ["$_side", "credit"] },
-                  { $convert: { input: "$_montoRaw", to: "double", onError: 0, onNull: 0 } },
-                  0,
-                ],
-              },
-            ],
-          },
-        },
-      },
-
-      // 7) agrupar por cuenta
-      {
-        $group: {
-          _id: "$code",
-          debe: { $sum: "$debe" },
-          haber: { $sum: "$haber" },
-        },
-      },
-    ];
-
-    const agg = await JournalEntry.aggregate(pipeline);
-
-    const accountNameMap = await getAccountNameMap(owner, codes);
-
+    // init
     const byCode = {};
     for (const code of codes) {
       byCode[code] = {
         cuenta_codigo: code,
-        cuenta_nombre: accountNameMap[code] || null,
+        cuenta_nombre: nameMap[code] || accountMaps.byCode[code] || null,
         debe: 0,
         haber: 0,
         neto: 0,
-        saldo: 0,
       };
     }
 
-    for (const row of agg) {
-      const code = String(row._id || "").trim();
-      if (!code) continue;
+    // sumar
+    for (const e of docs) {
+      const lines = e.lines || e.detalle_asientos || e.detalles_asiento || [];
+      if (!Array.isArray(lines) || !lines.length) continue;
 
-      const debe = num(row.debe, 0);
-      const haber = num(row.haber, 0);
-      const neto = debe - haber;
+      for (const l of lines) {
+        // resolver cuenta code directo
+        let code =
+          l?.accountCodigo ??
+          l?.accountCode ??
+          l?.cuentaCodigo ??
+          l?.cuenta_codigo ??
+          l?.code ??
+          l?.cuenta?.code ??
+          l?.cuenta?.codigo ??
+          l?.account?.code ??
+          l?.account?.codigo ??
+          null;
 
-      byCode[code] = {
-        cuenta_codigo: code,
-        cuenta_nombre: accountNameMap[code] || null,
-        debe,
-        haber,
-        neto,
-        saldo: neto, // ✅ para que el hook lo use directo
-      };
+        code = code ? String(code).trim() : "";
+
+        // si no hay code, resolver por id
+        if (!code) {
+          const idCandidate =
+            l?.accountId ??
+            l?.account_id ??
+            l?.accountID ??
+            l?.cuentaId ??
+            l?.cuenta_id ??
+            l?.account?._id ??
+            l?.cuenta?._id ??
+            null;
+
+          const sid = idCandidate ? String(idCandidate).trim() : "";
+          if (sid && accountMaps.byId[sid]?.code) {
+            code = String(accountMaps.byId[sid].code || "").trim();
+          }
+        }
+
+        if (!code || !byCode[code]) continue;
+
+        const side = String(l?.side || "").toLowerCase().trim();
+        const monto =
+          num(l?.monto, 0) ||
+          num(l?.amount, 0) ||
+          num(l?.importe, 0) ||
+          num(l?.valor, 0) ||
+          0;
+
+        const debe = num(l?.debit, 0) || num(l?.debe, 0) || (side === "debit" ? monto : 0);
+        const haber = num(l?.credit, 0) || num(l?.haber, 0) || (side === "credit" ? monto : 0);
+
+        byCode[code].debe += debe;
+        byCode[code].haber += haber;
+      }
     }
 
-    const items = Object.values(byCode);
+    const items = Object.values(byCode).map((r) => ({
+      ...r,
+      neto: num(r.debe, 0) - num(r.haber, 0),
+    }));
 
     return res.json({
       ok: true,
       data: items,
       items,
       byCode,
+      meta: {
+        dateField,
+        start: start ? toYMD(start) : null,
+        end: end ? toYMD(end) : null,
+        codes_count: codes.length,
+      },
     });
   } catch (e) {
     console.error("GET /api/asientos/detalle error:", e);
@@ -554,18 +422,17 @@ router.get("/detalle", ensureAuth, async (req, res) => {
 });
 
 /**
+ * ✅ LO QUE TU UI ESTÁ PIDIENDO:
  * GET /api/asientos?start=YYYY-MM-DD&end=YYYY-MM-DD&include_detalles=1&limit=200
  */
 router.get("/", ensureAuth, async (req, res) => {
   try {
     const owner = req.user._id;
+    const dateField = pickDateField();
 
     const start = parseYMD(req.query.start);
     const end = parseYMD(req.query.end);
-
-    const includeDetalles =
-      String(req.query.include_detalles || req.query.includeDetalles || "0").trim() === "1";
-
+    const includeDetalles = String(req.query.include_detalles || req.query.includeDetalles || "0").trim() === "1";
     const wrap = String(req.query.wrap || "").trim() === "1";
 
     const limitRaw = Number(req.query.limit ?? 200);
@@ -573,15 +440,16 @@ router.get("/", ensureAuth, async (req, res) => {
 
     const match = { owner };
     if (start || end) {
-      match.date = {};
-      if (start) match.date.$gte = start;
-      if (end) match.date.$lte = dayEnd(end);
+      match[dateField] = {};
+      if (start) match[dateField].$gte = start;
+      if (end) match[dateField].$lte = dayEnd(end);
     }
 
-    const docs = await JournalEntry.find(match)
-      .sort({ date: -1, createdAt: -1 })
-      .limit(limit)
-      .lean();
+    const sortObj = {};
+    sortObj[dateField] = -1;
+    sortObj.createdAt = -1;
+
+    const docs = await JournalEntry.find(match).sort(sortObj).limit(limit).lean();
 
     const allLines = [];
     for (const a of docs) {
@@ -611,6 +479,7 @@ router.get("/", ensureAuth, async (req, res) => {
         include_detalles: includeDetalles ? 1 : 0,
         start: start ? toYMD(start) : null,
         end: end ? toYMD(end) : null,
+        dateField,
       },
     });
   } catch (e) {
@@ -626,11 +495,7 @@ async function handleByNumero(req, res) {
     const numero = String(req.query.numero_asiento ?? req.query.numeroAsiento ?? req.query.numero ?? "").trim();
 
     if (!numero) {
-      return res.status(400).json({
-        ok: false,
-        error: "VALIDATION",
-        message: "numero_asiento es requerido",
-      });
+      return res.status(400).json({ ok: false, error: "VALIDATION", message: "numero_asiento es requerido" });
     }
 
     const asiento =
@@ -644,7 +509,13 @@ async function handleByNumero(req, res) {
     const accountMaps = await getAccountMaps(owner, rawLines);
     const asientoUI = mapEntryForUI(asiento, accountMaps);
 
-    return res.json({ ok: true, data: asientoUI, asiento: asientoUI, item: asientoUI, ...asientoUI });
+    return res.json({
+      ok: true,
+      data: asientoUI,
+      asiento: asientoUI,
+      item: asientoUI,
+      ...asientoUI,
+    });
   } catch (e) {
     console.error("GET /api/asientos/by-numero error:", e);
     return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
@@ -663,26 +534,22 @@ router.get("/by-ref", ensureAuth, async (req, res) => {
 });
 
 /**
+ * ✅ CLAVE:
  * GET /api/asientos/by-transaccion?source=ingreso|egreso|...&id=XXXXXXXX
  */
 router.get("/by-transaccion", ensureAuth, async (req, res) => {
   try {
     let { source, id } = req.query;
-
     source = String(source || "").trim();
     id = String(id || "").trim();
 
     if (!id) {
-      return res.status(400).json({
-        ok: false,
-        error: "MISSING_PARAMS",
-        details: "id es requerido",
-      });
+      return res.status(400).json({ ok: false, error: "MISSING_PARAMS", details: "id es requerido" });
     }
 
     const owner = req.user._id;
-
     const sourceIdCandidates = [id];
+
     if (mongoose.Types.ObjectId.isValid(id)) {
       sourceIdCandidates.push(new mongoose.Types.ObjectId(id));
     }
@@ -702,7 +569,6 @@ router.get("/by-transaccion", ensureAuth, async (req, res) => {
 
     if (sourceAliases.size) {
       const srcList = Array.from(sourceAliases);
-
       asiento =
         (await findBy({ owner, source: { $in: srcList }, sourceId: { $in: sourceIdCandidates } })) ||
         (await findBy({ owner, source: { $in: srcList }, transaccionId: { $in: sourceIdCandidates } })) ||
@@ -722,7 +588,6 @@ router.get("/by-transaccion", ensureAuth, async (req, res) => {
 
     const rawLines = asiento.lines || asiento.detalle_asientos || asiento.detalles_asiento || [];
     const accountMaps = await getAccountMaps(owner, rawLines);
-
     const asientoUI = mapEntryForUI(asiento, accountMaps);
 
     const numeroAsiento = asientoUI.numeroAsiento || asientoUI.numero_asiento || String(asiento._id);
@@ -743,7 +608,7 @@ router.get("/by-transaccion", ensureAuth, async (req, res) => {
 });
 
 /**
- * GET /api/asientos/:id
+ * GET /api/asientos/:id (siempre al final)
  */
 router.get("/:id", ensureAuth, async (req, res) => {
   try {
@@ -759,10 +624,15 @@ router.get("/:id", ensureAuth, async (req, res) => {
 
     const rawLines = asiento.lines || asiento.detalle_asientos || asiento.detalles_asiento || [];
     const accountMaps = await getAccountMaps(owner, rawLines);
-
     const asientoUI = mapEntryForUI(asiento, accountMaps);
 
-    return res.json({ ok: true, data: asientoUI, asiento: asientoUI, item: asientoUI, ...asientoUI });
+    return res.json({
+      ok: true,
+      data: asientoUI,
+      asiento: asientoUI,
+      item: asientoUI,
+      ...asientoUI,
+    });
   } catch (e) {
     console.error("GET /api/asientos/:id error:", e);
     return res.status(500).json({ ok: false, error: "SERVER_ERROR" });

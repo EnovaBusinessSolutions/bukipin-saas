@@ -65,6 +65,8 @@ app.use("/api/contabilidad", require("./routes/contabilidad"));
 app.use("/api/movimientos-inventario", require("./routes/movimientosInventario"));
 app.use("/api/asientos", require("./routes/asientos"));
 app.use("/api/productos-egresos", require("./routes/productosEgresos"));
+app.use("/api/flujo-efectivo", require("./routes/flujoEfectivo"));
+
 
 // ✅ NUEVO: Proveedores (evita 404 del panel de egresos)
 app.use("/api/proveedores", require("./routes/proveedores"));
