@@ -52,7 +52,6 @@ async function getAccountNameMap(owner, codes) {
 
 /**
  * ✅ NUEVO: Mapa por CODE y por ID (para cuando las líneas traen accountId pero NO traen code).
- * Esto es lo que te está causando cuenta_codigo:null y debe/haber:0 en egresos.
  */
 async function getAccountMaps(owner, rawLines) {
   const byCode = {};
@@ -63,7 +62,6 @@ async function getAccountMaps(owner, rawLines) {
   const ids = [];
 
   for (const l of lines) {
-    // code por variantes
     const code =
       l?.accountCodigo ??
       l?.accountCode ??
@@ -78,15 +76,12 @@ async function getAccountMaps(owner, rawLines) {
 
     if (code) codes.push(String(code).trim());
 
-    // id por variantes
     const idCandidate =
       l?.accountId ??
       l?.account_id ??
       l?.accountID ??
       l?.cuentaId ??
       l?.cuenta_id ??
-      l?.subcuentaId ??
-      l?.subcuenta_id ??
       l?.account?._id ??
       l?.cuenta?._id ??
       null;
@@ -128,22 +123,14 @@ async function getAccountMaps(owner, rawLines) {
  * ✅ Shape EXACTO que tus UIs esperan:
  * asiento.descripcion
  * asiento.detalles[] = { cuenta_codigo, cuenta_nombre, descripcion, debe, haber }
- *
- * Soporta líneas tipo:
- * - { accountCodigo, debit, credit, memo }            (JournalEntry)
- * - { cuentaCodigo, debe, haber, descripcion }        (legacy)
- * - { side:"debit|credit", monto, cuentaCodigo }      (egresos)
- * - { accountId, debit/credit }                       (cuando guardas solo el id de la cuenta)
  */
 function mapEntryForUI(entry, accountMapsOrNameMap = {}) {
-  // ✅ compat: si te pasan el map viejo (code->name), funciona igual
   const byCode = accountMapsOrNameMap?.byCode ? accountMapsOrNameMap.byCode : accountMapsOrNameMap;
   const byId = accountMapsOrNameMap?.byId ? accountMapsOrNameMap.byId : {};
 
   const rawLines = entry.lines || entry.detalle_asientos || entry.detalles_asiento || [];
 
   const detalle_asientos = (rawLines || []).map((l) => {
-    // 1) intentar sacar code directo
     let cuentaCodigo =
       l?.accountCodigo ??
       l?.accountCode ??
@@ -158,15 +145,12 @@ function mapEntryForUI(entry, accountMapsOrNameMap = {}) {
 
     let cuenta_codigo = cuentaCodigo ? String(cuentaCodigo).trim() : "";
 
-    // 2) si no hay code, intentar resolver por ID
     const idCandidate =
       l?.accountId ??
       l?.account_id ??
       l?.accountID ??
       l?.cuentaId ??
       l?.cuenta_id ??
-      l?.subcuentaId ??
-      l?.subcuenta_id ??
       l?.account?._id ??
       l?.cuenta?._id ??
       null;
@@ -176,7 +160,6 @@ function mapEntryForUI(entry, accountMapsOrNameMap = {}) {
       cuenta_codigo = String(byId[sid].code || "").trim();
     }
 
-    // nombre: preferir el de la línea si viene, si no usar mapa
     const nameFromLine =
       l?.cuenta_nombre ??
       l?.cuentaNombre ??
@@ -195,7 +178,6 @@ function mapEntryForUI(entry, accountMapsOrNameMap = {}) {
         ? byCode[cuenta_codigo] || (sid && byId[sid]?.name ? byId[sid].name : null)
         : (sid && byId[sid]?.name ? byId[sid].name : null);
 
-    // montos: soportar varias formas
     const side = String(l?.side || "").toLowerCase().trim();
     const monto =
       num(l?.monto, 0) ||
@@ -204,15 +186,8 @@ function mapEntryForUI(entry, accountMapsOrNameMap = {}) {
       num(l?.valor, 0) ||
       0;
 
-    const debe =
-      num(l?.debit, 0) ||
-      num(l?.debe, 0) ||
-      (side === "debit" ? monto : 0);
-
-    const haber =
-      num(l?.credit, 0) ||
-      num(l?.haber, 0) ||
-      (side === "credit" ? monto : 0);
+    const debe = num(l?.debit, 0) || num(l?.debe, 0) || (side === "debit" ? monto : 0);
+    const haber = num(l?.credit, 0) || num(l?.haber, 0) || (side === "credit" ? monto : 0);
 
     const memo = l?.memo ?? l?.descripcion ?? l?.concepto ?? l?.description ?? "";
 
@@ -221,8 +196,6 @@ function mapEntryForUI(entry, accountMapsOrNameMap = {}) {
       cuenta_nombre: cuenta_nombre || null,
       debe,
       haber,
-
-      // ✅ compat: algunos UIs esperan "descripcion" en detalle_asientos
       descripcion: memo || "",
       memo: memo || "",
     };
@@ -237,16 +210,11 @@ function mapEntryForUI(entry, accountMapsOrNameMap = {}) {
   }));
 
   const concepto = entry.concept ?? entry.concepto ?? entry.descripcion ?? entry.memo ?? "";
-
   const numeroAsiento = entry.numeroAsiento ?? entry.numero_asiento ?? entry.numero ?? null;
 
-  // ✅ FECHA: soporta date/fecha
   const fechaReal = entry.date ?? entry.fecha ?? entry.createdAt ?? entry.created_at ?? null;
-
-  // ✅ Fuente/source
   const source = entry.source ?? entry.fuente ?? "";
 
-  // ✅ SourceId/transaccionId
   const txId =
     entry.sourceId
       ? String(entry.sourceId)
@@ -272,8 +240,6 @@ function mapEntryForUI(entry, accountMapsOrNameMap = {}) {
     concepto: concepto || "",
 
     source,
-
-    // ✅ compat (no lo renombres aunque diga "ingreso", varias UIs ya lo usan así)
     transaccion_ingreso_id: txId,
 
     detalle_asientos,
@@ -287,7 +253,6 @@ function mapEntryForUI(entry, accountMapsOrNameMap = {}) {
 /**
  * ✅ IMPORTANTE:
  * /depreciaciones DEBE ir ANTES de "/:id"
- * porque si no, Express interpreta "depreciaciones" como un id.
  */
 router.get("/depreciaciones", ensureAuth, async (_req, res) => {
   return res.json({ ok: true, data: [], items: [] });
@@ -297,17 +262,22 @@ router.get("/depreciaciones", ensureAuth, async (_req, res) => {
  * ✅ Endpoint que tu UI/hook usan:
  * GET /api/asientos/detalle?cuentas=1001,1002&start=YYYY-MM-DD&end=YYYY-MM-DD
  *
- * Devuelve: [{ cuenta_codigo, cuenta_nombre, debe, haber, neto }]
+ * Devuelve: [{ cuenta_codigo, cuenta_nombre, debe, haber, neto, saldo }]
+ *
+ * ✅ FIX CRÍTICO:
+ * - Si las líneas traen accountId (y no code), resolvemos code con $lookup a Account
+ * - Soportamos variantes: accountCode, cuenta.code, account._id, etc.
+ * - Soportamos asientos con campo date o fecha
  */
 router.get("/detalle", ensureAuth, async (req, res) => {
   try {
     const owner = req.user._id;
+    const ownerObjId = new mongoose.Types.ObjectId(String(owner));
 
     // ✅ Compat: aceptar start/end o from/to
     const startRaw = req.query.start ?? req.query.from ?? null;
     const endRaw = req.query.end ?? req.query.to ?? null;
 
-    // Si el param viene pero es inválido, sí es error (para no ocultar bugs)
     if (startRaw && !parseYMD(startRaw)) {
       return res.status(400).json({
         ok: false,
@@ -338,9 +308,7 @@ router.get("/detalle", ensureAuth, async (req, res) => {
       .map((c) => String(c || "").trim())
       .filter(Boolean);
 
-    // ✅ NUEVO: si NO mandan cuentas (como Analítica de Egresos),
-    // inferimos las cuentas típicas de egresos del catálogo contable.
-    // (50xx costos, 51xx gastos, 52xx otros gastos)
+    // ✅ Si NO mandan cuentas (otros paneles), inferimos 50xx/51xx/52xx
     if (!codes.length) {
       const rows = await Account.find({
         owner,
@@ -354,52 +322,158 @@ router.get("/detalle", ensureAuth, async (req, res) => {
       );
     }
 
-    // ✅ Si aún no hay cuentas, NO rompas la UI: regresa vacío OK
     if (!codes.length) {
       return res.json({ ok: true, data: [], items: [], byCode: {} });
     }
 
-    const match = { owner };
+    // ✅ Match por owner y rango, soportando date o fecha
+    const match = { owner: ownerObjId };
     if (start || end) {
-      match.date = {};
-      if (start) match.date.$gte = start;
-      if (end) match.date.$lte = dayEnd(end);
+      const range = {};
+      if (start) range.$gte = start;
+      if (end) range.$lte = dayEnd(end);
+
+      match.$or = [
+        { date: range },
+        { fecha: range },
+      ];
     }
 
-    const agg = await JournalEntry.aggregate([
+    const pipeline = [
       { $match: match },
       { $unwind: "$lines" },
+
+      // 1) extraer code directo desde muchas variantes
       {
-        $project: {
-          code: {
+        $addFields: {
+          _codeDirect: {
             $ifNull: [
               "$lines.accountCodigo",
               {
                 $ifNull: [
-                  "$lines.cuentaCodigo",
-                  { $ifNull: ["$lines.cuenta_codigo", "$lines.code"] },
+                  "$lines.accountCode",
+                  {
+                    $ifNull: [
+                      "$lines.cuentaCodigo",
+                      {
+                        $ifNull: [
+                          "$lines.cuenta_codigo",
+                          {
+                            $ifNull: [
+                              "$lines.code",
+                              {
+                                $ifNull: [
+                                  "$lines.cuenta.code",
+                                  {
+                                    $ifNull: [
+                                      "$lines.cuenta.codigo",
+                                      {
+                                        $ifNull: [
+                                          "$lines.account.code",
+                                          "$lines.account.codigo",
+                                        ],
+                                      },
+                                    ],
+                                  },
+                                ],
+                              },
+                            ],
+                          },
+                        ],
+                      },
+                    ],
+                  },
                 ],
               },
             ],
           },
-          side: { $toLower: { $ifNull: ["$lines.side", ""] } },
-          debitRaw: { $ifNull: ["$lines.debit", { $ifNull: ["$lines.debe", null] }] },
-          creditRaw: { $ifNull: ["$lines.credit", { $ifNull: ["$lines.haber", null] }] },
-          montoRaw: { $ifNull: ["$lines.monto", 0] },
+
+          // 2) extraer accountId desde muchas variantes
+          _accountId: {
+            $ifNull: [
+              "$lines.accountId",
+              {
+                $ifNull: [
+                  "$lines.account_id",
+                  {
+                    $ifNull: [
+                      "$lines.cuentaId",
+                      {
+                        $ifNull: [
+                          "$lines.cuenta_id",
+                          {
+                            $ifNull: [
+                              "$lines.account._id",
+                              "$lines.cuenta._id",
+                            ],
+                          },
+                        ],
+                      },
+                    ],
+                  },
+                ],
+              },
+            ],
+          },
+
+          _side: { $toLower: { $ifNull: ["$lines.side", ""] } },
+          _debitRaw: { $ifNull: ["$lines.debit", { $ifNull: ["$lines.debe", null] }] },
+          _creditRaw: { $ifNull: ["$lines.credit", { $ifNull: ["$lines.haber", null] }] },
+          _montoRaw: { $ifNull: ["$lines.monto", { $ifNull: ["$lines.amount", 0] }] },
         },
       },
+
+      // 3) lookup a Accounts SOLO si hace falta (si _codeDirect viene vacío)
+      {
+        $lookup: {
+          from: "accounts",
+          let: { aid: "$_accountId" },
+          pipeline: [
+            {
+              $match: {
+                $expr: {
+                  $and: [
+                    { $eq: ["$owner", ownerObjId] },
+                    { $eq: ["$_id", { $toObjectId: "$$aid" }] },
+                  ],
+                },
+              },
+            },
+            { $project: { code: 1, name: 1, nombre: 1 } },
+          ],
+          as: "_acc",
+        },
+      },
+      { $addFields: { _acc0: { $arrayElemAt: ["$_acc", 0] } } },
+
+      // 4) code final (directo o resuelto por id)
+      {
+        $addFields: {
+          code: {
+            $trim: {
+              input: {
+                $ifNull: ["$_codeDirect", "$_acc0.code"],
+              },
+            },
+          },
+        },
+      },
+
+      // 5) quedarnos solo con códigos que nos pidieron
       { $match: { code: { $in: codes } } },
+
+      // 6) calcular debe/haber robusto
       {
         $project: {
           code: 1,
           debe: {
             $cond: [
-              { $ne: ["$debitRaw", null] },
-              { $convert: { input: "$debitRaw", to: "double", onError: 0, onNull: 0 } },
+              { $ne: ["$_debitRaw", null] },
+              { $convert: { input: "$_debitRaw", to: "double", onError: 0, onNull: 0 } },
               {
                 $cond: [
-                  { $eq: ["$side", "debit"] },
-                  { $convert: { input: "$montoRaw", to: "double", onError: 0, onNull: 0 } },
+                  { $eq: ["$_side", "debit"] },
+                  { $convert: { input: "$_montoRaw", to: "double", onError: 0, onNull: 0 } },
                   0,
                 ],
               },
@@ -407,12 +481,12 @@ router.get("/detalle", ensureAuth, async (req, res) => {
           },
           haber: {
             $cond: [
-              { $ne: ["$creditRaw", null] },
-              { $convert: { input: "$creditRaw", to: "double", onError: 0, onNull: 0 } },
+              { $ne: ["$_creditRaw", null] },
+              { $convert: { input: "$_creditRaw", to: "double", onError: 0, onNull: 0 } },
               {
                 $cond: [
-                  { $eq: ["$side", "credit"] },
-                  { $convert: { input: "$montoRaw", to: "double", onError: 0, onNull: 0 } },
+                  { $eq: ["$_side", "credit"] },
+                  { $convert: { input: "$_montoRaw", to: "double", onError: 0, onNull: 0 } },
                   0,
                 ],
               },
@@ -420,6 +494,8 @@ router.get("/detalle", ensureAuth, async (req, res) => {
           },
         },
       },
+
+      // 7) agrupar por cuenta
       {
         $group: {
           _id: "$code",
@@ -427,7 +503,9 @@ router.get("/detalle", ensureAuth, async (req, res) => {
           haber: { $sum: "$haber" },
         },
       },
-    ]);
+    ];
+
+    const agg = await JournalEntry.aggregate(pipeline);
 
     const accountNameMap = await getAccountNameMap(owner, codes);
 
@@ -439,6 +517,7 @@ router.get("/detalle", ensureAuth, async (req, res) => {
         debe: 0,
         haber: 0,
         neto: 0,
+        saldo: 0,
       };
     }
 
@@ -448,13 +527,15 @@ router.get("/detalle", ensureAuth, async (req, res) => {
 
       const debe = num(row.debe, 0);
       const haber = num(row.haber, 0);
+      const neto = debe - haber;
 
       byCode[code] = {
         cuenta_codigo: code,
         cuenta_nombre: accountNameMap[code] || null,
         debe,
         haber,
-        neto: debe - haber,
+        neto,
+        saldo: neto, // ✅ para que el hook lo use directo
       };
     }
 
@@ -473,7 +554,6 @@ router.get("/detalle", ensureAuth, async (req, res) => {
 });
 
 /**
- * ✅ LO QUE TU UI ESTÁ PIDIENDO:
  * GET /api/asientos?start=YYYY-MM-DD&end=YYYY-MM-DD&include_detalles=1&limit=200
  */
 router.get("/", ensureAuth, async (req, res) => {
@@ -503,14 +583,12 @@ router.get("/", ensureAuth, async (req, res) => {
       .limit(limit)
       .lean();
 
-    // ✅ juntar TODAS las líneas para resolver codes e ids
     const allLines = [];
     for (const a of docs) {
       const lines = a.lines || a.detalle_asientos || a.detalles_asiento || [];
       if (Array.isArray(lines) && lines.length) allLines.push(...lines);
     }
 
-    // ✅ maps por code e id (no rompe si solo hay codes)
     const accountMaps = await getAccountMaps(owner, allLines);
 
     const items = docs.map((a) => {
@@ -566,7 +644,6 @@ async function handleByNumero(req, res) {
     const accountMaps = await getAccountMaps(owner, rawLines);
     const asientoUI = mapEntryForUI(asiento, accountMaps);
 
-    // ✅ SHAPE COMPAT
     return res.json({ ok: true, data: asientoUI, asiento: asientoUI, item: asientoUI, ...asientoUI });
   } catch (e) {
     console.error("GET /api/asientos/by-numero error:", e);
@@ -574,17 +651,8 @@ async function handleByNumero(req, res) {
   }
 }
 
-/**
- * ✅ Compat: buscar por número de asiento
- * GET /api/asientos/by-numero?numero_asiento=EGR-...
- */
 router.get("/by-numero", ensureAuth, handleByNumero);
 
-/**
- * ✅ Compat LEGACY:
- * GET /api/asientos/by-ref/:numero
- * GET /api/asientos/by-ref?numero_asiento=...
- */
 router.get("/by-ref/:numero", ensureAuth, async (req, res) => {
   req.query.numero_asiento = req.params.numero;
   return handleByNumero(req, res);
@@ -595,11 +663,7 @@ router.get("/by-ref", ensureAuth, async (req, res) => {
 });
 
 /**
- * ✅ CLAVE PARA EGRESOS/INGRESOS:
  * GET /api/asientos/by-transaccion?source=ingreso|egreso|...&id=XXXXXXXX
- *
- * - Si source viene vacío, hacemos fallback buscando solo por owner+sourceId.
- * - Respuesta en SHAPE COMPAT (asientoUI plano)
  */
 router.get("/by-transaccion", ensureAuth, async (req, res) => {
   try {
@@ -623,7 +687,6 @@ router.get("/by-transaccion", ensureAuth, async (req, res) => {
       sourceIdCandidates.push(new mongoose.Types.ObjectId(id));
     }
 
-    // ✅ aliases (si source viene)
     const sourceAliases = new Set();
     if (source) {
       sourceAliases.add(source.toLowerCase());
@@ -633,7 +696,6 @@ router.get("/by-transaccion", ensureAuth, async (req, res) => {
       if (source.toLowerCase() === "egreso") sourceAliases.add("egresos");
     }
 
-    // ✅ builder: con source o sin source
     const findBy = async (q) => JournalEntry.findOne(q).sort({ createdAt: -1 }).lean();
 
     let asiento = null;
@@ -648,7 +710,6 @@ router.get("/by-transaccion", ensureAuth, async (req, res) => {
         (await findBy({ owner, "references.source": { $in: srcList }, "references.id": id }));
     }
 
-    // ✅ fallback si no hubo source o no encontró
     if (!asiento) {
       asiento =
         (await findBy({ owner, sourceId: { $in: sourceIdCandidates } })) ||
@@ -666,7 +727,6 @@ router.get("/by-transaccion", ensureAuth, async (req, res) => {
 
     const numeroAsiento = asientoUI.numeroAsiento || asientoUI.numero_asiento || String(asiento._id);
 
-    // ✅ SHAPE COMPAT (MUY IMPORTANTE para FE)
     return res.json({
       ok: true,
       data: asientoUI,
@@ -683,8 +743,7 @@ router.get("/by-transaccion", ensureAuth, async (req, res) => {
 });
 
 /**
- * GET /api/asientos/:id  (detalle por id)
- * ⚠️ SIEMPRE al final, para no pisar rutas como /depreciaciones
+ * GET /api/asientos/:id
  */
 router.get("/:id", ensureAuth, async (req, res) => {
   try {
@@ -703,7 +762,6 @@ router.get("/:id", ensureAuth, async (req, res) => {
 
     const asientoUI = mapEntryForUI(asiento, accountMaps);
 
-    // ✅ SHAPE COMPAT
     return res.json({ ok: true, data: asientoUI, asiento: asientoUI, item: asientoUI, ...asientoUI });
   } catch (e) {
     console.error("GET /api/asientos/:id error:", e);
