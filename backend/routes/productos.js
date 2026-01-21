@@ -44,12 +44,78 @@ function escapeRegex(str) {
   return String(str || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+/**
+ * Lee precio venta desde cualquier alias
+ */
+function readPrecioVenta(body) {
+  if (!body) return undefined;
+
+  const raw =
+    typeof body.precioVenta !== "undefined"
+      ? body.precioVenta
+      : typeof body.precio_venta !== "undefined"
+        ? body.precio_venta
+        : typeof body.precioVentaSugerido !== "undefined"
+          ? body.precioVentaSugerido
+          : typeof body.precio_venta_sugerido !== "undefined"
+            ? body.precio_venta_sugerido
+            : undefined;
+
+  if (typeof raw === "undefined") return undefined;
+  const n = numOrNull(raw);
+  return n === null ? undefined : n;
+}
+
+/**
+ * Lee costo compra desde cualquier alias
+ */
+function readCostoCompra(body) {
+  if (!body) return undefined;
+
+  const raw =
+    typeof body.costoCompra !== "undefined"
+      ? body.costoCompra
+      : typeof body.costo_compra !== "undefined"
+        ? body.costo_compra
+        : undefined;
+
+  if (typeof raw === "undefined") return undefined;
+  const n = numOrNull(raw);
+  return n === null ? undefined : n;
+}
+
 function normalizeOut(doc) {
+  const precio = typeof doc.precio === "number" ? doc.precio : Number(doc.precio || 0);
+
+  const costoCompra =
+    typeof doc.costoCompra === "number"
+      ? doc.costoCompra
+      : typeof doc.costo_compra === "number"
+        ? doc.costo_compra
+        : precio; // compat: precio = costo
+
+  const precioVenta =
+    typeof doc.precioVenta === "number"
+      ? doc.precioVenta
+      : typeof doc.precio_venta === "number"
+        ? doc.precio_venta
+        : 0;
+
   return {
     id: String(doc._id),
     nombre: doc.nombre ?? doc.name ?? "",
     descripcion: doc.descripcion ?? doc.description ?? "",
-    precio: typeof doc.precio === "number" ? doc.precio : Number(doc.precio || 0),
+
+    // ✅ compat actual (tu UI lo usa como costo)
+    precio,
+
+    // ✅ inventario (camel + snake)
+    costoCompra,
+    costo_compra: costoCompra,
+
+    precioVenta,
+    precio_venta: precioVenta,
+
     cuentaCodigo: doc.cuentaCodigo ?? doc.accountCode ?? null,
     subcuentaId: doc.subcuentaId ? String(doc.subcuentaId) : null,
     activo:
@@ -71,7 +137,6 @@ function normalizeOut(doc) {
 function readSubcuentaId(body) {
   if (!body) return undefined;
 
-  // si viene explícito en cualquiera
   const raw =
     typeof body.subcuentaId !== "undefined"
       ? body.subcuentaId
@@ -85,18 +150,14 @@ function readSubcuentaId(body) {
   if (raw === null) return null;
 
   const v = String(raw).trim();
-  return v ? v : null; // "" => null
+  return v ? v : null;
 }
 
 /**
  * Valida subcuenta (si Account existe)
- * Reglas:
- * - Debe existir y pertenecer al owner
- * - Debe ser subcuenta (parentCode != null)
- * - parentCode debe coincidir con cuentaCodigo
  */
 async function validateSubcuenta({ owner, cuentaCodigo, subcuentaId }) {
-  if (!Account) return null; // si no hay modelo Account, no validamos
+  if (!Account) return null;
   if (!subcuentaId) return null;
 
   const sub = await Account.findOne({
@@ -126,12 +187,6 @@ async function validateSubcuenta({ owner, cuentaCodigo, subcuentaId }) {
 
 /**
  * GET /api/productos
- * Query:
- * - activo=true|false
- * - cuenta_codigo=4001
- * - include_subcuentas=true|false (legacy: incluye productos con cuentaCodigo igual a hijos)
- * - q=texto (búsqueda)
- * - limit=500
  */
 router.get("/", ensureAuth, async (req, res) => {
   try {
@@ -150,12 +205,10 @@ router.get("/", ensureAuth, async (req, res) => {
     const q = { owner };
     const and = [];
 
-    // activo
     if (typeof activo !== "undefined") {
       and.push({ $or: [{ activo }, { isActive: activo }] });
     }
 
-    // cuentaCodigo (incluye legacy por include_subcuentas)
     if (cuentaCodigo) {
       if (includeSubcuentas && Account) {
         const children = await Account.find({
@@ -181,16 +234,10 @@ router.get("/", ensureAuth, async (req, res) => {
       }
     }
 
-    // ✅ búsqueda segura
     if (qText) {
       const rx = new RegExp(escapeRegex(qText), "i");
       and.push({
-        $or: [
-          { nombre: rx },
-          { name: rx },
-          { descripcion: rx },
-          { description: rx },
-        ],
+        $or: [{ nombre: rx }, { name: rx }, { descripcion: rx }, { description: rx }],
       });
     }
 
@@ -205,23 +252,20 @@ router.get("/", ensureAuth, async (req, res) => {
 });
 
 /**
- * ✅ GET /api/productos/lookup?nombre=...
- * Este endpoint lo está pidiendo tu frontend (según tu consola).
- * Regresa un solo producto (o null) buscando por nombre (case-insensitive).
+ * GET /api/productos/lookup?nombre=...
  */
 router.get("/lookup", ensureAuth, async (req, res) => {
   try {
     const owner = req.user._id;
 
     const nombre = req.query.nombre ? String(req.query.nombre).trim() : "";
-    const name = req.query.name ? String(req.query.name).trim() : ""; // compat opcional
+    const name = req.query.name ? String(req.query.name).trim() : "";
     const finalName = nombre || name;
 
     if (!finalName) {
       return res.status(400).json({ ok: false, message: "Falta el parámetro nombre." });
     }
 
-    // match exacto (ignorando espacios, case-insensitive)
     const rxExact = new RegExp(`^\\s*${escapeRegex(finalName)}\\s*$`, "i");
 
     const doc = await Product.findOne({
@@ -238,10 +282,10 @@ router.get("/lookup", ensureAuth, async (req, res) => {
 
 /**
  * POST /api/productos
- * Body mínimo:
- * - nombre
- * Opcional:
- * - descripcion, precio, cuentaCodigo (default 4001), subcuentaId, activo
+ * Ahora soporta inventario:
+ * - precio (compat costo)
+ * - costoCompra/costo_compra
+ * - precioVenta/precio_venta
  */
 router.post("/", ensureAuth, async (req, res) => {
   try {
@@ -249,6 +293,8 @@ router.post("/", ensureAuth, async (req, res) => {
 
     const nombre = s((req.body?.nombre ?? req.body?.name ?? "").toString());
     const descripcion = (req.body?.descripcion ?? req.body?.description ?? "").toString();
+
+    // ✅ compat: precio = costo unitario si inventario
     const precio = numOrNull(req.body?.precio ?? req.body?.price);
 
     const cuentaCodigo = s((req.body?.cuentaCodigo ?? req.body?.accountCode ?? "4001").toString());
@@ -256,23 +302,43 @@ router.post("/", ensureAuth, async (req, res) => {
 
     const activo = toBool(req.body?.activo ?? req.body?.isActive, true);
 
+    // ✅ nuevos campos inventario
+    const precioVenta = readPrecioVenta(req.body);
+    const costoCompra = readCostoCompra(req.body);
+
     if (!nombre) return res.status(400).json({ ok: false, message: "El nombre es requerido." });
     if (precio === null) return res.status(400).json({ ok: false, message: "Precio inválido." });
     if (!cuentaCodigo) return res.status(400).json({ ok: false, message: "Falta cuentaCodigo." });
 
-    // ✅ valida subcuenta si viene
     const subErr = await validateSubcuenta({ owner, cuentaCodigo, subcuentaId });
     if (subErr) return res.status(subErr.status).json({ ok: false, message: subErr.message });
 
-    const created = await Product.create({
+    const payload = {
       owner,
       nombre,
       descripcion,
-      precio,
+      precio, // compat: costo
       cuentaCodigo,
       subcuentaId,
       activo,
-    });
+    };
+
+    // Si vienen inventario fields, los guardamos
+    if (typeof costoCompra !== "undefined") {
+      payload.costoCompra = costoCompra;
+      payload.costo_compra = costoCompra;
+    } else {
+      // espejo por default
+      payload.costoCompra = precio;
+      payload.costo_compra = precio;
+    }
+
+    if (typeof precioVenta !== "undefined") {
+      payload.precioVenta = precioVenta;
+      payload.precio_venta = precioVenta;
+    }
+
+    const created = await Product.create(payload);
 
     return res.status(201).json({ ok: true, data: normalizeOut(created.toObject?.() || created) });
   } catch (err) {
@@ -289,17 +355,20 @@ router.post("/", ensureAuth, async (req, res) => {
 
 /**
  * PUT /api/productos/:id
- * Actualiza campos permitidos (whitelist)
- * ✅ Soporta subcuentaId (null para quitarla)
+ * ✅ soporta actualizar precios de inventario:
+ * - precio (compat costo)
+ * - costoCompra/costo_compra
+ * - precioVenta/precio_venta
  */
 router.put("/:id", ensureAuth, async (req, res) => {
   try {
     const owner = req.user._id;
     const { id } = req.params;
 
-    const allowed = ["nombre", "descripcion", "precio", "cuentaCodigo", "activo"];
     const patch = {};
 
+    // whitelist base (legacy)
+    const allowed = ["nombre", "descripcion", "precio", "cuentaCodigo", "activo"];
     for (const k of allowed) {
       if (typeof req.body?.[k] !== "undefined") patch[k] = req.body[k];
     }
@@ -307,7 +376,20 @@ router.put("/:id", ensureAuth, async (req, res) => {
     // subcuentaId con aliases y null permitido
     const incomingSubcuentaId = readSubcuentaId(req.body);
     if (typeof incomingSubcuentaId !== "undefined") {
-      patch.subcuentaId = incomingSubcuentaId; // puede ser string o null
+      patch.subcuentaId = incomingSubcuentaId;
+    }
+
+    // ✅ inventario fields
+    const incomingPrecioVenta = readPrecioVenta(req.body);
+    if (typeof incomingPrecioVenta !== "undefined") {
+      patch.precioVenta = incomingPrecioVenta;
+      patch.precio_venta = incomingPrecioVenta;
+    }
+
+    const incomingCostoCompra = readCostoCompra(req.body);
+    if (typeof incomingCostoCompra !== "undefined") {
+      patch.costoCompra = incomingCostoCompra;
+      patch.costo_compra = incomingCostoCompra;
     }
 
     if (typeof patch.nombre !== "undefined") patch.nombre = String(patch.nombre).trim();
@@ -317,11 +399,17 @@ router.put("/:id", ensureAuth, async (req, res) => {
       const precio = numOrNull(patch.precio);
       if (precio === null) return res.status(400).json({ ok: false, message: "Precio inválido." });
       patch.precio = precio;
+
+      // espejo default si no mandan costoCompra explícito
+      if (typeof patch.costoCompra === "undefined") {
+        patch.costoCompra = precio;
+        patch.costo_compra = precio;
+      }
     }
 
     if (typeof patch.activo !== "undefined") patch.activo = toBool(patch.activo, true);
 
-    // Para validar subcuentaId necesitamos el cuentaCodigo final
+    // validar subcuenta contra cuenta final
     if (typeof patch.subcuentaId !== "undefined") {
       const current = await Product.findOne({ _id: id, owner }).select("cuentaCodigo accountCode").lean();
       if (!current) return res.status(404).json({ ok: false, message: "Producto no encontrado." });
@@ -337,12 +425,7 @@ router.put("/:id", ensureAuth, async (req, res) => {
       if (subErr) return res.status(subErr.status).json({ ok: false, message: subErr.message });
     }
 
-    const updated = await Product.findOneAndUpdate(
-      { _id: id, owner },
-      { $set: patch },
-      { new: true }
-    ).lean();
-
+    const updated = await Product.findOneAndUpdate({ _id: id, owner }, { $set: patch }, { new: true }).lean();
     if (!updated) return res.status(404).json({ ok: false, message: "Producto no encontrado." });
 
     return res.json({ ok: true, data: normalizeOut(updated) });
