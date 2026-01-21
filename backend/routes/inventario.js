@@ -20,6 +20,10 @@ function parseDate(s) {
  * GET /api/inventario/movimientos?tipo=venta&start=YYYY-MM-DD&end=YYYY-MM-DD
  * Soporta también from/to.
  *
+ * Reglas:
+ * - tipo=compra|venta|ajuste => filtra por ese tipo
+ * - tipo=todos o sin tipo => NO filtra por tipo (trae todos)
+ *
  * Nota MVP:
  * - Si aún no existe InventoryMovement, devuelve lista vacía (pero con shape estable).
  */
@@ -27,7 +31,14 @@ router.get("/movimientos", ensureAuth, async (req, res) => {
   try {
     const owner = req.user._id;
 
-    const tipo = String(req.query.tipo || "venta").trim();
+    // 👇 IMPORTANTÍSIMO:
+    // si no viene tipo o viene "todos", NO filtramos por tipo
+    const tipoRaw = String(req.query.tipo ?? "").trim().toLowerCase();
+
+    // Validamos tipos permitidos
+    const allowedTipos = new Set(["compra", "venta", "ajuste"]);
+    const tipoValido = allowedTipos.has(tipoRaw) ? tipoRaw : null;
+
     const start = parseDate(req.query.start || req.query.from);
     const end = parseDate(req.query.end || req.query.to);
 
@@ -38,7 +49,7 @@ router.get("/movimientos", ensureAuth, async (req, res) => {
         data: {
           items: [],
           meta: {
-            tipo,
+            tipo: tipoValido || "todos",
             start: start ? start.toISOString() : null,
             end: end ? end.toISOString() : null,
             note: "InventoryMovement model no existe aún",
@@ -47,10 +58,17 @@ router.get("/movimientos", ensureAuth, async (req, res) => {
       });
     }
 
-    const q = { owner, tipo };
+    const q = { owner };
+
+    // ✅ SOLO filtramos cuando tipo sea compra|venta|ajuste
+    if (tipoValido) q.tipo = tipoValido;
 
     if (start && end) {
       q.fecha = { $gte: start, $lte: end };
+    } else if (start && !end) {
+      q.fecha = { $gte: start };
+    } else if (!start && end) {
+      q.fecha = { $lte: end };
     }
 
     const limit = Math.min(5000, Number(req.query.limit || 2000));
@@ -65,7 +83,7 @@ router.get("/movimientos", ensureAuth, async (req, res) => {
       data: {
         items,
         meta: {
-          tipo,
+          tipo: tipoValido || "todos",
           start: start ? start.toISOString() : null,
           end: end ? end.toISOString() : null,
         },
