@@ -8,6 +8,7 @@ const ensureAuth = require("../middleware/ensureAuth");
 let InventoryMovement = null;
 let JournalEntry = null;
 let Account = null;
+let Product = null;
 
 try {
   InventoryMovement = require("../models/InventoryMovement");
@@ -27,6 +28,12 @@ try {
   Account = null;
 }
 
+try {
+  Product = require("../models/Product");
+} catch (_) {
+  Product = null;
+}
+
 // --------------------
 // Helpers
 // --------------------
@@ -37,6 +44,15 @@ function num(v, def = 0) {
   const cleaned = s.replace(/[$,\s]/g, "");
   const n = Number(cleaned);
   return Number.isFinite(n) ? n : def;
+}
+
+function numOrNaN(v) {
+  if (v === null || v === undefined) return NaN;
+  const s = String(v).trim();
+  if (!s) return NaN;
+  const cleaned = s.replace(/[$,\s]/g, "");
+  const n = Number(cleaned);
+  return Number.isFinite(n) ? n : NaN;
 }
 
 /**
@@ -87,12 +103,6 @@ function pickEstado(m) {
   return String(m?.estado ?? m?.status ?? "activo").toLowerCase().trim();
 }
 
-function asId(v) {
-  if (!v) return "";
-  if (typeof v === "object" && (v._id || v.id)) return String(v._id || v.id);
-  return String(v);
-}
-
 function isEntrada(tipo) {
   const t = String(tipo || "").toLowerCase().trim();
   return t === "entrada" || t === "compra" || t === "ajuste_entrada";
@@ -129,8 +139,10 @@ async function resolveInventoryAccounts(owner) {
     (await findAccountByName(owner, "inventario", "activo")) ||
     (await findAccountByName(owner, "inventario", null));
 
-  const caja = (await findAccountByCode(owner, "1001")) || (await findAccountByName(owner, "caja", "activo"));
-  const bancos = (await findAccountByCode(owner, "1002")) || (await findAccountByName(owner, "banco", "activo"));
+  const caja =
+    (await findAccountByCode(owner, "1001")) || (await findAccountByName(owner, "caja", "activo"));
+  const bancos =
+    (await findAccountByCode(owner, "1002")) || (await findAccountByName(owner, "banco", "activo"));
 
   const proveedores =
     (await findAccountByCode(owner, "2001")) ||
@@ -141,11 +153,9 @@ async function resolveInventoryAccounts(owner) {
   return { inv, caja, bancos, proveedores };
 }
 
-/**
- * Determina cuenta de salida (crédito) para compras / y cuenta de entrada (débito) para ventas
- * - método: efectivo | bancos | transferencia | tarjeta => bancos
- * - crédito/pendiente => proveedores (2001)
- */
+// --------------------
+// Pagos (para asiento compra)
+// --------------------
 function parseMetodoPago(body) {
   const raw =
     body?.metodoPago ??
@@ -159,7 +169,6 @@ function parseMetodoPago(body) {
 }
 
 function parseTipoPago(body) {
-  // Ej: "pago total" | "credito" | "pago parcial" | "pendiente"
   const raw =
     body?.tipoPago ??
     body?.tipo_pago ??
@@ -174,12 +183,8 @@ function isCredito(tipoPago) {
   return tipoPago.includes("credito") || tipoPago.includes("crédito") || tipoPago.includes("pendiente");
 }
 
-function isParcial(tipoPago) {
-  return tipoPago.includes("parcial");
-}
-
 // --------------------
-// Mapper UI
+// Mapper UI (NO rompe front)
 // --------------------
 function mapMovementForUI(m) {
   const fecha = m.fecha || m.date || m.createdAt || m.created_at || m.updatedAt;
@@ -187,17 +192,25 @@ function mapMovementForUI(m) {
   const cantidad = num(m.cantidad ?? m.qty ?? m.quantity ?? m.unidades ?? m.units, 0);
 
   let costoUnitario = num(
-    m.costo_unitario ?? m.costoUnitario ?? m.unitCost ?? m.costo_unit ?? m.precio_unitario ?? m.unitPrice ?? 0,
+    m.costo_unitario ??
+      m.costoUnitario ??
+      m.unitCost ??
+      m.costo_unit ??
+      m.precio_unitario ??
+      m.unitPrice ??
+      0,
     0
   );
 
-  let costoTotal = num(m.costo_total ?? m.costoTotal ?? m.total ?? m.monto_total ?? m.montoTotal ?? 0, 0);
+  let costoTotal = num(
+    m.costo_total ?? m.costoTotal ?? m.total ?? m.monto_total ?? m.montoTotal ?? 0,
+    0
+  );
 
   // ✅ derivación robusta
   if (!costoTotal && costoUnitario && cantidad) costoTotal = costoUnitario * cantidad;
   if (!costoUnitario && costoTotal && cantidad) costoUnitario = costoTotal / cantidad;
 
-  // producto puede venir populated o como id
   const prodObj = m.productoId || m.producto_id || m.productId || m.producto || m.product || null;
 
   const prodId =
@@ -228,23 +241,18 @@ function mapMovementForUI(m) {
 
     fecha,
     tipo_movimiento: tipo,
-    tipo, // compat
+    tipo,
     estado,
 
     producto_id: prodId,
-    productoId: prodId, // compat
+    productoId: prodId,
 
-    // ✅ Para que tu frontend NO muestre “Producto eliminado”
     productos: {
       nombre: prodNombre || "Producto",
       imagen_url: prodImg || undefined,
     },
     producto: prodId
-      ? {
-          id: prodId,
-          nombre: prodNombre || "Producto",
-          imagen_url: prodImg || undefined,
-        }
+      ? { id: prodId, nombre: prodNombre || "Producto", imagen_url: prodImg || undefined }
       : null,
 
     cantidad,
@@ -256,7 +264,6 @@ function mapMovementForUI(m) {
     descripcion: m.descripcion ?? m.memo ?? m.concepto ?? "",
     referencia: m.referencia ?? m.ref ?? "",
 
-    // ✅ vínculo contable E2E
     asientoId: asientoId ? String(asientoId) : null,
     asiento_id: asientoId ? String(asientoId) : null,
     journalEntryId: asientoId ? String(asientoId) : null,
@@ -322,21 +329,25 @@ router.get("/", ensureAuth, async (req, res) => {
 
     if (productoId) {
       and.push({
-        $or: [{ productoId }, { producto_id: productoId }, { productId: productoId }, { producto: productoId }, { product: productoId }],
+        $or: [
+          { productoId },
+          { producto_id: productoId },
+          { productId: productoId },
+          { producto: productoId },
+          { product: productoId },
+        ],
       });
     }
 
     const filter = and.length > 1 ? { $and: and } : and[0];
 
-    // populate robusto (sin romper)
     let q = InventoryMovement.find(filter).sort(sort).limit(limit).setOptions({ strictPopulate: false });
 
-    // Intentamos varios paths comunes
     const paths = ["productoId", "producto_id", "productId", "producto", "product"];
     for (const p of paths) {
       try {
         if (InventoryMovement.schema?.path(p)) {
-          q = q.populate(p, "nombre name imagen_url imagenUrl image sku codigo code");
+          q = q.populate(p, "nombre name imagen_url imagenUrl image sku codigo code costoCompra costo_compra precio price");
           break;
         }
       } catch (_) {}
@@ -359,7 +370,7 @@ router.get("/", ensureAuth, async (req, res) => {
 
 // --------------------
 // POST /api/movimientos-inventario
-// ✅ crea movimiento + (si aplica) JournalEntry y lo amarra
+// ✅ FIX E2E: si no viene costo, tomarlo del producto (costoCompra / precio)
 // --------------------
 router.post("/", ensureAuth, async (req, res) => {
   try {
@@ -379,18 +390,20 @@ router.post("/", ensureAuth, async (req, res) => {
 
     const cantidad = num(req.body?.cantidad ?? req.body?.qty ?? req.body?.quantity ?? req.body?.unidades ?? 0, NaN);
 
-    // Acepta varios nombres
-    const costoUnitarioIn = num(
+    // Acepta varios nombres (puede venir vacío)
+    const costoUnitarioRaw =
       req.body?.costoUnitario ??
-        req.body?.costo_unitario ??
-        req.body?.unitCost ??
-        req.body?.precio_unitario ??
-        req.body?.precioUnitario ??
-        0,
-      0
-    );
+      req.body?.costo_unitario ??
+      req.body?.unitCost ??
+      req.body?.precio_unitario ??
+      req.body?.precioUnitario ??
+      null;
 
-    const costoTotalIn = num(req.body?.costoTotal ?? req.body?.costo_total ?? req.body?.total ?? req.body?.monto_total ?? 0, 0);
+    const costoTotalRaw = req.body?.costoTotal ?? req.body?.costo_total ?? req.body?.total ?? req.body?.monto_total ?? null;
+
+    // OJO: aquí usamos NaN para detectar "no vino"
+    let costoUnitario = numOrNaN(costoUnitarioRaw);
+    let costoTotal = numOrNaN(costoTotalRaw);
 
     const descripcion = String(req.body?.descripcion || "").trim();
     const referencia = String(req.body?.referencia || "").trim();
@@ -405,12 +418,34 @@ router.post("/", ensureAuth, async (req, res) => {
       return res.status(400).json({ ok: false, message: "cantidad es requerida y no puede ser 0." });
     }
 
-    // ✅ costos E2E
-    let costoUnitario = costoUnitarioIn;
-    let costoTotal = costoTotalIn;
+    // ✅ 1) si no vino costoUnitario o vino 0, buscarlo en Producto
+    if ((!Number.isFinite(costoUnitario) || costoUnitario <= 0) && Product) {
+      const prod = await Product.findOne({ _id: productoId, owner })
+        .select("costoCompra costo_compra precio price")
+        .lean();
 
-    if (!costoTotal && costoUnitario && cantidad) costoTotal = costoUnitario * cantidad;
-    if (!costoUnitario && costoTotal && cantidad) costoUnitario = costoTotal / cantidad;
+      const fallback =
+        numOrNaN(prod?.costoCompra) ||
+        numOrNaN(prod?.costo_compra) ||
+        numOrNaN(prod?.precio) ||
+        numOrNaN(prod?.price);
+
+      if (Number.isFinite(fallback) && fallback > 0) {
+        costoUnitario = fallback;
+      }
+    }
+
+    // ✅ 2) recalcular total SIEMPRE (fuente de verdad)
+    if (!Number.isFinite(costoUnitario) || costoUnitario < 0) costoUnitario = 0;
+
+    // si el total vino, lo respetamos solo si es válido y >0; de lo contrario recalculamos
+    if (!Number.isFinite(costoTotal) || costoTotal <= 0) {
+      costoTotal = Math.abs(cantidad) * Math.abs(costoUnitario);
+    } else {
+      costoTotal = Math.abs(costoTotal);
+      // y si el unitario seguía en 0, lo derivamos del total
+      if (costoUnitario === 0 && cantidad) costoUnitario = costoTotal / Math.abs(cantidad);
+    }
 
     // --------------------
     // Crear movimiento base
@@ -443,7 +478,6 @@ router.post("/", ensureAuth, async (req, res) => {
       referencia,
     };
 
-    // Creamos primero (y luego attach asiento si aplica)
     const created = await InventoryMovement.create(payload);
 
     // --------------------
@@ -457,14 +491,10 @@ router.post("/", ensureAuth, async (req, res) => {
     if (debeGenerarAsiento && JournalEntry && Account) {
       const { inv, caja, bancos, proveedores } = await resolveInventoryAccounts(owner);
 
-      // Si no tenemos cuenta de Inventario, mejor no romper: guardamos movimiento sin asiento
       if (inv) {
         const metodoPago = parseMetodoPago(req.body);
         const tipoPago = parseTipoPago(req.body);
 
-        // Determinar cuenta contrapartida
-        // - compras: crédito a caja/bancos o proveedores
-        // - ventas: débito a caja/bancos (o CxC si fuera crédito, pero eso ya lo manejas en ingresos)
         const usarProveedores = isEntrada(tipo) && isCredito(tipoPago);
         const usarBancos =
           metodoPago.includes("banco") ||
@@ -475,15 +505,11 @@ router.post("/", ensureAuth, async (req, res) => {
 
         const cuentaCajaOBancos = usarBancos ? bancos : caja;
 
-        // fallback final: si no hay caja/bancos, no generamos
         if (!usarProveedores && !cuentaCajaOBancos) {
           // skip asiento
         } else if (usarProveedores && !proveedores) {
           // skip asiento
         } else {
-          // Construir líneas
-          // Compra/Entrada: Debe Inventario, Haber Caja/Bancos o Proveedores
-          // Venta/Salida: Haber Inventario, Debe Caja/Bancos (esto es "salida por venta")
           const lines = [];
 
           if (isEntrada(tipo)) {
@@ -510,7 +536,6 @@ router.post("/", ensureAuth, async (req, res) => {
               });
             }
           } else if (isSalida(tipo)) {
-            // Nota: esto representa salida del costo (no el ingreso). Tu ingreso/venta ya se registra en /ingresos.
             lines.push({
               accountCodigo: inv.code,
               debit: 0,
@@ -534,7 +559,6 @@ router.post("/", ensureAuth, async (req, res) => {
               fecha,
               descripcion: descripcion || `Movimiento inventario (${tipo})`,
               lines,
-              // Puedes guardar referencia si tu schema lo soporta
               referencia: referencia || "",
               source: "inventario",
               source_id: String(created._id),
@@ -542,7 +566,6 @@ router.post("/", ensureAuth, async (req, res) => {
 
             asientoId = String(je._id);
 
-            // Guardamos en múltiples campos para compat
             created.asientoId = asientoId;
             created.asiento_id = asientoId;
             created.journalEntryId = asientoId;
@@ -554,8 +577,8 @@ router.post("/", ensureAuth, async (req, res) => {
       }
     }
 
-    // Volvemos a leer con populate si quieres (opcional). Aquí devolvemos lo creado.
     const out = created.toObject ? created.toObject() : created;
+
     return res.status(201).json({
       ok: true,
       data: mapMovementForUI(out),
