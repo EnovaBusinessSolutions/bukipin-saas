@@ -24,12 +24,6 @@ try {
 // --------------------
 // Helpers robustos
 // --------------------
-function parseDate(s) {
-  if (!s) return null;
-  const d = new Date(String(s));
-  return Number.isNaN(d.getTime()) ? null : d;
-}
-
 function num(v, def = 0) {
   if (v === null || v === undefined) return def;
   const s = String(v).trim();
@@ -37,6 +31,23 @@ function num(v, def = 0) {
   const cleaned = s.replace(/[$,\s]/g, "");
   const n = Number(cleaned);
   return Number.isFinite(n) ? n : def;
+}
+
+// Fechas seguras para YYYY-MM-DD (sin shift raro UTC)
+function parseStartDate(s) {
+  if (!s) return null;
+  const str = String(s).trim();
+  const isDateOnly = /^\d{4}-\d{2}-\d{2}$/.test(str);
+  const d = new Date(isDateOnly ? `${str}T00:00:00` : str);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function parseEndDate(s) {
+  if (!s) return null;
+  const str = String(s).trim();
+  const isDateOnly = /^\d{4}-\d{2}-\d{2}$/.test(str);
+  const d = new Date(isDateOnly ? `${str}T23:59:59.999` : str);
+  return Number.isNaN(d.getTime()) ? null : d;
 }
 
 function asId(v) {
@@ -56,56 +67,57 @@ function getMovementAsientoId(m) {
   );
 }
 
+function parseOrder(orderRaw) {
+  const order = String(orderRaw || "fecha:desc").trim();
+  const [field, dir] = order.split(":");
+  const key = (field || "fecha").trim();
+  const direction = String(dir || "desc").toLowerCase() === "asc" ? 1 : -1;
+  return { [key]: direction, createdAt: -1 };
+}
+
 function normalizeMovement(m) {
-  // Soporta campos distintos según tu modelo real
-  const cantidad = num(m?.cantidad ?? m?.qty ?? m?.quantity ?? m?.unidades ?? m?.units, 0);
+  const cantidad = num(m?.qty ?? m?.cantidad ?? m?.quantity ?? m?.unidades ?? m?.units, 0);
 
   let costoUnit = num(
-    m?.costo_unitario ??
+    m?.unitCost ??
+      m?.costo_unitario ??
       m?.costoUnitario ??
-      m?.unitCost ??
       m?.costoUnit ??
-      m?.costoCompra ??
-      m?.costo_compra ??
       m?.precio_unitario ??
       m?.precioUnitario ??
       m?.unitPrice ??
-      m?.precio ??
-      m?.price,
+      0,
     0
   );
 
   let costoTotal = num(
-    m?.costo_total ??
+    m?.total ??
+      m?.costo_total ??
       m?.costoTotal ??
-      m?.total ??
       m?.monto_total ??
       m?.montoTotal ??
       m?.importe_total ??
       m?.importeTotal ??
       m?.amount ??
       m?.monto ??
-      m?.importe,
+      m?.importe ??
+      0,
     0
   );
 
-  // ✅ Derivación E2E
+  // Derivación E2E
   if (!costoTotal && costoUnit && cantidad) costoTotal = costoUnit * cantidad;
   if (!costoUnit && costoTotal && cantidad) costoUnit = costoTotal / cantidad;
 
-  // Producto (si viene populate o si fue eliminado)
-  const prodObj =
-    m?.productos ||
-    m?.producto ||
-    m?.product ||
-    (m?.producto_id && typeof m.producto_id === "object" ? m.producto_id : null) ||
-    (m?.productoId && typeof m.productoId === "object" ? m.productoId : null) ||
-    (m?.productId && typeof m.productId === "object" ? m.productId : null) ||
-    null;
+  // ✅ El producto real SIEMPRE es productId
+  const prodObj = m?.productId && typeof m.productId === "object" ? m.productId : null;
+
+  const prodId =
+    prodObj ? asId(prodObj._id || prodObj.id) : asId(m?.productId ?? m?.productoId ?? m?.producto_id ?? "");
 
   const productos = prodObj
     ? {
-        nombre: String(prodObj?.nombre ?? "Producto eliminado"),
+        nombre: String(prodObj?.nombre ?? prodObj?.name ?? "Producto"),
         imagen_url: prodObj?.imagen_url ?? prodObj?.imagenUrl ?? prodObj?.image ?? undefined,
       }
     : { nombre: "Producto eliminado" };
@@ -115,47 +127,56 @@ function normalizeMovement(m) {
       .toLowerCase()
       .trim() || "entrada";
 
-  const fecha = m?.fecha ?? m?.date ?? m?.createdAt ?? m?.created_at ?? m?.updatedAt ?? m?.updated_at ?? null;
+  const estado = String(m?.status ?? m?.estado ?? "activo").toLowerCase().trim();
+
+  const fecha =
+    m?.fecha ?? m?.date ?? m?.createdAt ?? m?.created_at ?? m?.updatedAt ?? m?.updated_at ?? null;
 
   return {
     ...m,
     id: asId(m?.id ?? m?._id),
-    producto_id: asId(
-      m?.producto_id ??
-        m?.productoId ??
-        m?.productId ??
-        m?.producto ??
-        m?.product ??
-        m?.producto?._id ??
-        m?.product?._id
-    ),
+
+    // compat front
+    producto_id: prodId,
+    productoId: prodId,
+
     tipo_movimiento: tipo,
+    tipo,
+    estado,
+
     cantidad,
     costo_unitario: costoUnit,
+    costoUnitario: costoUnit,
+
     costo_total: costoTotal,
+    costoTotal: costoTotal,
+
     fecha,
-    descripcion: m?.descripcion ?? "",
-    estado: m?.estado ?? null,
+    descripcion: m?.descripcion ?? m?.nota ?? "",
+    referencia: m?.referencia ?? "",
+
     motivo_cancelacion: m?.motivo_cancelacion ?? null,
     fecha_cancelacion: m?.fecha_cancelacion ?? null,
     movimiento_reversion_id: m?.movimiento_reversion_id ?? null,
+
     productos,
   };
 }
 
-async function mapJournalEntryForUI(entry) {
+async function mapJournalEntryForUI(entry, owner) {
   if (!entry) return null;
 
   const lines = Array.isArray(entry.lines) ? entry.lines : Array.isArray(entry.detalles) ? entry.detalles : [];
 
-  // Construimos lookup de cuentas por código (si tenemos Account)
   const accountCodes = lines
     .map((l) => String(l.accountCodigo ?? l.cuenta_codigo ?? l.accountCode ?? l.codigo ?? "").trim())
     .filter(Boolean);
 
   let byCode = {};
   if (Account && accountCodes.length) {
-    const accs = await Account.find({ code: { $in: accountCodes } }).select("code name").lean();
+    const accs = await Account.find({ owner, code: { $in: accountCodes } })
+      .select("code name")
+      .lean();
     byCode = Object.fromEntries(accs.map((a) => [String(a.code), a]));
   }
 
@@ -188,7 +209,7 @@ async function mapJournalEntryForUI(entry) {
 // GET movimientos
 // --------------------
 /**
- * GET /api/inventario/movimientos?tipo=venta&start=YYYY-MM-DD&end=YYYY-MM-DD
+ * GET /api/inventario/movimientos?tipo=compra&estado=activo&order=fecha:desc&limit=5000&start=YYYY-MM-DD&end=YYYY-MM-DD
  * Soporta también from/to.
  */
 router.get("/movimientos", ensureAuth, async (req, res) => {
@@ -196,8 +217,13 @@ router.get("/movimientos", ensureAuth, async (req, res) => {
     const owner = req.user._id;
 
     const tipoRaw = String(req.query.tipo ?? "").trim().toLowerCase();
+    const estadoRaw = String(req.query.estado ?? "").trim().toLowerCase();
+    const order = parseOrder(req.query.order);
+    const limit = Math.min(5000, Number(req.query.limit || 2000));
 
-    // ✅ ampliamos permitidos para no romper si guardas "entrada/salida"
+    const start = parseStartDate(req.query.start || req.query.from);
+    const end = parseEndDate(req.query.end || req.query.to);
+
     const allowedTipos = new Set([
       "compra",
       "venta",
@@ -209,9 +235,6 @@ router.get("/movimientos", ensureAuth, async (req, res) => {
     ]);
     const tipoValido = allowedTipos.has(tipoRaw) ? tipoRaw : null;
 
-    const start = parseDate(req.query.start || req.query.from);
-    const end = parseDate(req.query.end || req.query.to);
-
     if (!InventoryMovement) {
       return res.json({
         ok: true,
@@ -219,6 +242,7 @@ router.get("/movimientos", ensureAuth, async (req, res) => {
           items: [],
           meta: {
             tipo: tipoValido || "todos",
+            estado: estadoRaw || "todos",
             start: start ? start.toISOString() : null,
             end: end ? end.toISOString() : null,
             note: "InventoryMovement model no existe aún",
@@ -229,29 +253,30 @@ router.get("/movimientos", ensureAuth, async (req, res) => {
 
     const q = { owner };
 
-    if (tipoValido) {
-      // Si te llegan "entrada/salida" y tu modelo usa "tipo" o "tipo_movimiento", lo manejamos flexible
-      // Probable: tu schema usa "tipo" (como en tu filtro original)
-      q.tipo = tipoValido;
+    if (tipoValido) q.tipo = tipoValido;
+
+    // ✅ status/estado robusto
+    if (estadoRaw && estadoRaw !== "todos") {
+      if (estadoRaw === "activo") {
+        q.$or = [{ status: "activo" }, { status: { $exists: false } }, { status: null }];
+      } else {
+        q.status = estadoRaw;
+      }
     }
 
     if (start && end) q.fecha = { $gte: start, $lte: end };
     else if (start && !end) q.fecha = { $gte: start };
     else if (!start && end) q.fecha = { $lte: end };
 
-    const limit = Math.min(5000, Number(req.query.limit || 2000));
-
-    // ✅ strictPopulate false para evitar errors si la ruta no existe en schema (Mongoose 7)
+    // ✅ IMPORTANTE:
+    // Solo populate por productId (campo real). NO tocar productoId/producto_id para evitar el 500.
     const itemsRaw = await InventoryMovement.find(q)
-      .sort({ fecha: -1, createdAt: -1 })
+      .sort(order)
       .limit(limit)
       .setOptions({ strictPopulate: false })
-      .populate({ path: "productoId", select: "nombre imagen_url imagenUrl image", strictPopulate: false })
-      .populate({ path: "productId", select: "nombre imagen_url imagenUrl image", strictPopulate: false })
-      .populate({ path: "producto_id", select: "nombre imagen_url imagenUrl image", strictPopulate: false })
+      .populate({ path: "productId", select: "nombre name imagen_url imagenUrl image", strictPopulate: false })
       .lean();
 
-    // ✅ Normalización E2E (para que no salgan $0 por campos raros)
     const items = (itemsRaw || []).map(normalizeMovement);
 
     return res.json({
@@ -260,6 +285,7 @@ router.get("/movimientos", ensureAuth, async (req, res) => {
         items,
         meta: {
           tipo: tipoValido || "todos",
+          estado: estadoRaw || "todos",
           start: start ? start.toISOString() : null,
           end: end ? end.toISOString() : null,
         },
@@ -280,26 +306,37 @@ router.get("/movimientos/:id/asiento", ensureAuth, async (req, res) => {
     const owner = req.user._id;
     const movimientoId = String(req.params.id);
 
-    if (!InventoryMovement) {
-      return res.json({ ok: true, data: null });
-    }
+    if (!InventoryMovement) return res.json({ ok: true, data: null });
 
     const mov = await InventoryMovement.findOne({ _id: movimientoId, owner }).lean();
     if (!mov) return res.status(404).json({ ok: false, message: "Movimiento no encontrado" });
 
-    if (!JournalEntry) {
-      return res.json({ ok: true, data: null });
+    if (!JournalEntry) return res.json({ ok: true, data: null });
+
+    // 1) Intentar por campo directo
+    let asientoId = getMovementAsientoId(mov);
+
+    // 2) Fallback fuerte: si no existe, buscar por source/source_id (porque a veces no se guarda asientoId en el schema)
+    if (!asientoId) {
+      const bySource = await JournalEntry.findOne({
+        owner,
+        $or: [
+          { source: "inventario", source_id: String(mov._id) },
+          { source: "inventario", sourceId: String(mov._id) },
+          { source_id: String(mov._id) },
+          { sourceId: String(mov._id) },
+        ],
+      }).lean();
+
+      if (bySource?._id) asientoId = String(bySource._id);
     }
 
-    const asientoId = getMovementAsientoId(mov);
-    if (!asientoId) {
-      return res.json({ ok: true, data: null });
-    }
+    if (!asientoId) return res.json({ ok: true, data: null });
 
     const entry = await JournalEntry.findOne({ _id: asientoId, owner }).lean();
     if (!entry) return res.json({ ok: true, data: null });
 
-    const mapped = await mapJournalEntryForUI(entry);
+    const mapped = await mapJournalEntryForUI(entry, owner);
     return res.json({ ok: true, data: mapped });
   } catch (err) {
     console.error("GET /api/inventario/movimientos/:id/asiento error:", err);
@@ -328,9 +365,8 @@ router.post("/movimientos/:id/cancel", ensureAuth, async (req, res) => {
     const mov = await InventoryMovement.findOne({ _id: movimientoId, owner });
     if (!mov) return res.status(404).json({ ok: false, message: "Movimiento no encontrado" });
 
-    // Evitar doble cancelación
     const yaCancelado =
-      String(mov.estado || "").toLowerCase() === "cancelado" ||
+      String(mov.status || mov.estado || "").toLowerCase() === "cancelado" ||
       !!mov.motivo_cancelacion ||
       !!mov.fecha_cancelacion ||
       !!mov.movimiento_reversion_id;
@@ -339,21 +375,36 @@ router.post("/movimientos/:id/cancel", ensureAuth, async (req, res) => {
       return res.json({ ok: true, message: "Movimiento ya estaba cancelado" });
     }
 
-    // Solo permitimos cancelar compras (tu UI lo usa así)
     const tipo = String(mov.tipo_movimiento ?? mov.tipo ?? "").toLowerCase().trim();
     if (tipo !== "compra") {
       return res.status(400).json({ ok: false, message: "Solo se pueden cancelar compras de inventario" });
     }
 
     // Marcar cancelación
+    mov.status = "cancelado";
     mov.estado = "cancelado";
     mov.motivo_cancelacion = motivoCancelacion;
     mov.fecha_cancelacion = new Date();
 
-    // Si hay JournalEntry, intentamos generar reversión
+    // Reversión asiento si existe
     let asientoReversionId = null;
+
     if (JournalEntry) {
-      const asientoId = getMovementAsientoId(mov);
+      let asientoId = getMovementAsientoId(mov);
+
+      if (!asientoId) {
+        const bySource = await JournalEntry.findOne({
+          owner,
+          $or: [
+            { source: "inventario", source_id: String(mov._id) },
+            { source: "inventario", sourceId: String(mov._id) },
+            { source_id: String(mov._id) },
+            { sourceId: String(mov._id) },
+          ],
+        });
+        if (bySource?._id) asientoId = String(bySource._id);
+      }
+
       if (asientoId) {
         const original = await JournalEntry.findOne({ _id: asientoId, owner });
         if (original && Array.isArray(original.lines) && original.lines.length) {
@@ -369,6 +420,8 @@ router.post("/movimientos/:id/cancel", ensureAuth, async (req, res) => {
             fecha: new Date(),
             descripcion: `Reversión cancelación inventario (${mov._id}) - ${motivoCancelacion}`,
             lines: reversedLines,
+            source: "inventario_cancel",
+            source_id: String(mov._id),
           });
 
           asientoReversionId = String(reversed._id);
@@ -376,9 +429,7 @@ router.post("/movimientos/:id/cancel", ensureAuth, async (req, res) => {
       }
     }
 
-    // Guardamos referencia si el schema lo soporta (no truena si no existe)
     mov.asiento_reversion_id = asientoReversionId || mov.asiento_reversion_id || null;
-
     await mov.save();
 
     return res.json({

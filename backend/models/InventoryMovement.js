@@ -7,24 +7,43 @@ const inventoryMovementSchema = new mongoose.Schema(
 
     fecha: { type: Date, default: Date.now, index: true },
 
-    // venta | compra | ajuste (tu app también usa "entrada/salida" a veces)
-    tipo: { type: String, default: "venta", trim: true },
+    // venta | compra | ajuste | entrada | salida | ajuste_entrada | ajuste_salida
+    tipo: { type: String, default: "venta", trim: true, index: true },
 
-    // ✅ Campo real
+    // ✅ Estado canónico
+    status: { type: String, default: "activo", trim: true, index: true }, // activo | cancelado | ...
+
+    // ✅ Campo real (ref)
     productId: { type: mongoose.Schema.Types.ObjectId, ref: "Product", default: null, index: true },
 
-    // ✅ Campos reales (estos son los que Atlas te muestra)
+    // ✅ Campos reales (fuente de verdad)
     qty: { type: Number, default: 0 },
     unitCost: { type: Number, default: 0 },
     total: { type: Number, default: 0 },
 
+    // Texto
     nota: { type: String, default: "" },
+    referencia: { type: String, default: "" },
 
-    source: { type: String, default: "" },
+    // Trazabilidad
+    source: { type: String, default: "" }, // ui | inventario | venta | compra | etc.
     sourceId: { type: mongoose.Schema.Types.ObjectId, default: null },
+
+    // ✅ Contabilidad (persistir para el modal)
+    asientoId: { type: mongoose.Schema.Types.ObjectId, ref: "JournalEntry", default: null, index: true },
+    asiento_reversion_id: { type: mongoose.Schema.Types.ObjectId, ref: "JournalEntry", default: null, index: true },
+
+    // ✅ Cancelación (para dejar rastro)
+    motivo_cancelacion: { type: String, default: null },
+    fecha_cancelacion: { type: Date, default: null },
+    movimiento_reversion_id: { type: mongoose.Schema.Types.ObjectId, default: null },
   },
   { timestamps: true }
 );
+
+// Para que los virtuals salgan en responses si los conviertes a JSON/obj
+inventoryMovementSchema.set("toJSON", { virtuals: true });
+inventoryMovementSchema.set("toObject", { virtuals: true });
 
 // ----------------------------
 // Helpers
@@ -40,35 +59,41 @@ function toNum(v) {
 }
 
 // ----------------------------
-// ✅ ALIASES (para que NO se pierdan campos)
+// ✅ Virtual populate CORRECTO (evita el 500 si alguien hace populate("productoId"))
+// - OJO: esto NO es alias setter/getter. Es populate real.
+// ----------------------------
+inventoryMovementSchema.virtual("productoId", {
+  ref: "Product",
+  localField: "productId",
+  foreignField: "_id",
+  justOne: true,
+});
+inventoryMovementSchema.virtual("producto_id", {
+  ref: "Product",
+  localField: "productId",
+  foreignField: "_id",
+  justOne: true,
+});
+inventoryMovementSchema.virtual("product", {
+  ref: "Product",
+  localField: "productId",
+  foreignField: "_id",
+  justOne: true,
+});
+
+// ----------------------------
+// ✅ Aliases de lectura/escritura (compat de payload)
+// Estas NO se deben usar para populate.
 // ----------------------------
 
-// productoId / producto_id / productId (ya existe) -> productId
+// estado -> status
 inventoryMovementSchema
-  .virtual("productoId")
+  .virtual("estado")
   .get(function () {
-    return this.productId;
+    return this.status;
   })
   .set(function (v) {
-    this.productId = v;
-  });
-
-inventoryMovementSchema
-  .virtual("producto_id")
-  .get(function () {
-    return this.productId;
-  })
-  .set(function (v) {
-    this.productId = v;
-  });
-
-inventoryMovementSchema
-  .virtual("product")
-  .get(function () {
-    return this.productId;
-  })
-  .set(function (v) {
-    this.productId = v;
+    this.status = v;
   });
 
 // cantidad / unidades / quantity -> qty
@@ -169,6 +194,7 @@ inventoryMovementSchema
 // ✅ NORMALIZACIÓN AUTOMÁTICA (E2E)
 // - Si llega total=0 pero unitCost y qty existen => calcula total
 // - Si llega unitCost=0 pero total y qty existen => calcula unitCost
+// - Normaliza strings tipo "$40" / "1,200"
 // ----------------------------
 inventoryMovementSchema.pre("validate", function (next) {
   try {
@@ -176,22 +202,13 @@ inventoryMovementSchema.pre("validate", function (next) {
     const unitCost = toNum(this.unitCost);
     const total = toNum(this.total);
 
-    // Normaliza qty
     if (Number.isFinite(qty)) this.qty = qty;
-
-    // Si qty no es válido o es 0, no hay nada que calcular
-    if (!Number.isFinite(qty) || qty === 0) {
-      // aún así normalizamos si vinieron strings
-      if (Number.isFinite(unitCost)) this.unitCost = unitCost;
-      if (Number.isFinite(total)) this.total = total;
-      return next();
-    }
-
-    // Normaliza unitCost / total si vinieron como strings
     if (Number.isFinite(unitCost)) this.unitCost = unitCost;
     if (Number.isFinite(total)) this.total = total;
 
-    // Derivaciones
+    // Si qty inválido o 0, no hay nada que derivar
+    if (!Number.isFinite(qty) || qty === 0) return next();
+
     const hasUC = Number.isFinite(unitCost) && unitCost > 0;
     const hasT = Number.isFinite(total) && total > 0;
 
@@ -199,11 +216,14 @@ inventoryMovementSchema.pre("validate", function (next) {
       this.total = Math.abs(unitCost) * Math.abs(qty);
     } else if (!hasUC && hasT) {
       this.unitCost = Math.abs(total) / Math.abs(qty);
-    } else if (!hasUC && !hasT) {
-      // Ambos en 0: lo dejamos así (la ruta puede inyectar costo desde Product)
-      this.unitCost = 0;
-      this.total = 0;
     }
+
+    // Asegurar no negativos raros
+    if (!Number.isFinite(this.unitCost) || this.unitCost < 0) this.unitCost = 0;
+    if (!Number.isFinite(this.total) || this.total < 0) this.total = Math.abs(this.total || 0);
+
+    // status default seguro
+    if (!this.status) this.status = "activo";
 
     return next();
   } catch (e) {
@@ -211,6 +231,8 @@ inventoryMovementSchema.pre("validate", function (next) {
   }
 });
 
+// Index compuesto útil (owner + fecha ya existe como idea)
 inventoryMovementSchema.index({ owner: 1, fecha: -1 });
+inventoryMovementSchema.index({ owner: 1, productId: 1, fecha: -1 });
 
 module.exports = mongoose.model("InventoryMovement", inventoryMovementSchema);

@@ -197,12 +197,13 @@ function isCredito(tipoPago) {
 function mapMovementForUI(m) {
   const fecha = m.fecha || m.date || m.createdAt || m.created_at || m.updatedAt;
 
-  const cantidad = num(m.cantidad ?? m.qty ?? m.quantity ?? m.unidades ?? m.units, 0);
+  // Fuente de verdad: qty/unitCost/total
+  const cantidad = num(m.qty ?? m.cantidad ?? m.quantity ?? m.unidades ?? m.units, 0);
 
   let costoUnitario = num(
-    m.costo_unitario ??
+    m.unitCost ??
+      m.costo_unitario ??
       m.costoUnitario ??
-      m.unitCost ??
       m.unit_cost ??
       m.precio_unitario ??
       m.unitPrice ??
@@ -210,13 +211,12 @@ function mapMovementForUI(m) {
     0
   );
 
-  let costoTotal = num(m.costo_total ?? m.costoTotal ?? m.total ?? m.monto_total ?? m.montoTotal ?? 0, 0);
+  let costoTotal = num(m.total ?? m.costo_total ?? m.costoTotal ?? m.monto_total ?? m.montoTotal ?? 0, 0);
 
   if (!costoTotal && costoUnitario && cantidad) costoTotal = costoUnitario * cantidad;
   if (!costoUnitario && costoTotal && cantidad) costoUnitario = costoTotal / cantidad;
 
-  // ✅ Con el modelo actual, el producto REAL es productId
-  const prodObj = m.productId || m.productoId || m.producto_id || m.productId || m.producto || m.product || null;
+  const prodObj = m.productId || m.productoId || m.producto_id || m.producto || m.product || null;
 
   const prodId =
     prodObj && typeof prodObj === "object"
@@ -235,7 +235,7 @@ function mapMovementForUI(m) {
       ? prodObj.imagen_url ?? prodObj.imagenUrl ?? prodObj.image ?? null
       : null;
 
-  const tipo = pickTipo(m) || "ajuste";
+  const tipo = pickTipo(m) || String(m.tipo || "ajuste").toLowerCase();
   const estado = pickEstado(m) || "activo";
 
   const asientoId = m.asientoId || m.asiento_id || m.journalEntryId || m.journal_entry_id || null;
@@ -279,7 +279,7 @@ function mapMovementForUI(m) {
 
 // --------------------
 // GET /api/movimientos-inventario
-// ✅ FIX: populate SIEMPRE por productId (es el campo real)
+// ✅ FIX: populate SIEMPRE por productId (campo real)
 // --------------------
 router.get("/", ensureAuth, async (req, res) => {
   try {
@@ -326,21 +326,21 @@ router.get("/", ensureAuth, async (req, res) => {
     else if (!start && end) and.push({ fecha: { $lte: end } });
 
     if (productoId) {
-      // ✅ Campo real
-      and.push({ productId: productoId });
+      and.push({ productId: productoId }); // ✅ campo real
     }
 
     const filter = and.length > 1 ? { $and: and } : and[0];
 
-    let q = InventoryMovement.find(filter)
+    const rows = await InventoryMovement.find(filter)
       .sort(sort)
       .limit(limit)
-      .setOptions({ strictPopulate: false });
+      .setOptions({ strictPopulate: false })
+      .populate(
+        "productId",
+        "nombre name imagen_url imagenUrl image sku codigo code costoCompra costo_compra precio price"
+      )
+      .lean();
 
-    // ✅ populate real
-    q = q.populate("productId", "nombre name imagen_url imagenUrl image sku codigo code costoCompra costo_compra precio price");
-
-    const rows = await q.lean();
     const items = (rows || []).map(mapMovementForUI);
 
     return res.json({
@@ -439,7 +439,7 @@ router.post("/", ensureAuth, async (req, res) => {
       owner,
       fecha,
 
-      // Canon
+      // Canon del modelo InventoryMovement
       tipo,
       status: estado,
 
@@ -452,11 +452,10 @@ router.post("/", ensureAuth, async (req, res) => {
       source: "ui",
       sourceId: null,
 
-      // Compat extra (no hace daño si tu front depende de algo)
-      // (Pero lo importante ya quedó guardado arriba)
+      // Aliases de compat (por si alguna UI vieja los usa)
+      type: tipo,
       tipo_movimiento: tipo,
       tipoMovimiento: tipo,
-      type: tipo,
 
       productoId,
       producto_id: productoId,
@@ -464,6 +463,7 @@ router.post("/", ensureAuth, async (req, res) => {
       cantidad,
       costoUnitario,
       costo_unitario: costoUnitario,
+
       costoTotal,
       costo_total: costoTotal,
 
@@ -521,7 +521,12 @@ router.post("/", ensureAuth, async (req, res) => {
               });
             } else if (isSalida(tipo)) {
               lines.push({ accountCodigo: invCode, debit: 0, credit: Math.abs(costoTotal), memo: "Salida inventario" });
-              lines.push({ accountCodigo: contraCode, debit: Math.abs(costoTotal), credit: 0, memo: "Salida por venta (costo)" });
+              lines.push({
+                accountCodigo: contraCode,
+                debit: Math.abs(costoTotal),
+                credit: 0,
+                memo: "Salida por venta (costo)",
+              });
             }
 
             if (lines.length >= 2) {
@@ -537,7 +542,6 @@ router.post("/", ensureAuth, async (req, res) => {
 
               asientoId = String(je._id);
 
-              // compat
               created.asientoId = asientoId;
               created.asiento_id = asientoId;
               created.journalEntryId = asientoId;
@@ -553,9 +557,12 @@ router.post("/", ensureAuth, async (req, res) => {
       }
     }
 
-    // ✅ re-fetch con populate para que el response traiga producto
+    // ✅ Re-fetch con populate para response consistente
     const fresh = await InventoryMovement.findOne({ _id: created._id, owner })
-      .populate("productId", "nombre name imagen_url imagenUrl image sku codigo code costoCompra costo_compra precio price")
+      .populate(
+        "productId",
+        "nombre name imagen_url imagenUrl image sku codigo code costoCompra costo_compra precio price"
+      )
       .lean();
 
     return res.status(201).json({
