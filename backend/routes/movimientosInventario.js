@@ -91,17 +91,6 @@ function parseOrder(orderRaw) {
   return { [key]: direction, createdAt: -1 };
 }
 
-function pickProductoId(m) {
-  return String(
-    m?.producto_id ??
-      m?.productoId ??
-      m?.productId ??
-      (typeof m?.producto === "string" ? m.producto : "") ??
-      (typeof m?.product === "string" ? m.product : "") ??
-      ""
-  ).trim();
-}
-
 function pickTipo(m) {
   return String(m?.tipo_movimiento ?? m?.tipoMovimiento ?? m?.tipo ?? m?.type ?? "")
     .toLowerCase()
@@ -214,7 +203,7 @@ function mapMovementForUI(m) {
     m.costo_unitario ??
       m.costoUnitario ??
       m.unitCost ??
-      m.costo_unit ??
+      m.unit_cost ??
       m.precio_unitario ??
       m.unitPrice ??
       0,
@@ -226,14 +215,15 @@ function mapMovementForUI(m) {
   if (!costoTotal && costoUnitario && cantidad) costoTotal = costoUnitario * cantidad;
   if (!costoUnitario && costoTotal && cantidad) costoUnitario = costoTotal / cantidad;
 
-  const prodObj = m.productoId || m.producto_id || m.productId || m.producto || m.product || null;
+  // ✅ Con el modelo actual, el producto REAL es productId
+  const prodObj = m.productId || m.productoId || m.producto_id || m.productId || m.producto || m.product || null;
 
   const prodId =
     prodObj && typeof prodObj === "object"
       ? String(prodObj._id || prodObj.id || "")
       : prodObj
       ? String(prodObj)
-      : pickProductoId(m) || null;
+      : (m.productId ? String(m.productId) : null);
 
   const prodNombre =
     prodObj && typeof prodObj === "object"
@@ -259,6 +249,7 @@ function mapMovementForUI(m) {
     tipo,
     estado,
 
+    // compat front
     producto_id: prodId,
     productoId: prodId,
 
@@ -270,11 +261,11 @@ function mapMovementForUI(m) {
 
     cantidad,
     costo_unitario: costoUnitario,
-    costoUnitario: costoUnitario,
+    costoUnitario,
     costo_total: costoTotal,
-    costoTotal: costoTotal,
+    costoTotal,
 
-    descripcion: m.descripcion ?? m.memo ?? m.concepto ?? "",
+    descripcion: m.descripcion ?? m.memo ?? m.concepto ?? m.nota ?? "",
     referencia: m.referencia ?? m.ref ?? "",
 
     asientoId: asientoId ? String(asientoId) : null,
@@ -288,6 +279,7 @@ function mapMovementForUI(m) {
 
 // --------------------
 // GET /api/movimientos-inventario
+// ✅ FIX: populate SIEMPRE por productId (es el campo real)
 // --------------------
 router.get("/", ensureAuth, async (req, res) => {
   try {
@@ -306,7 +298,7 @@ router.get("/", ensureAuth, async (req, res) => {
     const start = parseStartDate(req.query.start || req.query.from);
     const end = parseEndDate(req.query.end || req.query.to);
 
-    const productoId = String(req.query.productoId || req.query.producto_id || "").trim();
+    const productoId = String(req.query.productoId || req.query.producto_id || req.query.productId || "").trim();
 
     const limit = Math.min(5000, Number(req.query.limit || 500));
     const sort = parseOrder(req.query.order);
@@ -316,17 +308,10 @@ router.get("/", ensureAuth, async (req, res) => {
     if (estadoRaw && estadoRaw !== "todos") {
       if (estadoRaw === "activo") {
         and.push({
-          $or: [
-            { estado: "activo" },
-            { status: "activo" },
-            { estado: { $exists: false } },
-            { status: { $exists: false } },
-            { estado: null },
-            { status: null },
-          ],
+          $or: [{ status: "activo" }, { status: { $exists: false } }, { status: null }],
         });
       } else {
-        and.push({ $or: [{ estado: estadoRaw }, { status: estadoRaw }] });
+        and.push({ status: estadoRaw });
       }
     }
 
@@ -341,33 +326,19 @@ router.get("/", ensureAuth, async (req, res) => {
     else if (!start && end) and.push({ fecha: { $lte: end } });
 
     if (productoId) {
-      and.push({
-        $or: [
-          { productoId },
-          { producto_id: productoId },
-          { productId: productoId },
-          { producto: productoId },
-          { product: productoId },
-        ],
-      });
+      // ✅ Campo real
+      and.push({ productId: productoId });
     }
 
     const filter = and.length > 1 ? { $and: and } : and[0];
 
-    let q = InventoryMovement.find(filter).sort(sort).limit(limit).setOptions({ strictPopulate: false });
+    let q = InventoryMovement.find(filter)
+      .sort(sort)
+      .limit(limit)
+      .setOptions({ strictPopulate: false });
 
-    const paths = ["productoId", "producto_id", "productId", "producto", "product"];
-    for (const p of paths) {
-      try {
-        if (InventoryMovement.schema?.path(p)) {
-          q = q.populate(
-            p,
-            "nombre name imagen_url imagenUrl image sku codigo code costoCompra costo_compra precio price"
-          );
-          break;
-        }
-      } catch (_) {}
-    }
+    // ✅ populate real
+    q = q.populate("productId", "nombre name imagen_url imagenUrl image sku codigo code costoCompra costo_compra precio price");
 
     const rows = await q.lean();
     const items = (rows || []).map(mapMovementForUI);
@@ -386,7 +357,7 @@ router.get("/", ensureAuth, async (req, res) => {
 
 // --------------------
 // POST /api/movimientos-inventario
-// FIX: costo fallback + asientos sin romper si code/codigo
+// ✅ FIX E2E: persistir en campos CANÓNICOS (qty, unitCost, total, productId)
 // --------------------
 router.post("/", ensureAuth, async (req, res) => {
   try {
@@ -436,7 +407,7 @@ router.post("/", ensureAuth, async (req, res) => {
       return res.status(400).json({ ok: false, message: "cantidad es requerida y no puede ser 0." });
     }
 
-    // 1) si no vino costoUnitario o vino 0, buscarlo en Producto
+    // ✅ 1) si no vino costoUnitario, tomarlo del producto
     if ((!Number.isFinite(costoUnitario) || costoUnitario <= 0) && Product) {
       const prod = await Product.findOne({ _id: productoId, owner })
         .select("costoCompra costo_compra precio price")
@@ -453,7 +424,7 @@ router.post("/", ensureAuth, async (req, res) => {
 
     if (!Number.isFinite(costoUnitario) || costoUnitario < 0) costoUnitario = 0;
 
-    // 2) recalcular total (fuente de verdad)
+    // ✅ 2) total como fuente de verdad
     if (!Number.isFinite(costoTotal) || costoTotal <= 0) {
       costoTotal = Math.abs(cantidad) * Math.abs(costoUnitario);
     } else {
@@ -461,29 +432,40 @@ router.post("/", ensureAuth, async (req, res) => {
       if (costoUnitario === 0 && cantidad) costoUnitario = costoTotal / Math.abs(cantidad);
     }
 
+    // --------------------
+    // ✅ Payload CANÓNICO (esto es lo que Atlas debe mostrar)
+    // --------------------
     const payload = {
       owner,
       fecha,
-      estado,
+
+      // Canon
+      tipo,
       status: estado,
 
-      tipo,
-      type: tipo,
+      productId: productoId,
+      qty: cantidad,
+      unitCost: costoUnitario,
+      total: costoTotal,
+
+      nota: descripcion || "",
+      source: "ui",
+      sourceId: null,
+
+      // Compat extra (no hace daño si tu front depende de algo)
+      // (Pero lo importante ya quedó guardado arriba)
       tipo_movimiento: tipo,
       tipoMovimiento: tipo,
+      type: tipo,
 
       productoId,
       producto_id: productoId,
-      productId: productoId,
 
       cantidad,
-      qty: cantidad,
-
       costoUnitario,
       costo_unitario: costoUnitario,
-
+      costoTotal,
       costo_total: costoTotal,
-      costoTotal: costoTotal,
 
       descripcion,
       referencia,
@@ -491,7 +473,9 @@ router.post("/", ensureAuth, async (req, res) => {
 
     const created = await InventoryMovement.create(payload);
 
-    // ✅ Contabilidad automática (si se puede) SIN romper el movimiento
+    // --------------------
+    // ✅ Asiento contable (NO rompe si falla)
+    // --------------------
     let asientoId = null;
     let asientoWarning = null;
 
@@ -506,9 +490,8 @@ router.post("/", ensureAuth, async (req, res) => {
         const bancosCode = accCode(bancos);
         const provCode = accCode(proveedores);
 
-        // si no hay inventario code/codigo, no generamos asiento (pero no rompemos)
         if (!invCode) {
-          asientoWarning = "No se pudo generar asiento: cuenta de Inventario (1201) sin code/codigo.";
+          asientoWarning = "No se pudo generar asiento: cuenta 1201 Inventario sin code/codigo.";
         } else {
           const metodoPago = parseMetodoPago(req.body);
           const tipoPago = parseTipoPago(req.body);
@@ -524,17 +507,12 @@ router.post("/", ensureAuth, async (req, res) => {
           const contraCode = usarProveedores ? provCode : (usarBancos ? bancosCode : cajaCode);
 
           if (!contraCode) {
-            asientoWarning = "No se pudo generar asiento: falta cuenta contrapartida (Caja/Bancos/Proveedores).";
+            asientoWarning = "No se pudo generar asiento: falta Caja/Bancos/Proveedores.";
           } else {
             const lines = [];
 
             if (isEntrada(tipo)) {
-              lines.push({
-                accountCodigo: invCode,
-                debit: Math.abs(costoTotal),
-                credit: 0,
-                memo: "Entrada inventario",
-              });
+              lines.push({ accountCodigo: invCode, debit: Math.abs(costoTotal), credit: 0, memo: "Entrada inventario" });
               lines.push({
                 accountCodigo: contraCode,
                 debit: 0,
@@ -542,18 +520,8 @@ router.post("/", ensureAuth, async (req, res) => {
                 memo: usarProveedores ? "Compra a crédito (proveedores)" : "Pago compra inventario",
               });
             } else if (isSalida(tipo)) {
-              lines.push({
-                accountCodigo: invCode,
-                debit: 0,
-                credit: Math.abs(costoTotal),
-                memo: "Salida inventario",
-              });
-              lines.push({
-                accountCodigo: contraCode,
-                debit: Math.abs(costoTotal),
-                credit: 0,
-                memo: "Salida por venta (costo)",
-              });
+              lines.push({ accountCodigo: invCode, debit: 0, credit: Math.abs(costoTotal), memo: "Salida inventario" });
+              lines.push({ accountCodigo: contraCode, debit: Math.abs(costoTotal), credit: 0, memo: "Salida por venta (costo)" });
             }
 
             if (lines.length >= 2) {
@@ -569,6 +537,7 @@ router.post("/", ensureAuth, async (req, res) => {
 
               asientoId = String(je._id);
 
+              // compat
               created.asientoId = asientoId;
               created.asiento_id = asientoId;
               created.journalEntryId = asientoId;
@@ -584,11 +553,14 @@ router.post("/", ensureAuth, async (req, res) => {
       }
     }
 
-    const out = created.toObject ? created.toObject() : created;
+    // ✅ re-fetch con populate para que el response traiga producto
+    const fresh = await InventoryMovement.findOne({ _id: created._id, owner })
+      .populate("productId", "nombre name imagen_url imagenUrl image sku codigo code costoCompra costo_compra precio price")
+      .lean();
 
     return res.status(201).json({
       ok: true,
-      data: mapMovementForUI(out),
+      data: mapMovementForUI(fresh || created),
       asientoId: asientoId || null,
       warning: asientoWarning || null,
     });
