@@ -910,12 +910,9 @@ function pickStockKey(productDoc) {
 async function updateProductStockAtomic(owner, productId, stockKey, qtyToDecrement) {
   if (!Product || !productId || !stockKey || !qtyToDecrement) return { ok: false };
 
-  // También incrementamos una métrica si existe, sin ser agresivos
   const inc = { [stockKey]: -qtyToDecrement };
   const bumpCandidates = ["totalVendido", "total_vendido", "totalUsadoVendido", "total_usado_vendido"];
   for (const k of bumpCandidates) {
-    // no sabemos si existe: lo hacemos con $inc igual, mongo lo crea si no existe.
-    // si no quieres que se cree, dime y lo quitamos.
     inc[k] = (inc[k] || 0) + qtyToDecrement;
     break;
   }
@@ -1277,7 +1274,7 @@ router.post("/", ensureAuth, async (req, res) => {
       req.body?.forceInventario === true;
 
     // ✅ Si es inventariado: validamos productId y pre-calculamos meta (stock/costo)
-    let invMeta = null; // { productId, productName, qty, costUnit, costTotal, stockKey }
+    let invMeta = null; // { productIdStr, productIdObj, productName, qty, costUnit, costTotal, stockKey }
     let productDoc = null;
 
     if (isInventariado) {
@@ -1328,7 +1325,8 @@ router.post("/", ensureAuth, async (req, res) => {
       }
 
       invMeta = {
-        productId: String(productDoc._id),
+        productIdStr: String(productDoc._id),
+        productIdObj: new mongoose.Types.ObjectId(String(productDoc._id)),
         productName: pname,
         qty,
         costUnit,
@@ -1558,9 +1556,25 @@ router.post("/", ensureAuth, async (req, res) => {
       numeroAsiento,
     });
 
+    // ============================
+    // ✅ FIX 1: espejo en la tx
+    // (útil para UI/queries; si tu schema no lo tiene, mongo igual lo guarda si no es strict)
+    // ============================
+    try {
+      tx.asientoId = tx.asientoId ?? entry._id;
+      tx.asiento_id = tx.asiento_id ?? entry._id;
+      tx.journalEntryId = tx.journalEntryId ?? entry._id;
+      tx.journal_entry_id = tx.journal_entry_id ?? entry._id;
+
+      tx.numeroAsiento = tx.numeroAsiento ?? numeroAsiento;
+      tx.numero_asiento = tx.numero_asiento ?? numeroAsiento;
+
+      await tx.save().catch(() => {});
+    } catch (_) {}
+
     // ✅ Si inventariado: decrementar stock de forma atómica (evita negativos)
-    if (invMeta?.productId && Product) {
-      const ok = await updateProductStockAtomic(owner, invMeta.productId, invMeta.stockKey, invMeta.qty);
+    if (invMeta?.productIdStr && Product) {
+      const ok = await updateProductStockAtomic(owner, invMeta.productIdStr, invMeta.stockKey, invMeta.qty);
       if (!ok?.ok) {
         // rollback contable y tx, porque inventario no se pudo ajustar
         await JournalEntry.deleteOne({ _id: entry._id, owner }).catch(() => {});
@@ -1573,26 +1587,35 @@ router.post("/", ensureAuth, async (req, res) => {
     }
 
     // ✅ crear movimiento de inventario “SALIDA” (si existe modelo) para que aparezca en Resumen Transacciones
-    if (invMeta?.productId) {
+    if (invMeta?.productIdStr) {
+      const asientoId = entry._id;
+
       await createInventorySalidaIfPossible(owner, {
         owner,
         fecha: tx.fecha,
         date: tx.fecha,
 
-        // vínculos
+        // vínculos (sourceId = tx._id; el asiento REAL es entry._id)
         source: "ingreso",
         sourceId: tx._id,
         transaccion_ingreso_id: tx._id,
 
-        journalEntryId: entry._id,
-        asientoId: entry._id,
-        numeroAsiento,
+        // ============================
+        // ✅ FIX 2: TODAS las llaves compat
+        // ============================
+        journalEntryId: asientoId,
+        journal_entry_id: asientoId,
+        asientoId: asientoId,
+        asiento_id: asientoId,
 
-        // producto
-        productId: invMeta.productId,
-        productoId: invMeta.productId,
-        product_id: invMeta.productId,
-        producto_id: invMeta.productId,
+        numeroAsiento,
+        numero_asiento: numeroAsiento,
+
+        // producto (ideal: ObjectId)
+        productId: invMeta.productIdObj,
+        productoId: invMeta.productIdObj,
+        product_id: invMeta.productIdObj,
+        producto_id: invMeta.productIdObj,
 
         producto: invMeta.productName,
         productName: invMeta.productName,
@@ -1615,8 +1638,9 @@ router.post("/", ensureAuth, async (req, res) => {
         descripcion: tx.descripcion,
         memo: tx.descripcion,
 
+        // estado/status (consistente con filtros)
         estado: "activo",
-        status: "active",
+        status: "activo",
       });
     }
 
