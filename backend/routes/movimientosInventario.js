@@ -69,6 +69,13 @@ function isValidObjectId(str) {
   return mongoose.Types.ObjectId.isValid(String(str || ""));
 }
 
+function toObjectId(v) {
+  if (!v) return null;
+  const s = String(v).trim();
+  if (!isValidObjectId(s)) return null;
+  return new mongoose.Types.ObjectId(s);
+}
+
 function accCode(acc) {
   if (!acc) return "";
   return String(acc.code ?? acc.codigo ?? acc.accountCode ?? acc.cuentaCodigo ?? "").trim();
@@ -76,8 +83,6 @@ function accCode(acc) {
 
 /**
  * Fechas (evitar UTC con YYYY-MM-DD)
- * Nota: aquí usamos fecha local “naive” como lo venías haciendo.
- * (Si quieres igualarlo a TZ_OFFSET_MINUTES como ingresos.js, lo hacemos después.)
  */
 function parseStartDate(s) {
   if (!s) return null;
@@ -124,7 +129,6 @@ function isSalida(tipo) {
 
 // --------------------
 // Contabilidad (resolver cuentas)
-// Basado en tu prototipo Bukipin:
 // 1001 Caja
 // 1002 Bancos
 // 1005 Inventario de Mercancías
@@ -142,8 +146,6 @@ async function findAccountByCode(owner, code) {
 
 async function findAccountByName(owner, nameRegex, type) {
   if (!Account) return null;
-
-  // soportar name/nombre
   const q = {
     owner,
     $or: [
@@ -151,7 +153,6 @@ async function findAccountByName(owner, nameRegex, type) {
       { nombre: { $regex: nameRegex, $options: "i" } },
     ],
   };
-
   if (type) q.type = type;
   return await Account.findOne(q).lean();
 }
@@ -215,12 +216,13 @@ function parseTipoPago(body) {
 }
 
 function isCredito(tipoPago) {
-  const t = String(tipoPago || "");
+  const t = String(tipoPago || "").toLowerCase();
   return (
     t.includes("credito") ||
     t.includes("crédito") ||
     t.includes("pendiente") ||
-    t.includes("por_pagar")
+    t.includes("por_pagar") ||
+    t.includes("por pagar")
   );
 }
 
@@ -244,63 +246,47 @@ function pickNumeroAsientoFromBody(body) {
 }
 
 // --------------------
-// ✅ JournalEntry helpers (modo lines por accountCodigo o accountId)
+// ✅ JournalEntry helpers
+// CLAVE: guardar SIEMPRE accountCodigo (para que UI no muestre "-")
+// y además accountId si existe (mejor para integridad)
 // --------------------
-function journalLineMode() {
-  const schema = JournalEntry?.schema;
-  if (!schema) return "code";
-
-  const hasAccountId =
-    schema.path("lines.accountId") ||
-    schema.path("lines.$.accountId") ||
-    schema.path("lines.0.accountId");
-
-  if (hasAccountId) return "id";
-
-  const hasAccountCodigo =
-    schema.path("lines.accountCodigo") ||
-    schema.path("lines.$.accountCodigo") ||
-    schema.path("lines.0.accountCodigo");
-
-  if (hasAccountCodigo) return "code";
-
-  return "code";
-}
-
-async function accountIdByCode(owner, code) {
+async function accountByCode(owner, code) {
   if (!Account || !code) return null;
   const c = String(code).trim();
-  const acc = await Account.findOne({
+  return await Account.findOne({
     owner,
     $or: [{ code: c }, { codigo: c }, { cuentaCodigo: c }, { accountCode: c }],
   })
-    .select("_id")
+    .select("_id code name nombre")
     .lean();
-  return acc?._id || null;
 }
 
 async function buildLine(owner, { code, debit = 0, credit = 0, memo = "" }) {
-  const mode = journalLineMode();
+  const c = String(code || "").trim();
+  if (!c) {
+    const err = new Error("buildLine: code inválido.");
+    err.statusCode = 400;
+    throw err;
+  }
 
-  const base = {
+  // buscamos cuenta para obtener accountId
+  const acc = await accountByCode(owner, c);
+
+  // SIEMPRE dejamos accountCodigo (para UI),
+  // y si existe accountId lo incluimos también.
+  return {
+    accountCodigo: c,
+    // compat extra (por si alguna ruta/UI usa estos)
+    accountCode: c,
+    cuentaCodigo: c,
+    cuenta_codigo: c,
+
+    ...(acc?._id ? { accountId: acc._id } : {}),
+
     debit: num(debit, 0),
     credit: num(credit, 0),
     memo: memo || "",
   };
-
-  if (mode === "id") {
-    const id = await accountIdByCode(owner, code);
-    if (!id) {
-      const err = new Error(
-        `No existe la cuenta contable con code/codigo="${String(code).trim()}" para este usuario.`
-      );
-      err.statusCode = 400;
-      throw err;
-    }
-    return { ...base, accountId: id };
-  }
-
-  return { ...base, accountCodigo: String(code).trim() };
 }
 
 async function nextJournalNumber(owner, dateObj) {
@@ -456,19 +442,16 @@ router.get("/", ensureAuth, async (req, res) => {
       });
     }
 
-    // fecha/date
-    if (start && end) and.push({ $or: [{ fecha: { $gte: start, $lte: end } }, { date: { $gte: start, $lte: end } }] });
+    if (start && end)
+      and.push({ $or: [{ fecha: { $gte: start, $lte: end } }, { date: { $gte: start, $lte: end } }] });
     else if (start && !end) and.push({ $or: [{ fecha: { $gte: start } }, { date: { $gte: start } }] });
     else if (!start && end) and.push({ $or: [{ fecha: { $lte: end } }, { date: { $lte: end } }] });
 
     if (productoId) {
-      if (isValidObjectId(productoId)) {
+      const oid = toObjectId(productoId);
+      if (oid) {
         and.push({
-          $or: [
-            { productId: new mongoose.Types.ObjectId(productoId) },
-            { productoId: new mongoose.Types.ObjectId(productoId) },
-            { producto_id: new mongoose.Types.ObjectId(productoId) },
-          ],
+          $or: [{ productId: oid }, { productoId: oid }, { producto_id: oid }],
         });
       } else {
         and.push({ $or: [{ productId: productoId }, { productoId: productoId }, { producto_id: productoId }] });
@@ -500,12 +483,6 @@ router.get("/", ensureAuth, async (req, res) => {
 
 // --------------------
 // POST /api/movimientos-inventario
-// ✅ Ajustado al prototipo Bukipin
-// - Inventario = 1005
-// - Salidas: 5002 vs 1005 (NO toca Caja/Bancos)
-// - Si llega asientoId (desde ingresos.js) NO crear asiento nuevo
-// - ✅ FIX: si creamos asiento aquí, SIEMPRE generamos numeroAsiento
-// - ✅ FIX: JournalEntry shape canónico (date/concept/source/sourceId/lines/numeroAsiento)
 // --------------------
 router.post("/", ensureAuth, async (req, res) => {
   try {
@@ -559,7 +536,7 @@ router.post("/", ensureAuth, async (req, res) => {
       return res.status(400).json({ ok: false, message: "cantidad es requerida y no puede ser 0." });
     }
 
-    // ✅ 1) si no vino costoUnitario, tomarlo del producto
+    // ✅ 1) fallback costo del producto
     if ((!Number.isFinite(costoUnitario) || costoUnitario <= 0) && Product) {
       const prod = await Product.findOne({ _id: new mongoose.Types.ObjectId(productoId), owner })
         .select("costoCompra costo_compra precio price")
@@ -584,12 +561,12 @@ router.post("/", ensureAuth, async (req, res) => {
       if (costoUnitario === 0 && cantidad) costoUnitario = costoTotal / Math.abs(cantidad);
     }
 
-    // qty canónico positivo
     const qtyCanon = Math.abs(cantidad);
 
-    // Si llega un asientoId externo (ej. desde ingresos.js), NO creamos asiento aquí.
     const asientoIdExterno = pickAsientoIdFromBody(req.body) || null;
     const numeroAsientoExterno = pickNumeroAsientoFromBody(req.body) || null;
+
+    const prodOid = new mongoose.Types.ObjectId(productoId);
 
     const payload = {
       owner,
@@ -600,7 +577,7 @@ router.post("/", ensureAuth, async (req, res) => {
       status: estado,
       estado: estado,
 
-      productId: new mongoose.Types.ObjectId(productoId),
+      productId: prodOid,
       qty: qtyCanon,
       unitCost: costoUnitario,
       total: costoTotal,
@@ -614,8 +591,8 @@ router.post("/", ensureAuth, async (req, res) => {
       tipo_movimiento: tipo,
       tipoMovimiento: tipo,
 
-      productoId: new mongoose.Types.ObjectId(productoId),
-      producto_id: new mongoose.Types.ObjectId(productoId),
+      productoId: prodOid,
+      producto_id: prodOid,
 
       cantidad: qtyCanon,
       costoUnitario,
@@ -627,7 +604,7 @@ router.post("/", ensureAuth, async (req, res) => {
       descripcion,
       referencia,
 
-      // Si viene desde afuera (venta), guardamos referencia a ese asiento:
+      // si viene asiento externo (ventas)
       asientoId: asientoIdExterno || undefined,
       asiento_id: asientoIdExterno || undefined,
       journalEntryId: asientoIdExterno || undefined,
@@ -641,21 +618,16 @@ router.post("/", ensureAuth, async (req, res) => {
 
     // --------------------
     // ✅ Asiento contable
-    // - Si ya llegó asiento externo, NO hacemos nada.
-    // - Si es ENTRADA: 1005 vs (1001/1002/2001) según método/tipo de pago
-    // - Si es SALIDA: 5002 vs 1005 (NO Caja/Bancos)
     // --------------------
     let asientoId = asientoIdExterno || null;
     let numeroAsiento = numeroAsientoExterno || null;
     let asientoWarning = null;
 
-    const debeGenerarAsiento =
-      !asientoIdExterno && (isEntrada(tipo) || isSalida(tipo)) && costoTotal > 0;
+    const debeGenerarAsiento = !asientoIdExterno && (isEntrada(tipo) || isSalida(tipo)) && costoTotal > 0;
 
     if (debeGenerarAsiento && JournalEntry && Account) {
       try {
-        const { inv, caja, bancos, proveedores, costoVentasInv } =
-          await resolveInventoryAccounts(owner);
+        const { inv, caja, bancos, proveedores, costoVentasInv } = await resolveInventoryAccounts(owner);
 
         const invCode = accCode(inv); // 1005
         const cajaCode = accCode(caja); // 1001
@@ -664,12 +636,11 @@ router.post("/", ensureAuth, async (req, res) => {
         const cogsCode = accCode(costoVentasInv); // 5002
 
         if (!invCode) {
-          asientoWarning =
-            "No se pudo generar asiento: falta cuenta 1005 Inventario de Mercancías.";
+          asientoWarning = "No se pudo generar asiento: falta cuenta 1005 Inventario de Mercancías.";
         } else {
           const lines = [];
 
-          // ---------------- ENTRADA / COMPRA ----------------
+          // ENTRADA
           if (isEntrada(tipo)) {
             const metodoPago = parseMetodoPago(req.body);
             const tipoPago = parseTipoPago(req.body);
@@ -682,13 +653,10 @@ router.post("/", ensureAuth, async (req, res) => {
               metodoPago.includes("tdd") ||
               metodoPago.includes("tdc");
 
-            const contraCode = usarProveedores
-              ? provCode
-              : (usarBancos ? bancosCode : cajaCode);
+            const contraCode = usarProveedores ? provCode : usarBancos ? bancosCode : cajaCode;
 
             if (!contraCode) {
-              asientoWarning =
-                "No se pudo generar asiento de compra: falta Caja/Bancos/Proveedores.";
+              asientoWarning = "No se pudo generar asiento de compra: falta Caja/Bancos/Proveedores.";
             } else {
               lines.push(
                 await buildLine(owner, {
@@ -704,22 +672,17 @@ router.post("/", ensureAuth, async (req, res) => {
                   code: contraCode,
                   debit: 0,
                   credit: Math.abs(costoTotal),
-                  memo: usarProveedores
-                    ? "Compra a crédito (Proveedores)"
-                    : "Pago compra inventario",
+                  memo: usarProveedores ? "Compra a crédito (Proveedores)" : "Pago compra inventario",
                 })
               );
             }
           }
 
-          // ---------------- SALIDA / VENTA / AJUSTE SALIDA ----------------
+          // SALIDA
           if (isSalida(tipo)) {
             if (!cogsCode) {
-              asientoWarning =
-                "No se pudo generar asiento de salida: falta cuenta 5002 Costo de Ventas Inventario.";
+              asientoWarning = "No se pudo generar asiento de salida: falta cuenta 5002 Costo de Ventas Inventario.";
             } else {
-              // Este asiento es SOLO inventario/costo.
-              // Caja/Bancos + Ventas (4001) se generan en ingresos.js cuando es venta real.
               lines.push(
                 await buildLine(owner, {
                   code: cogsCode,
@@ -741,13 +704,14 @@ router.post("/", ensureAuth, async (req, res) => {
           }
 
           if (lines.length >= 2) {
-            // ✅ FIX: siempre generar numeroAsiento (evita null/duplicate)
+            // ✅ SIEMPRE folio (numeroAsiento)
             numeroAsiento = (await nextJournalNumber(owner, fecha)) || null;
 
             const je = await JournalEntry.create({
               owner,
               date: fecha,
               concept: descripcion || `Movimiento inventario (${tipo})`,
+              referencia: referencia || "",
               source: "inventario",
               sourceId: created._id,
               lines,
@@ -802,12 +766,7 @@ router.post("/", ensureAuth, async (req, res) => {
 
 // --------------------
 // DELETE /api/movimientos-inventario/:id
-// ✅ Prototipo: "Cancelar" (soft cancel) en vez de borrar
-// - status => cancelado
-// - Si el asiento fue creado por este módulo (source=inventario y sourceId==movimiento),
-//   crea reversa contable. Si no, NO toca el asiento (ej. ventas creadas en ingresos.js).
-// - Si mandas ?hard=1 => borra físicamente
-// - ✅ FIX: reversa también genera numeroAsiento y usa shape canónico
+// Soft cancel + reversa si el asiento fue creado por inventario
 // --------------------
 router.delete("/:id", ensureAuth, async (req, res) => {
   try {
@@ -831,7 +790,6 @@ router.delete("/:id", ensureAuth, async (req, res) => {
       return res.json({ ok: true, hard: true });
     }
 
-    // Soft cancel
     found.status = "cancelado";
     found.estado = "cancelado";
 
@@ -845,7 +803,7 @@ router.delete("/:id", ensureAuth, async (req, res) => {
       try {
         const je = await JournalEntry.findOne({ _id: asientoId, owner }).lean();
 
-        // Solo revertimos si el asiento fue generado por ESTE módulo.
+        // Solo revertimos si el asiento fue generado por ESTE módulo
         const isFromThisModule =
           je &&
           String(je.source || "") === "inventario" &&
@@ -854,33 +812,19 @@ router.delete("/:id", ensureAuth, async (req, res) => {
         if (isFromThisModule) {
           const originalLines = Array.isArray(je.lines) ? je.lines : [];
 
-          const reversedLines = [];
-          for (const ln of originalLines) {
+          const reversedLines = originalLines.map((ln) => {
             const code =
-              ln.accountCodigo ??
-              ln.accountCode ??
-              ln.cuentaCodigo ??
-              ln.cuenta_codigo ??
-              null;
+              (ln.accountCodigo ?? ln.accountCode ?? ln.cuentaCodigo ?? ln.cuenta_codigo ?? "").toString().trim();
 
-            // si es modo accountId, preservamos accountId
-            const lineMode = journalLineMode();
-            if (lineMode === "id" && ln.accountId) {
-              reversedLines.push({
-                accountId: ln.accountId,
-                debit: num(ln.credit, 0),
-                credit: num(ln.debit, 0),
-                memo: `Reversa: ${ln.memo || "Movimiento inventario"}`,
-              });
-            } else {
-              reversedLines.push({
-                accountCodigo: code ? String(code).trim() : null,
-                debit: num(ln.credit, 0),
-                credit: num(ln.debit, 0),
-                memo: `Reversa: ${ln.memo || "Movimiento inventario"}`,
-              });
-            }
-          }
+            return {
+              // ✅ CLAVE: siempre dejar accountCodigo para que UI no muestre "-"
+              ...(code ? { accountCodigo: code, accountCode: code, cuentaCodigo: code, cuenta_codigo: code } : {}),
+              ...(ln.accountId ? { accountId: ln.accountId } : {}),
+              debit: num(ln.credit, 0),
+              credit: num(ln.debit, 0),
+              memo: `Reversa: ${ln.memo || "Movimiento inventario"}`,
+            };
+          });
 
           const numeroAsiento = (await nextJournalNumber(owner, new Date())) || null;
 
@@ -888,6 +832,7 @@ router.delete("/:id", ensureAuth, async (req, res) => {
             owner,
             date: new Date(),
             concept: `REVERSA - ${je.concept ?? je.concepto ?? je.descripcion ?? "Asiento inventario"}`,
+            referencia: `REV-${je.referencia || ""}`.trim(),
             source: "inventario_reversal",
             sourceId: found._id,
             lines: reversedLines,
