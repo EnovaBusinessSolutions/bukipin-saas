@@ -6,8 +6,17 @@ const JournalEntry = require("../models/JournalEntry");
 const Account = require("../models/Account");
 const ensureAuth = require("../middleware/ensureAuth");
 
+// ✅ FIX: num() robusto (soporta "$1,200", " 1,200 ", etc.)
 function num(v, def = 0) {
-  const n = Number(String(v ?? "").replace(/,/g, ""));
+  if (v === null || typeof v === "undefined") return def;
+  if (typeof v === "number") return Number.isFinite(v) ? v : def;
+
+  const s = String(v).trim();
+  if (!s) return def;
+
+  // quita $ , espacios y símbolos comunes
+  const cleaned = s.replace(/[$,\s]/g, "");
+  const n = Number(cleaned);
   return Number.isFinite(n) ? n : def;
 }
 
@@ -23,7 +32,6 @@ function toYMD(d) {
 function parseYMD(s) {
   const str = String(s || "").trim();
   if (!/^\d{4}-\d{2}-\d{2}$/.test(str)) return null;
-  // ojo: es local, pero para filtros diarios nos funciona bien si usamos dayEnd()
   const d = new Date(`${str}T00:00:00`);
   if (Number.isNaN(d.getTime())) return null;
   return d;
@@ -184,6 +192,8 @@ function mapEntryForUI(entry, accountMapsOrNameMap = {}) {
             : null;
 
     const side = String(l?.side || "").toLowerCase().trim();
+
+    // ✅ FIX: monto y debit/credit robustos (strings con $)
     const monto =
       num(l?.monto, 0) ||
       num(l?.amount, 0) ||
@@ -260,11 +270,13 @@ router.get("/depreciaciones", ensureAuth, async (_req, res) => {
  * ✅ Endpoint saldo por cuentas:
  * GET /api/asientos/detalle?cuentas=1001,1002&start=YYYY-MM-DD&end=YYYY-MM-DD
  *
- * Devuelve: [{ cuenta_codigo, cuenta_nombre, debe, haber, neto }]
+ * Devuelve: [{ cuenta_codigo, cuenta_nombre, debe, haber, neto, saldo }]
  *
  * ✅ FIX E2E:
  * - soporta líneas con code o con accountId
  * - usa dateField real (date/fecha/createdAt)
+ * - num() robusto (soporta strings con "$")
+ * - agrega "saldo" (alias de neto) para hooks/UI
  */
 router.get("/detalle", ensureAuth, async (req, res) => {
   try {
@@ -275,10 +287,18 @@ router.get("/detalle", ensureAuth, async (req, res) => {
     const endRaw = req.query.end ?? req.query.to ?? req.query.until ?? null;
 
     if (startRaw && !parseYMD(startRaw)) {
-      return res.status(400).json({ ok: false, error: "VALIDATION", message: "Fecha 'start/from' inválida. Usa YYYY-MM-DD" });
+      return res.status(400).json({
+        ok: false,
+        error: "VALIDATION",
+        message: "Fecha 'start/from' inválida. Usa YYYY-MM-DD",
+      });
     }
     if (endRaw && !parseYMD(endRaw)) {
-      return res.status(400).json({ ok: false, error: "VALIDATION", message: "Fecha 'end/to' inválida. Usa YYYY-MM-DD" });
+      return res.status(400).json({
+        ok: false,
+        error: "VALIDATION",
+        message: "Fecha 'end/to' inválida. Usa YYYY-MM-DD",
+      });
     }
 
     const start = parseYMD(startRaw);
@@ -299,7 +319,9 @@ router.get("/detalle", ensureAuth, async (req, res) => {
       const rows = await Account.find({
         owner,
         $or: [{ code: /^50/ }, { code: /^51/ }, { code: /^52/ }],
-      }).select("code").lean();
+      })
+        .select("code")
+        .lean();
 
       codes = Array.from(new Set((rows || []).map((r) => String(r.code || "").trim()).filter(Boolean)));
     }
@@ -316,10 +338,12 @@ router.get("/detalle", ensureAuth, async (req, res) => {
       if (end) match[dateField].$lte = dayEnd(end);
     }
 
-    // Traemos SOLO lo necesario (para calcular saldos bien aunque venga accountId sin code)
-    const docs = await JournalEntry.find(match).select(`${dateField} lines detalle_asientos detalles_asiento`).lean();
+    // Traer SOLO lo necesario para calcular saldos
+    const docs = await JournalEntry.find(match)
+      .select(`${dateField} lines detalle_asientos detalles_asiento`)
+      .lean();
 
-    // juntar líneas para resolver mapas
+    // juntar líneas para resolver mapas (por accountId también)
     const allLines = [];
     for (const e of docs) {
       const lines = e.lines || e.detalle_asientos || e.detalles_asiento || [];
@@ -338,6 +362,7 @@ router.get("/detalle", ensureAuth, async (req, res) => {
         debe: 0,
         haber: 0,
         neto: 0,
+        saldo: 0, // ✅ alias útil para UI/hook
       };
     }
 
@@ -383,6 +408,7 @@ router.get("/detalle", ensureAuth, async (req, res) => {
         if (!code || !byCode[code]) continue;
 
         const side = String(l?.side || "").toLowerCase().trim();
+
         const monto =
           num(l?.monto, 0) ||
           num(l?.amount, 0) ||
@@ -398,10 +424,14 @@ router.get("/detalle", ensureAuth, async (req, res) => {
       }
     }
 
-    const items = Object.values(byCode).map((r) => ({
-      ...r,
-      neto: num(r.debe, 0) - num(r.haber, 0),
-    }));
+    const items = Object.values(byCode).map((r) => {
+      const neto = num(r.debe, 0) - num(r.haber, 0);
+      return {
+        ...r,
+        neto,
+        saldo: neto, // ✅ alias
+      };
+    });
 
     return res.json({
       ok: true,
@@ -413,6 +443,7 @@ router.get("/detalle", ensureAuth, async (req, res) => {
         start: start ? toYMD(start) : null,
         end: end ? toYMD(end) : null,
         codes_count: codes.length,
+        docs_count: Array.isArray(docs) ? docs.length : 0,
       },
     });
   } catch (e) {
@@ -480,6 +511,7 @@ router.get("/", ensureAuth, async (req, res) => {
         start: start ? toYMD(start) : null,
         end: end ? toYMD(end) : null,
         dateField,
+        docs_count: Array.isArray(docs) ? docs.length : 0,
       },
     });
   } catch (e) {

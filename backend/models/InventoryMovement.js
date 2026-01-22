@@ -8,10 +8,22 @@ const inventoryMovementSchema = new mongoose.Schema(
     fecha: { type: Date, default: Date.now, index: true },
 
     // venta | compra | ajuste | entrada | salida | ajuste_entrada | ajuste_salida
-    tipo: { type: String, default: "venta", trim: true, index: true },
+    tipo: {
+      type: String,
+      default: "venta",
+      trim: true,
+      index: true,
+      enum: ["venta", "compra", "ajuste", "entrada", "salida", "ajuste_entrada", "ajuste_salida"],
+    },
 
     // ✅ Estado canónico
-    status: { type: String, default: "activo", trim: true, index: true }, // activo | cancelado | ...
+    status: {
+      type: String,
+      default: "activo",
+      trim: true,
+      index: true,
+      enum: ["activo", "cancelado"],
+    },
 
     // ✅ Campo real (ref)
     productId: { type: mongoose.Schema.Types.ObjectId, ref: "Product", default: null, index: true },
@@ -29,7 +41,7 @@ const inventoryMovementSchema = new mongoose.Schema(
     source: { type: String, default: "" }, // ui | inventario | venta | compra | etc.
     sourceId: { type: mongoose.Schema.Types.ObjectId, default: null },
 
-    // ✅ Contabilidad (persistir para el modal)
+    // ✅ Contabilidad
     asientoId: { type: mongoose.Schema.Types.ObjectId, ref: "JournalEntry", default: null, index: true },
     asiento_reversion_id: { type: mongoose.Schema.Types.ObjectId, ref: "JournalEntry", default: null, index: true },
 
@@ -59,8 +71,8 @@ function toNum(v) {
 }
 
 // ----------------------------
-// ✅ Virtual populate CORRECTO (evita el 500 si alguien hace populate("productoId"))
-// - OJO: esto NO es alias setter/getter. Es populate real.
+// ✅ Virtual populate CORRECTO
+// (evita 500 si alguien hace populate("productoId"))
 // ----------------------------
 inventoryMovementSchema.virtual("productoId", {
   ref: "Product",
@@ -82,8 +94,8 @@ inventoryMovementSchema.virtual("product", {
 });
 
 // ----------------------------
-// ✅ Aliases de lectura/escritura (compat de payload)
-// Estas NO se deben usar para populate.
+// ✅ Aliases de lectura/escritura (compat payload/UI)
+// (Estas NO se deben usar para populate)
 // ----------------------------
 
 // estado -> status
@@ -94,6 +106,34 @@ inventoryMovementSchema
   })
   .set(function (v) {
     this.status = v;
+  });
+
+// type / tipo_movimiento / tipoMovimiento -> tipo
+inventoryMovementSchema
+  .virtual("type")
+  .get(function () {
+    return this.tipo;
+  })
+  .set(function (v) {
+    this.tipo = v;
+  });
+
+inventoryMovementSchema
+  .virtual("tipo_movimiento")
+  .get(function () {
+    return this.tipo;
+  })
+  .set(function (v) {
+    this.tipo = v;
+  });
+
+inventoryMovementSchema
+  .virtual("tipoMovimiento")
+  .get(function () {
+    return this.tipo;
+  })
+  .set(function (v) {
+    this.tipo = v;
   });
 
 // cantidad / unidades / quantity -> qty
@@ -190,11 +230,39 @@ inventoryMovementSchema
     this.nota = v;
   });
 
+// ✅ Compat contable: asiento_id / journalEntryId / journal_entry_id -> asientoId
+inventoryMovementSchema
+  .virtual("asiento_id")
+  .get(function () {
+    return this.asientoId;
+  })
+  .set(function (v) {
+    this.asientoId = v;
+  });
+
+inventoryMovementSchema
+  .virtual("journalEntryId")
+  .get(function () {
+    return this.asientoId;
+  })
+  .set(function (v) {
+    this.asientoId = v;
+  });
+
+inventoryMovementSchema
+  .virtual("journal_entry_id")
+  .get(function () {
+    return this.asientoId;
+  })
+  .set(function (v) {
+    this.asientoId = v;
+  });
+
 // ----------------------------
 // ✅ NORMALIZACIÓN AUTOMÁTICA (E2E)
-// - Si llega total=0 pero unitCost y qty existen => calcula total
-// - Si llega unitCost=0 pero total y qty existen => calcula unitCost
-// - Normaliza strings tipo "$40" / "1,200"
+// - Normaliza "$40" / "1,200"
+// - Deriva total/unitCost si faltan
+// - Guarda fecha_cancelacion cuando status pasa a cancelado
 // ----------------------------
 inventoryMovementSchema.pre("validate", function (next) {
   try {
@@ -207,22 +275,23 @@ inventoryMovementSchema.pre("validate", function (next) {
     if (Number.isFinite(total)) this.total = total;
 
     // Si qty inválido o 0, no hay nada que derivar
-    if (!Number.isFinite(qty) || qty === 0) return next();
-
-    const hasUC = Number.isFinite(unitCost) && unitCost > 0;
-    const hasT = Number.isFinite(total) && total > 0;
-
-    if (!hasT && hasUC) {
-      this.total = Math.abs(unitCost) * Math.abs(qty);
-    } else if (!hasUC && hasT) {
-      this.unitCost = Math.abs(total) / Math.abs(qty);
+    if (!Number.isFinite(this.qty) || this.qty === 0) {
+      if (!this.status) this.status = "activo";
+      return next();
     }
 
-    // Asegurar no negativos raros
+    const hasUC = Number.isFinite(this.unitCost) && this.unitCost > 0;
+    const hasT = Number.isFinite(this.total) && this.total > 0;
+
+    if (!hasT && hasUC) {
+      this.total = Math.abs(this.unitCost) * Math.abs(this.qty);
+    } else if (!hasUC && hasT) {
+      this.unitCost = Math.abs(this.total) / Math.abs(this.qty);
+    }
+
     if (!Number.isFinite(this.unitCost) || this.unitCost < 0) this.unitCost = 0;
     if (!Number.isFinite(this.total) || this.total < 0) this.total = Math.abs(this.total || 0);
 
-    // status default seguro
     if (!this.status) this.status = "activo";
 
     return next();
@@ -231,7 +300,19 @@ inventoryMovementSchema.pre("validate", function (next) {
   }
 });
 
-// Index compuesto útil (owner + fecha ya existe como idea)
+// Si cambia status a cancelado, deja rastro automáticamente
+inventoryMovementSchema.pre("save", function (next) {
+  try {
+    if (this.isModified("status") && String(this.status) === "cancelado") {
+      if (!this.fecha_cancelacion) this.fecha_cancelacion = new Date();
+    }
+    return next();
+  } catch (e) {
+    return next(e);
+  }
+});
+
+// Index compuesto útil
 inventoryMovementSchema.index({ owner: 1, fecha: -1 });
 inventoryMovementSchema.index({ owner: 1, productId: 1, fecha: -1 });
 

@@ -138,8 +138,18 @@ function fixFechaWithCreatedAt(tx) {
   );
 }
 
+/**
+ * ✅ num robusto (soporta "$1,200" / "1,200")
+ */
 function num(v, def = 0) {
-  const n = Number(v);
+  if (v === null || typeof v === "undefined") return def;
+  if (typeof v === "number") return Number.isFinite(v) ? v : def;
+
+  const s = String(v).trim();
+  if (!s) return def;
+
+  const cleaned = s.replace(/[$,\s]/g, "");
+  const n = Number(cleaned);
   return Number.isFinite(n) ? n : def;
 }
 
@@ -652,19 +662,50 @@ async function buildLine(owner, { code, debit = 0, credit = 0, memo = "" }) {
   return { ...base, accountCodigo: String(code).trim() };
 }
 
-function mapEntryForUI(entry, accountNameMap = {}) {
+/**
+ * ✅ Mapper JournalEntry → UI (soporta líneas por code o por accountId)
+ */
+function mapEntryForUI(entry, accountMaps = {}) {
+  const nameByCode = accountMaps?.nameByCode || {};
+  const codeById = accountMaps?.codeById || {};
+  const nameById = accountMaps?.nameById || {};
+
   const rawLines = entry.lines || entry.detalle_asientos || [];
 
   const detalle_asientos = (rawLines || []).map((l) => {
-    const cuentaCodigo = l.accountCodigo ?? l.accountCode ?? l.cuenta_codigo ?? "";
-    const cuenta_codigo = cuentaCodigo ? String(cuentaCodigo).trim() : "";
+    // 1) intentar por code
+    let cuenta_codigo = String(
+      l.accountCodigo ??
+        l.accountCode ??
+        l.cuenta_codigo ??
+        l.cuentaCodigo ??
+        ""
+    ).trim();
+
+    // 2) si no hay code, resolver por accountId
+    if (!cuenta_codigo) {
+      const aid = l.accountId ?? l.cuenta_id ?? l.account ?? null;
+      if (aid) {
+        const sid = String(aid);
+        if (codeById[sid]) cuenta_codigo = String(codeById[sid]).trim();
+      }
+    }
+
+    const aid2 = l.accountId ?? l.cuenta_id ?? l.account ?? null;
+    const sid2 = aid2 ? String(aid2) : null;
+
+    const cuenta_nombre =
+      (cuenta_codigo ? (nameByCode[cuenta_codigo] || null) : null) ||
+      (sid2 ? (nameById[sid2] || null) : null);
+
+    const memo = l.memo ?? l.descripcion ?? "";
 
     return {
       cuenta_codigo: cuenta_codigo || null,
-      cuenta_nombre: cuenta_codigo ? (accountNameMap[cuenta_codigo] || null) : null,
+      cuenta_nombre,
       debe: num(l.debit ?? l.debe, 0),
       haber: num(l.credit ?? l.haber, 0),
-      memo: l.memo ?? "",
+      memo,
     };
   });
 
@@ -679,6 +720,8 @@ function mapEntryForUI(entry, accountNameMap = {}) {
   const concepto = entry.concept ?? entry.concepto ?? "";
   const numeroAsiento = entry.numeroAsiento ?? entry.numero_asiento ?? null;
 
+  const fecha = entry.date ?? entry.fecha ?? entry.createdAt ?? null;
+
   return {
     id: String(entry._id),
     _id: entry._id,
@@ -686,8 +729,8 @@ function mapEntryForUI(entry, accountNameMap = {}) {
     numeroAsiento,
     numero_asiento: numeroAsiento,
 
-    asiento_fecha: toYMDLocal(entry.date),
-    fecha: entry.date,
+    asiento_fecha: fecha ? toYMDLocal(fecha) : null,
+    fecha,
 
     descripcion: concepto,
     concepto,
@@ -726,7 +769,7 @@ function flattenDetalles(entries, accountMaps = null) {
   };
 
   for (const e of entries) {
-    const asientoFecha = toYMDLocal(e.date);
+    const asientoFecha = toYMDLocal(e.date ?? e.fecha ?? e.createdAt ?? null);
     for (const l of e.lines || []) {
       const cuenta_codigo = getCodeFromLine(l);
 
@@ -871,7 +914,7 @@ router.get("/asientos", ensureAuth, async (req, res) => {
 
     const accountMaps = await buildAccountMaps(owner, entries);
 
-    const asientos = entries.map((e) => mapEntryForUI(e, accountMaps.nameByCode));
+    const asientos = entries.map((e) => mapEntryForUI(e, accountMaps));
     const detalles = flattenDetalles(entries, accountMaps);
 
     return res.json({
@@ -911,7 +954,8 @@ router.get("/detalles", ensureAuth, async (req, res) => {
       .sort({ date: -1, createdAt: -1 })
       .lean();
 
-    const detalles = flattenDetalles(entries);
+    const accountMaps = await buildAccountMaps(owner, entries);
+    const detalles = flattenDetalles(entries, accountMaps);
 
     const itemsRaw = await IncomeTransaction.find({
       owner,
@@ -969,13 +1013,8 @@ router.get("/asientos-directos", ensureAuth, async (req, res) => {
       .limit(limit)
       .lean();
 
-    const allCodes = entries
-      .flatMap((e) => (e.lines || []).map((l) => l.accountCodigo ?? l.accountCode ?? null))
-      .filter(Boolean)
-      .map(String);
-
-    const accountNameMap = await getAccountNameMap(owner, allCodes);
-    const asientos = entries.map((e) => mapEntryForUI(e, accountNameMap));
+    const accountMaps = await buildAccountMaps(owner, entries);
+    const asientos = entries.map((e) => mapEntryForUI(e, accountMaps));
 
     return res.json({ ok: true, data: { asientos }, asientos });
   } catch (err) {
@@ -1084,7 +1123,8 @@ router.post("/", ensureAuth, async (req, res) => {
       req.body?.item_id ??
       null;
 
-    if (!subcuentaRef && productIdRaw) {
+    // ✅ FIX: evitar crash si productIdRaw no es ObjectId
+    if (!subcuentaRef && productIdRaw && isObjectId(productIdRaw)) {
       // inferir desde producto
       const p = await Product?.findOne({
         owner,
@@ -1205,51 +1245,51 @@ router.post("/", ensureAuth, async (req, res) => {
     }
 
     if (tipoPago === "contado") {
-  lines.push(
-    await buildLine(owner, {
-      code: codCobro,
-      debit: neto,
-      credit: 0,
-      memo: "Cobro contado",
-    })
-  );
-} else {
-  if (montoPagado > 0) {
+      lines.push(
+        await buildLine(owner, {
+          code: codCobro,
+          debit: neto,
+          credit: 0,
+          memo: "Cobro contado",
+        })
+      );
+    } else {
+      if (montoPagado > 0) {
+        lines.push(
+          await buildLine(owner, {
+            code: codCobro,
+            debit: montoPagado,
+            credit: 0,
+            memo: "Cobro",
+          })
+        );
+      }
+
+      // ✅ SIEMPRE: saldo pendiente a 1003 (Cuentas por Cobrar Clientes)
+      if (saldoPendiente > 0) {
+        lines.push(
+          await buildLine(owner, {
+            code: COD_CXC,
+            debit: saldoPendiente,
+            credit: 0,
+            memo: "Saldo pendiente (Cuentas por Cobrar)",
+          })
+        );
+      }
+    }
+
+    // ✅ CLAVE: el haber del ingreso debe caer en subcuenta si existe
+    const haberIngresos = descuento > 0 ? total : neto;
+    const codeIngreso = subcuentaCodigoResolved || cuentaCodigo;
+
     lines.push(
       await buildLine(owner, {
-        code: codCobro,
-        debit: montoPagado,
-        credit: 0,
-        memo: "Cobro",
+        code: codeIngreso,
+        debit: 0,
+        credit: haberIngresos,
+        memo: subcuentaCodigoResolved ? "Ingreso (subcuenta)" : "Ingreso",
       })
     );
-  }
-
-  // ✅ SIEMPRE: saldo pendiente a 1003 (Cuentas por Cobrar Clientes)
-  if (saldoPendiente > 0) {
-    lines.push(
-      await buildLine(owner, {
-        code: COD_CXC,
-        debit: saldoPendiente,
-        credit: 0,
-        memo: "Saldo pendiente (Cuentas por Cobrar)",
-      })
-    );
-  }
-} // ✅ <-- ESTA LLAVE TE FALTABA (cierra el else)
-
-// ✅ CLAVE: el haber del ingreso debe caer en subcuenta si existe
-const haberIngresos = descuento > 0 ? total : neto;
-const codeIngreso = subcuentaCodigoResolved || cuentaCodigo;
-
-lines.push(
-  await buildLine(owner, {
-    code: codeIngreso,
-    debit: 0,
-    credit: haberIngresos,
-    memo: subcuentaCodigoResolved ? "Ingreso (subcuenta)" : "Ingreso",
-  })
-);
 
     const numeroAsiento = await nextJournalNumber(owner, tx.fecha);
 
@@ -1263,13 +1303,9 @@ lines.push(
       numeroAsiento,
     });
 
-    const entryCodes = (entry.lines || [])
-      .map((l) => l.accountCodigo ?? l.accountCode ?? null)
-      .filter(Boolean)
-      .map(String);
-
-    const accountNameMap = await getAccountNameMap(owner, entryCodes);
-    const asiento = mapEntryForUI(entry, accountNameMap);
+    // ✅ FIX: resolver cuentas aunque el asiento guarde por accountId
+    const accountMaps = await buildAccountMaps(owner, [entry]);
+    const asiento = mapEntryForUI(entry, accountMaps);
 
     let txUI = mapTxForUI(tx.toObject ? tx.toObject() : tx);
     txUI = (await attachAccountInfo(owner, [txUI]))[0];
@@ -1441,6 +1477,5 @@ router.get("/highlights", ensureAuth, async (req, res) => {
     return res.status(500).json({ ok: false, message: "Error cargando highlights" });
   }
 });
-
 
 module.exports = router;

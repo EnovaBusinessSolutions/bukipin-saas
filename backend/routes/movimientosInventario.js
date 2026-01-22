@@ -112,6 +112,12 @@ function isSalida(tipo) {
 
 // --------------------
 // Contabilidad (resolver cuentas)
+// Basado en tu prototipo Bukipin:
+// 1001 Caja
+// 1002 Bancos
+// 1005 Inventario de Mercancías
+// 2001 Proveedores
+// 5002 Costo de Ventas Inventario
 // --------------------
 async function findAccountByCode(owner, code) {
   if (!Account || !code) return null;
@@ -129,16 +135,11 @@ async function findAccountByName(owner, nameRegex, type) {
   return await Account.findOne(q).lean();
 }
 
-/**
- * Resuelve cuentas con fallback:
- * - Inventario: 1201
- * - Proveedores/CxP: 2001
- * - Caja: 1001
- * - Bancos: 1002
- */
 async function resolveInventoryAccounts(owner) {
+  // ✅ Inventario real del prototipo
   const inv =
-    (await findAccountByCode(owner, "1201")) ||
+    (await findAccountByCode(owner, "1005")) ||
+    (await findAccountByName(owner, "inventario de mercanc", "activo")) ||
     (await findAccountByName(owner, "inventario", "activo")) ||
     (await findAccountByName(owner, "inventario", null));
 
@@ -158,11 +159,18 @@ async function resolveInventoryAccounts(owner) {
     (await findAccountByName(owner, "cuentas por pagar", "pasivo")) ||
     (await findAccountByName(owner, "por pagar", "pasivo"));
 
-  return { inv, caja, bancos, proveedores };
+  // ✅ Costo de ventas inventario (sale por ventas / ajustes salida)
+  const costoVentasInv =
+    (await findAccountByCode(owner, "5002")) ||
+    (await findAccountByName(owner, "costo de ventas invent", "gasto")) ||
+    (await findAccountByName(owner, "costo de ventas", "gasto")) ||
+    (await findAccountByName(owner, "costo de ventas", null));
+
+  return { inv, caja, bancos, proveedores, costoVentasInv };
 }
 
 // --------------------
-// Pagos (para asiento compra)
+// Pagos (solo para compras/entradas)
 // --------------------
 function parseMetodoPago(body) {
   const raw =
@@ -191,13 +199,24 @@ function isCredito(tipoPago) {
   return tipoPago.includes("credito") || tipoPago.includes("crédito") || tipoPago.includes("pendiente");
 }
 
+function pickAsientoIdFromBody(body) {
+  const raw =
+    body?.asientoId ??
+    body?.asiento_id ??
+    body?.journalEntryId ??
+    body?.journal_entry_id ??
+    body?.idAsiento ??
+    null;
+  if (!raw) return null;
+  return String(raw).trim();
+}
+
 // --------------------
 // Mapper UI (NO rompe front)
 // --------------------
 function mapMovementForUI(m) {
   const fecha = m.fecha || m.date || m.createdAt || m.created_at || m.updatedAt;
 
-  // Fuente de verdad: qty/unitCost/total
   const cantidad = num(m.qty ?? m.cantidad ?? m.quantity ?? m.unidades ?? m.units, 0);
 
   let costoUnitario = num(
@@ -249,7 +268,6 @@ function mapMovementForUI(m) {
     tipo,
     estado,
 
-    // compat front
     producto_id: prodId,
     productoId: prodId,
 
@@ -279,7 +297,6 @@ function mapMovementForUI(m) {
 
 // --------------------
 // GET /api/movimientos-inventario
-// ✅ FIX: populate SIEMPRE por productId (campo real)
 // --------------------
 router.get("/", ensureAuth, async (req, res) => {
   try {
@@ -326,7 +343,7 @@ router.get("/", ensureAuth, async (req, res) => {
     else if (!start && end) and.push({ fecha: { $lte: end } });
 
     if (productoId) {
-      and.push({ productId: productoId }); // ✅ campo real
+      and.push({ productId: productoId });
     }
 
     const filter = and.length > 1 ? { $and: and } : and[0];
@@ -335,10 +352,7 @@ router.get("/", ensureAuth, async (req, res) => {
       .sort(sort)
       .limit(limit)
       .setOptions({ strictPopulate: false })
-      .populate(
-        "productId",
-        "nombre name imagen_url imagenUrl image sku codigo code costoCompra costo_compra precio price"
-      )
+      .populate("productId", "nombre name imagen_url imagenUrl image sku codigo code costoCompra costo_compra precio price")
       .lean();
 
     const items = (rows || []).map(mapMovementForUI);
@@ -357,7 +371,10 @@ router.get("/", ensureAuth, async (req, res) => {
 
 // --------------------
 // POST /api/movimientos-inventario
-// ✅ FIX E2E: persistir en campos CANÓNICOS (qty, unitCost, total, productId)
+// ✅ Ajustado al prototipo Bukipin
+// - Inventario = 1005
+// - Salidas: 5002 vs 1005 (NO toca Caja/Bancos)
+// - Si llega asientoId (desde ingresos.js) NO crear asiento nuevo
 // --------------------
 router.post("/", ensureAuth, async (req, res) => {
   try {
@@ -386,8 +403,7 @@ router.post("/", ensureAuth, async (req, res) => {
       req.body?.precioUnitario ??
       null;
 
-    const costoTotalRaw =
-      req.body?.costoTotal ?? req.body?.costo_total ?? req.body?.total ?? req.body?.monto_total ?? null;
+    const costoTotalRaw = req.body?.costoTotal ?? req.body?.costo_total ?? req.body?.total ?? req.body?.monto_total ?? null;
 
     let costoUnitario = numOrNaN(costoUnitarioRaw);
     let costoTotal = numOrNaN(costoTotalRaw);
@@ -414,10 +430,7 @@ router.post("/", ensureAuth, async (req, res) => {
         .lean();
 
       const fallback =
-        numOrNaN(prod?.costoCompra) ||
-        numOrNaN(prod?.costo_compra) ||
-        numOrNaN(prod?.precio) ||
-        numOrNaN(prod?.price);
+        numOrNaN(prod?.costoCompra) || numOrNaN(prod?.costo_compra) || numOrNaN(prod?.precio) || numOrNaN(prod?.price);
 
       if (Number.isFinite(fallback) && fallback > 0) costoUnitario = fallback;
     }
@@ -432,27 +445,30 @@ router.post("/", ensureAuth, async (req, res) => {
       if (costoUnitario === 0 && cantidad) costoUnitario = costoTotal / Math.abs(cantidad);
     }
 
-    // --------------------
-    // ✅ Payload CANÓNICO (esto es lo que Atlas debe mostrar)
-    // --------------------
+    // Si el tipo es salida/venta, guardamos qty como cantidad positiva para consistencia visual
+    // (la UI ya trae "Tipo" separado, no necesitamos qty negativa).
+    const qtyCanon = Math.abs(cantidad);
+
+    // Si llega un asientoId externo (ej. desde ingresos.js), NO creamos asiento aquí.
+    const asientoIdExterno = pickAsientoIdFromBody(req.body) || null;
+
     const payload = {
       owner,
       fecha,
 
-      // Canon del modelo InventoryMovement
       tipo,
       status: estado,
 
       productId: productoId,
-      qty: cantidad,
+      qty: qtyCanon,
       unitCost: costoUnitario,
       total: costoTotal,
 
       nota: descripcion || "",
-      source: "ui",
-      sourceId: null,
+      source: req.body?.source ? String(req.body.source) : "ui",
+      sourceId: req.body?.sourceId ? String(req.body.sourceId) : null,
 
-      // Aliases de compat (por si alguna UI vieja los usa)
+      // compat
       type: tipo,
       tipo_movimiento: tipo,
       tipoMovimiento: tipo,
@@ -460,7 +476,7 @@ router.post("/", ensureAuth, async (req, res) => {
       productoId,
       producto_id: productoId,
 
-      cantidad,
+      cantidad: qtyCanon,
       costoUnitario,
       costo_unitario: costoUnitario,
 
@@ -469,86 +485,120 @@ router.post("/", ensureAuth, async (req, res) => {
 
       descripcion,
       referencia,
+
+      // Si viene desde afuera (venta), guardamos referencia a ese asiento:
+      asientoId: asientoIdExterno || undefined,
+      asiento_id: asientoIdExterno || undefined,
+      journalEntryId: asientoIdExterno || undefined,
+      journal_entry_id: asientoIdExterno || undefined,
     };
 
     const created = await InventoryMovement.create(payload);
 
     // --------------------
-    // ✅ Asiento contable (NO rompe si falla)
+    // ✅ Asiento contable
+    // - Si ya llegó asiento externo, NO hacemos nada.
+    // - Si es ENTRADA: 1005 vs (1001/1002/2001) según método/tipo de pago
+    // - Si es SALIDA: 5002 vs 1005 (NO Caja/Bancos)
     // --------------------
-    let asientoId = null;
+    let asientoId = asientoIdExterno || null;
     let asientoWarning = null;
 
-    const debeGenerarAsiento = (isEntrada(tipo) || isSalida(tipo)) && costoTotal > 0;
+    const debeGenerarAsiento = !asientoIdExterno && (isEntrada(tipo) || isSalida(tipo)) && costoTotal > 0;
 
     if (debeGenerarAsiento && JournalEntry && Account) {
       try {
-        const { inv, caja, bancos, proveedores } = await resolveInventoryAccounts(owner);
+        const { inv, caja, bancos, proveedores, costoVentasInv } = await resolveInventoryAccounts(owner);
 
-        const invCode = accCode(inv);
-        const cajaCode = accCode(caja);
-        const bancosCode = accCode(bancos);
-        const provCode = accCode(proveedores);
+        const invCode = accCode(inv); // ✅ 1005
+        const cajaCode = accCode(caja); // 1001
+        const bancosCode = accCode(bancos); // 1002
+        const provCode = accCode(proveedores); // 2001
+        const cogsCode = accCode(costoVentasInv); // ✅ 5002
 
         if (!invCode) {
-          asientoWarning = "No se pudo generar asiento: cuenta 1201 Inventario sin code/codigo.";
+          asientoWarning = "No se pudo generar asiento: falta cuenta 1005 Inventario de Mercancías.";
         } else {
-          const metodoPago = parseMetodoPago(req.body);
-          const tipoPago = parseTipoPago(req.body);
+          const lines = [];
 
-          const usarProveedores = isEntrada(tipo) && isCredito(tipoPago);
-          const usarBancos =
-            metodoPago.includes("banco") ||
-            metodoPago.includes("transfer") ||
-            metodoPago.includes("tarjeta") ||
-            metodoPago.includes("tdd") ||
-            metodoPago.includes("tdc");
+          // ---------------- ENTRADA / COMPRA ----------------
+          if (isEntrada(tipo)) {
+            const metodoPago = parseMetodoPago(req.body);
+            const tipoPago = parseTipoPago(req.body);
 
-          const contraCode = usarProveedores ? provCode : (usarBancos ? bancosCode : cajaCode);
+            const usarProveedores = isCredito(tipoPago);
+            const usarBancos =
+              metodoPago.includes("banco") ||
+              metodoPago.includes("transfer") ||
+              metodoPago.includes("tarjeta") ||
+              metodoPago.includes("tdd") ||
+              metodoPago.includes("tdc");
 
-          if (!contraCode) {
-            asientoWarning = "No se pudo generar asiento: falta Caja/Bancos/Proveedores.";
-          } else {
-            const lines = [];
+            const contraCode = usarProveedores ? provCode : (usarBancos ? bancosCode : cajaCode);
 
-            if (isEntrada(tipo)) {
-              lines.push({ accountCodigo: invCode, debit: Math.abs(costoTotal), credit: 0, memo: "Entrada inventario" });
+            if (!contraCode) {
+              asientoWarning = "No se pudo generar asiento de compra: falta Caja/Bancos/Proveedores.";
+            } else {
+              lines.push({
+                accountCodigo: invCode,
+                debit: Math.abs(costoTotal),
+                credit: 0,
+                memo: "Compra / Entrada a inventario",
+              });
+
               lines.push({
                 accountCodigo: contraCode,
                 debit: 0,
                 credit: Math.abs(costoTotal),
-                memo: usarProveedores ? "Compra a crédito (proveedores)" : "Pago compra inventario",
+                memo: usarProveedores ? "Compra a crédito (Proveedores)" : "Pago compra inventario",
               });
-            } else if (isSalida(tipo)) {
-              lines.push({ accountCodigo: invCode, debit: 0, credit: Math.abs(costoTotal), memo: "Salida inventario" });
+            }
+          }
+
+          // ---------------- SALIDA / VENTA / AJUSTE SALIDA ----------------
+          if (isSalida(tipo)) {
+            if (!cogsCode) {
+              asientoWarning =
+                "No se pudo generar asiento de salida: falta cuenta 5002 Costo de Ventas Inventario.";
+            } else {
+              // ✅ IMPORTANTE:
+              // Este asiento es SOLO la parte de inventario/costo.
+              // Caja/Bancos + Ventas (4001) se generan en ingresos.js cuando es venta real.
               lines.push({
-                accountCodigo: contraCode,
+                accountCodigo: cogsCode,
                 debit: Math.abs(costoTotal),
                 credit: 0,
-                memo: "Salida por venta (costo)",
-              });
-            }
-
-            if (lines.length >= 2) {
-              const je = await JournalEntry.create({
-                owner,
-                fecha,
-                descripcion: descripcion || `Movimiento inventario (${tipo})`,
-                lines,
-                referencia: referencia || "",
-                source: "inventario",
-                source_id: String(created._id),
+                memo: "Salida inventario (Costo)",
               });
 
-              asientoId = String(je._id);
-
-              created.asientoId = asientoId;
-              created.asiento_id = asientoId;
-              created.journalEntryId = asientoId;
-              created.journal_entry_id = asientoId;
-
-              await created.save();
+              lines.push({
+                accountCodigo: invCode,
+                debit: 0,
+                credit: Math.abs(costoTotal),
+                memo: "Salida inventario (Reduce stock)",
+              });
             }
+          }
+
+          if (lines.length >= 2) {
+            const je = await JournalEntry.create({
+              owner,
+              fecha,
+              descripcion: descripcion || `Movimiento inventario (${tipo})`,
+              lines,
+              referencia: referencia || "",
+              source: "inventario",
+              source_id: String(created._id),
+            });
+
+            asientoId = String(je._id);
+
+            created.asientoId = asientoId;
+            created.asiento_id = asientoId;
+            created.journalEntryId = asientoId;
+            created.journal_entry_id = asientoId;
+
+            await created.save();
           }
         }
       } catch (e) {
@@ -557,12 +607,8 @@ router.post("/", ensureAuth, async (req, res) => {
       }
     }
 
-    // ✅ Re-fetch con populate para response consistente
     const fresh = await InventoryMovement.findOne({ _id: created._id, owner })
-      .populate(
-        "productId",
-        "nombre name imagen_url imagenUrl image sku codigo code costoCompra costo_compra precio price"
-      )
+      .populate("productId", "nombre name imagen_url imagenUrl image sku codigo code costoCompra costo_compra precio price")
       .lean();
 
     return res.status(201).json({
@@ -587,6 +633,11 @@ router.post("/", ensureAuth, async (req, res) => {
 
 // --------------------
 // DELETE /api/movimientos-inventario/:id
+// ✅ Prototipo: "Cancelar" (soft cancel) en vez de borrar
+// - status => cancelado
+// - Si el asiento fue creado por este módulo (source=inventario y source_id==movimiento),
+//   crea reversa contable. Si no, NO toca el asiento (ej. ventas creadas en ingresos.js).
+// - Si mandas ?hard=1 => borra físicamente (por si lo necesitas).
 // --------------------
 router.delete("/:id", ensureAuth, async (req, res) => {
   try {
@@ -600,15 +651,69 @@ router.delete("/:id", ensureAuth, async (req, res) => {
     const owner = req.user._id;
     const { id } = req.params;
 
+    const hard = String(req.query.hard || "").trim() === "1";
+
     const found = await InventoryMovement.findOne({ _id: id, owner });
     if (!found) return res.status(404).json({ ok: false, message: "Movimiento no encontrado." });
 
-    await InventoryMovement.deleteOne({ _id: id, owner });
+    if (hard) {
+      await InventoryMovement.deleteOne({ _id: id, owner });
+      return res.json({ ok: true, hard: true });
+    }
 
-    return res.json({ ok: true });
+    // Soft cancel
+    found.status = "cancelado";
+    // compat
+    found.estado = "cancelado";
+
+    let reversalId = null;
+    let warning = null;
+
+    const asientoId =
+      found.asientoId || found.asiento_id || found.journalEntryId || found.journal_entry_id || null;
+
+    if (asientoId && JournalEntry) {
+      try {
+        const je = await JournalEntry.findOne({ _id: asientoId, owner }).lean();
+
+        // Solo revertimos si el asiento fue generado por ESTE módulo.
+        const isFromThisModule =
+          je && String(je.source || "") === "inventario" && String(je.source_id || "") === String(found._id);
+
+        if (isFromThisModule) {
+          const originalLines = Array.isArray(je.lines) ? je.lines : [];
+          const reversedLines = originalLines.map((ln) => ({
+            accountCodigo: ln.accountCodigo ?? ln.cuentaCodigo ?? ln.accountCode ?? ln.code,
+            debit: num(ln.credit, 0),
+            credit: num(ln.debit, 0),
+            memo: `Reversa: ${ln.memo || "Movimiento inventario"}`,
+          }));
+
+          const rev = await JournalEntry.create({
+            owner,
+            fecha: new Date(),
+            descripcion: `REVERSA - ${je.descripcion || "Asiento inventario"}`,
+            lines: reversedLines,
+            referencia: `REV-${je.referencia || ""}`.trim(),
+            source: "inventario_reversal",
+            source_id: String(found._id),
+            reversal_of: String(je._id),
+          });
+
+          reversalId = String(rev._id);
+        }
+      } catch (e) {
+        console.error("Cancelar movimiento inventario: error reversando asiento:", e);
+        warning = e?.message || "Error creando reversa contable";
+      }
+    }
+
+    await found.save();
+
+    return res.json({ ok: true, canceled: true, reversalId: reversalId || null, warning: warning || null });
   } catch (err) {
     console.error("DELETE /api/movimientos-inventario/:id error:", err);
-    return res.status(500).json({ ok: false, message: "Error eliminando movimiento" });
+    return res.status(500).json({ ok: false, message: "Error cancelando movimiento" });
   }
 });
 

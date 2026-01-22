@@ -9,17 +9,17 @@ const journalLineSchema = new mongoose.Schema(
     accountCodigo: { type: String, default: "" }, // MVP por código
 
     // =========================
-    // ✅ NUEVO: soportar guardar por ID de cuenta
-    // (si viene accountId, lo resolvemos en /api/asientos)
+    // ✅ Soportar guardar por ID de cuenta
+    // (si viene accountId, lo resuelves en /api/asientos)
     // =========================
     accountId: { type: mongoose.Schema.Types.ObjectId, ref: "Account", default: null, index: true },
 
     // =========================
     // ✅ Compat: variantes de nombre de campo (NO rompen nada)
     // =========================
-    accountCode: { type: String, default: "" },     // alias común
-    cuentaCodigo: { type: String, default: "" },    // legacy/compat
-    cuenta_codigo: { type: String, default: "" },   // legacy/compat
+    accountCode: { type: String, default: "" }, // alias común
+    cuentaCodigo: { type: String, default: "" }, // legacy/compat
+    cuenta_codigo: { type: String, default: "" }, // legacy/compat
 
     // =========================
     // ✅ Montos (canonical)
@@ -47,23 +47,29 @@ const journalEntrySchema = new mongoose.Schema(
   {
     owner: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true, index: true },
 
-    date: { type: Date, default: Date.now, index: true },
-    concept: { type: String, default: "", trim: true },
+    // ✅ Canonical (pero con alias para compat)
+    date: { type: Date, default: Date.now, index: true, alias: "fecha" },
+
+    // ✅ Canonical (pero con alias para compat)
+    concept: { type: String, default: "", trim: true, alias: "descripcion" },
 
     // ✅ Canonical
-    numeroAsiento: { type: String, default: null, index: true },
+    numeroAsiento: { type: String, default: null, index: true, alias: "numero_asiento" },
 
     // ✅ fuente
-    source: { type: String, default: "", index: true }, // ingreso, egreso, pago_cxp, etc.
+    source: { type: String, default: "", index: true }, // ingreso, egreso, pago_cxp, inventario, etc.
 
     // ✅ canonical para ligar transacción
     sourceId: { type: mongoose.Schema.Types.ObjectId, default: null, index: true },
+
+    // ✅ NUEVO (necesario por tu flujo): referencia genérica
+    referencia: { type: String, default: "", trim: true, index: true },
 
     // ==========================================================
     // ✅ COMPAT (MUY útil para búsquedas legacy / futuras)
     // ==========================================================
     transaccionId: { type: mongoose.Schema.Types.ObjectId, default: null, index: true }, // alias
-    source_id: { type: mongoose.Schema.Types.ObjectId, default: null, index: true },     // alias
+    source_id: { type: mongoose.Schema.Types.ObjectId, default: null, index: true }, // alias
 
     // referencias genéricas: [{source:"egreso", id:"...", numero:"..."}]
     references: {
@@ -85,6 +91,7 @@ const journalEntrySchema = new mongoose.Schema(
     toJSON: {
       virtuals: true,
       transform: (_doc, ret) => {
+        // IDs y timestamps
         ret.id = String(ret._id);
         ret.created_at = ret.createdAt ? new Date(ret.createdAt).toISOString() : null;
         ret.updated_at = ret.updatedAt ? new Date(ret.updatedAt).toISOString() : null;
@@ -103,6 +110,31 @@ const journalEntrySchema = new mongoose.Schema(
 );
 
 // =============================
+// ✅ Virtuals útiles para UI (no rompen lógica)
+// =============================
+journalEntrySchema.virtual("fecha").get(function () {
+  return this.date;
+});
+
+journalEntrySchema.virtual("descripcion").get(function () {
+  return this.concept;
+});
+
+journalEntrySchema.virtual("numero_asiento").get(function () {
+  return this.numeroAsiento;
+});
+
+journalEntrySchema.virtual("total_debe").get(function () {
+  const lines = Array.isArray(this.lines) ? this.lines : [];
+  return lines.reduce((acc, l) => acc + (Number(l?.debit || 0) || 0), 0);
+});
+
+journalEntrySchema.virtual("total_haber").get(function () {
+  const lines = Array.isArray(this.lines) ? this.lines : [];
+  return lines.reduce((acc, l) => acc + (Number(l?.credit || 0) || 0), 0);
+});
+
+// =============================
 // ✅ Normalizaciones automáticas
 // =============================
 journalEntrySchema.pre("validate", function (next) {
@@ -112,6 +144,16 @@ journalEntrySchema.pre("validate", function (next) {
     // ✅ compat: si usaron otro campo para sourceId, lo espejamos
     if (!entry.sourceId && entry.transaccionId) entry.sourceId = entry.transaccionId;
     if (!entry.sourceId && entry.source_id) entry.sourceId = entry.source_id;
+
+    // ✅ espejo para mantener consistencia (útil en búsquedas)
+    if (entry.sourceId) {
+      if (!entry.transaccionId) entry.transaccionId = entry.sourceId;
+      if (!entry.source_id) entry.source_id = entry.sourceId;
+    }
+
+    // ✅ normalizar strings principales
+    if (entry.concept && typeof entry.concept === "string") entry.concept = entry.concept.trim();
+    if (entry.referencia && typeof entry.referencia === "string") entry.referencia = entry.referencia.trim();
 
     // ✅ normalizar líneas
     if (Array.isArray(entry.lines)) {
@@ -123,12 +165,7 @@ journalEntrySchema.pre("validate", function (next) {
 
         // 2) normalizar código: si no viene accountCodigo pero sí aliases
         if (!line.accountCodigo) {
-          const candidate =
-            line.accountCode ||
-            line.cuentaCodigo ||
-            line.cuenta_codigo ||
-            "";
-
+          const candidate = line.accountCode || line.cuentaCodigo || line.cuenta_codigo || "";
           if (candidate) line.accountCodigo = String(candidate).trim();
         } else {
           line.accountCodigo = String(line.accountCodigo || "").trim();
@@ -157,7 +194,8 @@ journalEntrySchema.pre("validate", function (next) {
           else if (Number(line.credit || 0) > 0) line.side = "credit";
         }
         if (!line.monto) {
-          line.monto = Number(line.debit || 0) > 0 ? Number(line.debit || 0) : Number(line.credit || 0) || 0;
+          line.monto =
+            Number(line.debit || 0) > 0 ? Number(line.debit || 0) : Number(line.credit || 0) || 0;
         }
 
         return line;
