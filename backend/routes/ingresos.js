@@ -33,6 +33,28 @@ try {
   }
 }
 
+// ✅ Opcional: modelo de movimientos/transacciones de inventario (para que aparezca en “Resumen de Transacciones”)
+let InventoryMovement = null;
+try {
+  InventoryMovement = require("../models/InventoryMovement");
+} catch (_) {
+  try {
+    InventoryMovement = require("../models/InventoryTransaction");
+  } catch (_) {
+    try {
+      InventoryMovement = require("../models/InventarioMovimiento");
+    } catch (_) {
+      try {
+        InventoryMovement = require("../models/StockMovement");
+      } catch (_) {
+        try {
+          InventoryMovement = require("../models/MovimientoInventario");
+        } catch (_) {}
+      }
+    }
+  }
+}
+
 /**
  * =========================
  * ✅ TIMEZONE / FECHA E2E
@@ -376,7 +398,6 @@ async function attachSubcuentaInfo(owner, items) {
     const code = String(r.code ?? r.codigo ?? "").trim();
     const name = r.name ?? r.nombre ?? "";
 
-    // ✅ AQUÍ ESTÁ LA CLAVE: poner también el id (lo que el frontend filtra)
     return {
       ...it,
       subcuentaId: it.subcuentaId ?? id,
@@ -445,7 +466,6 @@ async function attachSubcuentaFromProduct(owner, items) {
     const subRef = map.get(String(pid));
     if (!subRef) return it;
 
-    // guardamos "ref" en tx para que luego attachSubcuentaInfo resuelva id/nombre
     return {
       ...it,
       subcuentaId: it.subcuentaId ?? subRef,
@@ -535,7 +555,6 @@ function mapTxForUI(tx) {
     tx.cuenta_principal_codigo ??
     null;
 
-  // ✅ subcuenta: aquí NO mezcles "subcuenta" display con id
   const rawSubId = tx.subcuentaId ?? tx.subcuenta_id ?? null;
   const rawSubCode = tx.subcuentaCodigo ?? tx.subcuenta_codigo ?? null;
 
@@ -584,7 +603,6 @@ function mapTxForUI(tx) {
     cuenta_principal_codigo:
       tx.cuenta_principal_codigo ?? tx.cuentaPrincipalCodigo ?? cuentaCodigo ?? null,
 
-    // ✅ subcuenta canonical
     subcuentaId: subcuentaId ?? null,
     subcuenta_id: subcuentaId ?? null,
     subcuentaCodigo: subcuentaCodigo ?? null,
@@ -673,7 +691,6 @@ function mapEntryForUI(entry, accountMaps = {}) {
   const rawLines = entry.lines || entry.detalle_asientos || [];
 
   const detalle_asientos = (rawLines || []).map((l) => {
-    // 1) intentar por code
     let cuenta_codigo = String(
       l.accountCodigo ??
         l.accountCode ??
@@ -682,7 +699,6 @@ function mapEntryForUI(entry, accountMaps = {}) {
         ""
     ).trim();
 
-    // 2) si no hay code, resolver por accountId
     if (!cuenta_codigo) {
       const aid = l.accountId ?? l.cuenta_id ?? l.account ?? null;
       if (aid) {
@@ -800,6 +816,131 @@ function normalizeTipoPago(raw) {
   let v = typeof raw === "string" ? raw.trim().toLowerCase() : "";
   if (!v) return "contado";
   return v;
+}
+
+/**
+ * ✅ Inventario helpers (PROTOTIPO)
+ */
+function normalizeTipoIngresoInventario(tipoIngresoRaw) {
+  const t = lower(tipoIngresoRaw);
+  return (
+    t === "inventariado" ||
+    t === "inventariados" ||
+    t === "producto_inventariado" ||
+    t === "producto inventariado" ||
+    t === "inventario" ||
+    t === "stock"
+  );
+}
+
+function pickQty(body) {
+  const q =
+    body?.cantidad ??
+    body?.qty ??
+    body?.quantity ??
+    body?.unidades ??
+    body?.units ??
+    body?.cantidadProducto ??
+    body?.cantidad_producto ??
+    null;
+
+  const n = num(q, 0);
+  return n > 0 ? n : 1;
+}
+
+function pickProductId(body) {
+  return (
+    body?.productId ??
+    body?.productoId ??
+    body?.product_id ??
+    body?.producto_id ??
+    body?.itemId ??
+    body?.item_id ??
+    null
+  );
+}
+
+function getProductCostUnit(p) {
+  if (!p) return 0;
+  const candidates = [
+    p.costoUnitario,
+    p.costo_unitario,
+    p.costUnitario,
+    p.cost_unitario,
+    p.costoPromedio,
+    p.costo_promedio,
+    p.costoPromedioPonderado,
+    p.costo_promedio_ponderado,
+    p.costo,
+    p.cost,
+    p.precioCompra,
+    p.precio_compra,
+    p.purchasePrice,
+    p.purchase_price,
+  ];
+  for (const v of candidates) {
+    const n = num(v, NaN);
+    if (Number.isFinite(n) && n >= 0) return n;
+  }
+  return 0;
+}
+
+function getProductName(p) {
+  return p?.nombre ?? p?.name ?? p?.title ?? p?.producto ?? p?.descripcion ?? "Producto";
+}
+
+async function updateProductStockSafe(owner, productDoc, qtyToDecrement) {
+  if (!Product || !productDoc?._id) return;
+
+  const inc = {};
+  const present = new Set(Object.keys(productDoc || {}));
+
+  const maybeDec = [
+    "stock",
+    "stockActual",
+    "stock_actual",
+    "existencia",
+    "existencias",
+    "cantidad",
+    "cantidad_actual",
+    "cantidadActual",
+  ];
+
+  const maybeInc = [
+    "totalUsadoVendido",
+    "total_usado_vendido",
+    "totalVendido",
+    "total_vendido",
+    "usadoVendido",
+    "usado_vendido",
+  ];
+
+  for (const k of maybeDec) {
+    if (present.has(k)) inc[k] = (inc[k] || 0) - qtyToDecrement;
+  }
+  for (const k of maybeInc) {
+    if (present.has(k)) inc[k] = (inc[k] || 0) + qtyToDecrement;
+  }
+
+  if (!Object.keys(inc).length) {
+    if (present.has("stock")) inc.stock = -qtyToDecrement;
+    else if (present.has("stockActual")) inc.stockActual = -qtyToDecrement;
+  }
+
+  if (!Object.keys(inc).length) return;
+
+  await Product.updateOne({ owner, _id: productDoc._id }, { $inc: inc }).catch(() => {});
+}
+
+async function createInventorySalidaIfPossible(owner, payload) {
+  if (!InventoryMovement) return null;
+  try {
+    const doc = await InventoryMovement.create(payload);
+    return doc;
+  } catch (e) {
+    console.warn("⚠️ InventoryMovement.create falló (no bloqueante):", e?.message || e);
+    return null;
+  }
 }
 
 /**
@@ -967,8 +1108,8 @@ router.get("/detalles", ensureAuth, async (req, res) => {
     let items = itemsRaw.map(mapTxForUI);
 
     items = await attachAccountInfo(owner, items);
-    items = await attachSubcuentaFromProduct(owner, items); // ✅ inferencia por producto
-    items = await attachSubcuentaInfo(owner, items); // ✅ ahora sí mete subcuenta_id + nombre
+    items = await attachSubcuentaFromProduct(owner, items);
+    items = await attachSubcuentaInfo(owner, items);
     items = await attachClientInfo(owner, items);
 
     const total = itemsRaw.reduce((acc, it) => {
@@ -1073,6 +1214,18 @@ router.post("/:id/cancelar", ensureAuth, async (req, res) => {
     await JournalEntry.deleteMany({ owner, source: "ingreso", sourceId: tx._id });
     await IncomeTransaction.deleteOne({ _id: tx._id, owner });
 
+    // opcional: cancelar movimientos de inventario ligados a este ingreso
+    if (InventoryMovement) {
+      await InventoryMovement.deleteMany({
+        owner,
+        $or: [
+          { source: "ingreso", sourceId: tx._id },
+          { source: "venta", sourceId: tx._id },
+          { source: "ingreso", transaccion_ingreso_id: tx._id },
+        ],
+      }).catch(() => {});
+    }
+
     return res.json({
       ok: true,
       numeroAsientoCancelado,
@@ -1114,18 +1267,11 @@ router.post("/", ensureAuth, async (req, res) => {
       req.body?.subcuenta_codigo ??
       null;
 
-    const productIdRaw =
-      req.body?.productId ??
-      req.body?.productoId ??
-      req.body?.product_id ??
-      req.body?.producto_id ??
-      req.body?.itemId ??
-      req.body?.item_id ??
-      null;
+    const productIdRaw = pickProductId(req.body);
+    const qty = pickQty(req.body);
 
     // ✅ FIX: evitar crash si productIdRaw no es ObjectId
     if (!subcuentaRef && productIdRaw && isObjectId(productIdRaw)) {
-      // inferir desde producto
       const p = await Product?.findOne({
         owner,
         _id: new mongoose.Types.ObjectId(String(productIdRaw)),
@@ -1182,6 +1328,18 @@ router.post("/", ensureAuth, async (req, res) => {
     const COD_DESCUENTOS = "4002";
     const codCobro = metodoPago === "bancos" ? COD_BANCOS : COD_CAJA;
 
+    // ✅ Inventario (prototipo)
+    const COD_COGS = "5002";
+    const COD_INVENTARIO = "1005";
+
+    // ✅ Detectar inventariado
+    const isInventariado =
+      normalizeTipoIngresoInventario(tipoIngreso) ||
+      lower(req.body?.tipoProducto) === "inventariado" ||
+      lower(req.body?.productoTipo) === "inventariado" ||
+      req.body?.isInventariado === true ||
+      (!!productIdRaw && !!Product);
+
     const txPayload = {
       owner,
       fecha,
@@ -1199,15 +1357,18 @@ router.post("/", ensureAuth, async (req, res) => {
       cuentaPrincipalCodigo: cuentaCodigo,
       cuenta_principal_codigo: cuentaCodigo,
 
-      // ✅ guardamos id + code (canonical)
       subcuentaId: subcuentaIdResolved ?? null,
       subcuenta_id: subcuentaIdResolved ?? null,
       subcuentaCodigo: subcuentaCodigoResolved ?? null,
       subcuenta_codigo: subcuentaCodigoResolved ?? null,
 
-      // trazabilidad (si venía por producto)
       productId: productIdRaw ?? null,
       product_id: productIdRaw ?? null,
+
+      // ✅ qty (para trazabilidad)
+      cantidad: qty,
+      qty,
+      unidades: qty,
 
       saldoPendiente,
       saldo_pendiente: saldoPendiente,
@@ -1265,7 +1426,6 @@ router.post("/", ensureAuth, async (req, res) => {
         );
       }
 
-      // ✅ SIEMPRE: saldo pendiente a 1003 (Cuentas por Cobrar Clientes)
       if (saldoPendiente > 0) {
         lines.push(
           await buildLine(owner, {
@@ -1278,7 +1438,6 @@ router.post("/", ensureAuth, async (req, res) => {
       }
     }
 
-    // ✅ CLAVE: el haber del ingreso debe caer en subcuenta si existe
     const haberIngresos = descuento > 0 ? total : neto;
     const codeIngreso = subcuentaCodigoResolved || cuentaCodigo;
 
@@ -1290,6 +1449,63 @@ router.post("/", ensureAuth, async (req, res) => {
         memo: subcuentaCodigoResolved ? "Ingreso (subcuenta)" : "Ingreso",
       })
     );
+
+    /**
+     * ==========================================================
+     * ✅ INVENTARIO (venta inventariada) — PROTOTIPO
+     *   - Debe 5002 (costo de venta)
+     *   - Haber 1005 (salida inventario)
+     *   - Registrar movimiento “SALIDA” si existe modelo
+     *   - Ajustar stock del producto
+     * ==========================================================
+     */
+    let invMeta = null;
+
+    if (isInventariado && Product && productIdRaw && isObjectId(productIdRaw)) {
+      const p = await Product.findOne({
+        owner,
+        _id: new mongoose.Types.ObjectId(String(productIdRaw)),
+      })
+        .lean()
+        .catch(() => null);
+
+      if (p) {
+        const costUnit = getProductCostUnit(p);
+        const costTotal = Number((costUnit * qty).toFixed(2));
+        const pname = getProductName(p);
+
+        if (costTotal > 0) {
+          lines.push(
+            await buildLine(owner, {
+              code: COD_COGS,
+              debit: costTotal,
+              credit: 0,
+              memo: `Costo de venta - ${pname} (${qty} unidades)`,
+            })
+          );
+
+          lines.push(
+            await buildLine(owner, {
+              code: COD_INVENTARIO,
+              debit: 0,
+              credit: costTotal,
+              memo: `Salida de inventario - ${pname} (${qty} unidades)`,
+            })
+          );
+        }
+
+        // update stock (no bloqueante)
+        await updateProductStockSafe(owner, p, qty);
+
+        invMeta = {
+          productId: String(p._id),
+          productName: pname,
+          qty,
+          costUnit,
+          costTotal,
+        };
+      }
+    }
 
     const numeroAsiento = await nextJournalNumber(owner, tx.fecha);
 
@@ -1303,7 +1519,49 @@ router.post("/", ensureAuth, async (req, res) => {
       numeroAsiento,
     });
 
-    // ✅ FIX: resolver cuentas aunque el asiento guarde por accountId
+    // ✅ crear movimiento de inventario “SALIDA” (si existe modelo) para que aparezca en Resumen Transacciones
+    if (invMeta?.productId) {
+      await createInventorySalidaIfPossible(owner, {
+        owner,
+        fecha: tx.fecha,
+        date: tx.fecha,
+
+        source: "ingreso",
+        sourceId: tx._id,
+        transaccion_ingreso_id: tx._id,
+
+        journalEntryId: entry._id,
+        asientoId: entry._id,
+        numeroAsiento,
+
+        productId: invMeta.productId,
+        productoId: invMeta.productId,
+        product_id: invMeta.productId,
+        producto_id: invMeta.productId,
+
+        producto: invMeta.productName,
+        productName: invMeta.productName,
+
+        tipo: "salida",
+        tipoMovimiento: "salida",
+        tipo_movimiento: "salida",
+
+        cantidad: invMeta.qty,
+        qty: invMeta.qty,
+
+        costoUnitario: invMeta.costUnit,
+        costo_unitario: invMeta.costUnit,
+        costoTotal: invMeta.costTotal,
+        costo_total: invMeta.costTotal,
+
+        descripcion: tx.descripcion,
+        memo: tx.descripcion,
+
+        estado: "activo",
+        status: "active",
+      });
+    }
+
     const accountMaps = await buildAccountMaps(owner, [entry]);
     const asiento = mapEntryForUI(entry, accountMaps);
 
@@ -1322,6 +1580,7 @@ router.post("/", ensureAuth, async (req, res) => {
         asiento,
         numeroAsiento,
         journalEntryId: String(entry._id),
+        inventario: invMeta || null,
       },
     });
   } catch (err) {
@@ -1342,19 +1601,16 @@ router.get("/highlights", ensureAuth, async (req, res) => {
   try {
     const owner = req.user._id;
 
-    // --- helpers ---
     const pad = (n) => String(n).padStart(2, "0");
     const toYMD = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 
-    // "hoy" en timezone de la app (usa tu TZ_OFFSET_MINUTES ya definido arriba)
     const nowUtc = new Date();
     const nowLocal = new Date(nowUtc.getTime() + TZ_OFFSET_MINUTES * 60 * 1000);
 
     const y = nowLocal.getUTCFullYear();
-    const m = nowLocal.getUTCMonth(); // 0-11
+    const m = nowLocal.getUTCMonth();
     const d = nowLocal.getUTCDate();
 
-    // Rangos en UTC usando tu dateOnlyToUtc (ya existe en tu archivo)
     const startDay = dateOnlyToUtc(toYMD(new Date(Date.UTC(y, m, d))), 0, 0, 0, 0);
     const endDay = dateOnlyToUtc(toYMD(new Date(Date.UTC(y, m, d))), 23, 59, 59, 999);
 
@@ -1365,7 +1621,6 @@ router.get("/highlights", ensureAuth, async (req, res) => {
     const startYear = dateOnlyToUtc(`${y}-01-01`, 0, 0, 0, 0);
     const endYear = dateOnlyToUtc(`${y}-12-31`, 23, 59, 59, 999);
 
-    // --- función para calcular totales desde IncomeTransaction (tu fuente “transacciones”) ---
     async function calcTxTotals(start, end) {
       const txs = await IncomeTransaction.find({
         owner,
@@ -1379,20 +1634,25 @@ router.get("/highlights", ensureAuth, async (req, res) => {
 
       for (const t of txs) {
         const cuenta = String(
-          t.cuenta_principal_codigo ?? t.cuentaPrincipalCodigo ?? t.cuentaCodigo ?? t.cuenta_codigo ?? ""
+          t.cuenta_principal_codigo ??
+            t.cuentaPrincipalCodigo ??
+            t.cuentaCodigo ??
+            t.cuenta_codigo ??
+            ""
         ).trim();
 
         const total = num(t.montoTotal ?? t.monto_total ?? t.total, 0);
         const desc = num(t.montoDescuento ?? t.monto_descuento ?? t.descuento, 0);
-        const neto = num(t.montoNeto ?? t.monto_neto ?? t.neto, Math.max(0, total - Math.max(0, desc)));
+        const neto = num(
+          t.montoNeto ?? t.monto_neto ?? t.neto,
+          Math.max(0, total - Math.max(0, desc))
+        );
 
-        // ventas = 4001
         if (cuenta === "4001") {
           ventasBrutas += total;
           descuentos += Math.max(0, desc);
           ventasNetas += neto;
         } else if (cuenta.startsWith("4") && cuenta !== "4003") {
-          // otros ingresos = 4XXX excepto 4001 y 4003
           otrosIngresos += neto;
         }
       }
@@ -1406,7 +1666,6 @@ router.get("/highlights", ensureAuth, async (req, res) => {
       };
     }
 
-    // --- Opción PRO contable: incluir ingresos_directos (JournalEntry) que NO tienen transacción ---
     async function calcDirectTotals(start, end) {
       const entries = await JournalEntry.find({
         owner,
@@ -1418,7 +1677,6 @@ router.get("/highlights", ensureAuth, async (req, res) => {
 
       for (const e of entries) {
         const lines = Array.isArray(e.lines) ? e.lines : [];
-        // tomar líneas de HABER en cuentas 4XXX (ingreso)
         for (const l of lines) {
           const code = String(l.accountCodigo ?? l.accountCode ?? "").trim();
           const haber = num(l.credit ?? l.haber, 0);
@@ -1440,7 +1698,6 @@ router.get("/highlights", ensureAuth, async (req, res) => {
     const mesDir = await calcDirectTotals(startMonth, endMonth);
     const anoDir = await calcDirectTotals(startYear, endYear);
 
-    // sumar directos como "otros ingresos"
     const dia = {
       ...diaTx,
       otrosIngresos: (diaTx.otrosIngresos || 0) + (diaDir.otrosIngresos || 0),
