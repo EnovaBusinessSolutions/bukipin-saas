@@ -55,6 +55,15 @@ function numOrNaN(v) {
   return Number.isFinite(n) ? n : NaN;
 }
 
+function isValidObjectId(str) {
+  return typeof str === "string" && /^[a-f\d]{24}$/i.test(str);
+}
+
+function accCode(acc) {
+  if (!acc) return "";
+  return String(acc.code ?? acc.codigo ?? acc.accountCode ?? acc.cuentaCodigo ?? "").trim();
+}
+
 /**
  * Fechas (evitar UTC con YYYY-MM-DD)
  */
@@ -117,7 +126,11 @@ function isSalida(tipo) {
 // --------------------
 async function findAccountByCode(owner, code) {
   if (!Account || !code) return null;
-  return await Account.findOne({ owner, code: String(code) }).lean();
+  const c = String(code).trim();
+  return await Account.findOne({
+    owner,
+    $or: [{ code: c }, { codigo: c }, { cuentaCodigo: c }, { accountCode: c }],
+  }).lean();
 }
 
 async function findAccountByName(owner, nameRegex, type) {
@@ -129,9 +142,10 @@ async function findAccountByName(owner, nameRegex, type) {
 
 /**
  * Resuelve cuentas con fallback:
- * - Inventario: intenta 1201, si no existe busca por nombre "Inventario"
- * - Proveedores/CxP: intenta 2001, si no existe busca "Proveedores" / "Cuentas por pagar"
- * - Caja: 1001, Bancos: 1002
+ * - Inventario: 1201
+ * - Proveedores/CxP: 2001
+ * - Caja: 1001
+ * - Bancos: 1002
  */
 async function resolveInventoryAccounts(owner) {
   const inv =
@@ -140,9 +154,14 @@ async function resolveInventoryAccounts(owner) {
     (await findAccountByName(owner, "inventario", null));
 
   const caja =
-    (await findAccountByCode(owner, "1001")) || (await findAccountByName(owner, "caja", "activo"));
+    (await findAccountByCode(owner, "1001")) ||
+    (await findAccountByName(owner, "caja", "activo")) ||
+    (await findAccountByName(owner, "caja", null));
+
   const bancos =
-    (await findAccountByCode(owner, "1002")) || (await findAccountByName(owner, "banco", "activo"));
+    (await findAccountByCode(owner, "1002")) ||
+    (await findAccountByName(owner, "banco", "activo")) ||
+    (await findAccountByName(owner, "banco", null));
 
   const proveedores =
     (await findAccountByCode(owner, "2001")) ||
@@ -202,12 +221,8 @@ function mapMovementForUI(m) {
     0
   );
 
-  let costoTotal = num(
-    m.costo_total ?? m.costoTotal ?? m.total ?? m.monto_total ?? m.montoTotal ?? 0,
-    0
-  );
+  let costoTotal = num(m.costo_total ?? m.costoTotal ?? m.total ?? m.monto_total ?? m.montoTotal ?? 0, 0);
 
-  // ✅ derivación robusta
   if (!costoTotal && costoUnitario && cantidad) costoTotal = costoUnitario * cantidad;
   if (!costoUnitario && costoTotal && cantidad) costoUnitario = costoTotal / cantidad;
 
@@ -251,9 +266,7 @@ function mapMovementForUI(m) {
       nombre: prodNombre || "Producto",
       imagen_url: prodImg || undefined,
     },
-    producto: prodId
-      ? { id: prodId, nombre: prodNombre || "Producto", imagen_url: prodImg || undefined }
-      : null,
+    producto: prodId ? { id: prodId, nombre: prodNombre || "Producto", imagen_url: prodImg || undefined } : null,
 
     cantidad,
     costo_unitario: costoUnitario,
@@ -347,7 +360,10 @@ router.get("/", ensureAuth, async (req, res) => {
     for (const p of paths) {
       try {
         if (InventoryMovement.schema?.path(p)) {
-          q = q.populate(p, "nombre name imagen_url imagenUrl image sku codigo code costoCompra costo_compra precio price");
+          q = q.populate(
+            p,
+            "nombre name imagen_url imagenUrl image sku codigo code costoCompra costo_compra precio price"
+          );
           break;
         }
       } catch (_) {}
@@ -370,7 +386,7 @@ router.get("/", ensureAuth, async (req, res) => {
 
 // --------------------
 // POST /api/movimientos-inventario
-// ✅ FIX E2E: si no viene costo, tomarlo del producto (costoCompra / precio)
+// FIX: costo fallback + asientos sin romper si code/codigo
 // --------------------
 router.post("/", ensureAuth, async (req, res) => {
   try {
@@ -386,11 +402,11 @@ router.post("/", ensureAuth, async (req, res) => {
     const tipo = String(req.body?.tipo ?? req.body?.tipo_movimiento ?? "ajuste").trim().toLowerCase();
     const estado = String(req.body?.estado ?? "activo").trim().toLowerCase();
 
-    const productoId = req.body?.productoId ?? req.body?.producto_id ?? req.body?.productId ?? null;
+    const productoIdRaw = req.body?.productoId ?? req.body?.producto_id ?? req.body?.productId ?? null;
+    const productoId = productoIdRaw ? String(productoIdRaw).trim() : "";
 
     const cantidad = num(req.body?.cantidad ?? req.body?.qty ?? req.body?.quantity ?? req.body?.unidades ?? 0, NaN);
 
-    // Acepta varios nombres (puede venir vacío)
     const costoUnitarioRaw =
       req.body?.costoUnitario ??
       req.body?.costo_unitario ??
@@ -399,9 +415,9 @@ router.post("/", ensureAuth, async (req, res) => {
       req.body?.precioUnitario ??
       null;
 
-    const costoTotalRaw = req.body?.costoTotal ?? req.body?.costo_total ?? req.body?.total ?? req.body?.monto_total ?? null;
+    const costoTotalRaw =
+      req.body?.costoTotal ?? req.body?.costo_total ?? req.body?.total ?? req.body?.monto_total ?? null;
 
-    // OJO: aquí usamos NaN para detectar "no vino"
     let costoUnitario = numOrNaN(costoUnitarioRaw);
     let costoTotal = numOrNaN(costoTotalRaw);
 
@@ -414,11 +430,13 @@ router.post("/", ensureAuth, async (req, res) => {
     }
 
     if (!productoId) return res.status(400).json({ ok: false, message: "productoId es requerido." });
+    if (!isValidObjectId(productoId)) return res.status(400).json({ ok: false, message: "productoId inválido." });
+
     if (!Number.isFinite(cantidad) || cantidad === 0) {
       return res.status(400).json({ ok: false, message: "cantidad es requerida y no puede ser 0." });
     }
 
-    // ✅ 1) si no vino costoUnitario o vino 0, buscarlo en Producto
+    // 1) si no vino costoUnitario o vino 0, buscarlo en Producto
     if ((!Number.isFinite(costoUnitario) || costoUnitario <= 0) && Product) {
       const prod = await Product.findOne({ _id: productoId, owner })
         .select("costoCompra costo_compra precio price")
@@ -430,26 +448,19 @@ router.post("/", ensureAuth, async (req, res) => {
         numOrNaN(prod?.precio) ||
         numOrNaN(prod?.price);
 
-      if (Number.isFinite(fallback) && fallback > 0) {
-        costoUnitario = fallback;
-      }
+      if (Number.isFinite(fallback) && fallback > 0) costoUnitario = fallback;
     }
 
-    // ✅ 2) recalcular total SIEMPRE (fuente de verdad)
     if (!Number.isFinite(costoUnitario) || costoUnitario < 0) costoUnitario = 0;
 
-    // si el total vino, lo respetamos solo si es válido y >0; de lo contrario recalculamos
+    // 2) recalcular total (fuente de verdad)
     if (!Number.isFinite(costoTotal) || costoTotal <= 0) {
       costoTotal = Math.abs(cantidad) * Math.abs(costoUnitario);
     } else {
       costoTotal = Math.abs(costoTotal);
-      // y si el unitario seguía en 0, lo derivamos del total
       if (costoUnitario === 0 && cantidad) costoUnitario = costoTotal / Math.abs(cantidad);
     }
 
-    // --------------------
-    // Crear movimiento base
-    // --------------------
     const payload = {
       owner,
       fecha,
@@ -480,100 +491,96 @@ router.post("/", ensureAuth, async (req, res) => {
 
     const created = await InventoryMovement.create(payload);
 
-    // --------------------
-    // ✅ Contabilidad automática (E2E)
-    // Solo si hay JournalEntry + Account + costo > 0
-    // --------------------
+    // ✅ Contabilidad automática (si se puede) SIN romper el movimiento
     let asientoId = null;
+    let asientoWarning = null;
 
     const debeGenerarAsiento = (isEntrada(tipo) || isSalida(tipo)) && costoTotal > 0;
 
     if (debeGenerarAsiento && JournalEntry && Account) {
-      const { inv, caja, bancos, proveedores } = await resolveInventoryAccounts(owner);
+      try {
+        const { inv, caja, bancos, proveedores } = await resolveInventoryAccounts(owner);
 
-      if (inv) {
-        const metodoPago = parseMetodoPago(req.body);
-        const tipoPago = parseTipoPago(req.body);
+        const invCode = accCode(inv);
+        const cajaCode = accCode(caja);
+        const bancosCode = accCode(bancos);
+        const provCode = accCode(proveedores);
 
-        const usarProveedores = isEntrada(tipo) && isCredito(tipoPago);
-        const usarBancos =
-          metodoPago.includes("banco") ||
-          metodoPago.includes("transfer") ||
-          metodoPago.includes("tarjeta") ||
-          metodoPago.includes("tdd") ||
-          metodoPago.includes("tdc");
-
-        const cuentaCajaOBancos = usarBancos ? bancos : caja;
-
-        if (!usarProveedores && !cuentaCajaOBancos) {
-          // skip asiento
-        } else if (usarProveedores && !proveedores) {
-          // skip asiento
+        // si no hay inventario code/codigo, no generamos asiento (pero no rompemos)
+        if (!invCode) {
+          asientoWarning = "No se pudo generar asiento: cuenta de Inventario (1201) sin code/codigo.";
         } else {
-          const lines = [];
+          const metodoPago = parseMetodoPago(req.body);
+          const tipoPago = parseTipoPago(req.body);
 
-          if (isEntrada(tipo)) {
-            lines.push({
-              accountCodigo: inv.code,
-              debit: Math.abs(costoTotal),
-              credit: 0,
-              memo: "Entrada inventario",
-            });
+          const usarProveedores = isEntrada(tipo) && isCredito(tipoPago);
+          const usarBancos =
+            metodoPago.includes("banco") ||
+            metodoPago.includes("transfer") ||
+            metodoPago.includes("tarjeta") ||
+            metodoPago.includes("tdd") ||
+            metodoPago.includes("tdc");
 
-            if (usarProveedores) {
+          const contraCode = usarProveedores ? provCode : (usarBancos ? bancosCode : cajaCode);
+
+          if (!contraCode) {
+            asientoWarning = "No se pudo generar asiento: falta cuenta contrapartida (Caja/Bancos/Proveedores).";
+          } else {
+            const lines = [];
+
+            if (isEntrada(tipo)) {
               lines.push({
-                accountCodigo: proveedores.code,
+                accountCodigo: invCode,
+                debit: Math.abs(costoTotal),
+                credit: 0,
+                memo: "Entrada inventario",
+              });
+              lines.push({
+                accountCodigo: contraCode,
                 debit: 0,
                 credit: Math.abs(costoTotal),
-                memo: "Compra a crédito (proveedores)",
+                memo: usarProveedores ? "Compra a crédito (proveedores)" : "Pago compra inventario",
               });
-            } else {
+            } else if (isSalida(tipo)) {
               lines.push({
-                accountCodigo: cuentaCajaOBancos.code,
+                accountCodigo: invCode,
                 debit: 0,
                 credit: Math.abs(costoTotal),
-                memo: "Pago compra inventario",
+                memo: "Salida inventario",
               });
-            }
-          } else if (isSalida(tipo)) {
-            lines.push({
-              accountCodigo: inv.code,
-              debit: 0,
-              credit: Math.abs(costoTotal),
-              memo: "Salida inventario",
-            });
-
-            if (cuentaCajaOBancos) {
               lines.push({
-                accountCodigo: cuentaCajaOBancos.code,
+                accountCodigo: contraCode,
                 debit: Math.abs(costoTotal),
                 credit: 0,
                 memo: "Salida por venta (costo)",
               });
             }
-          }
 
-          if (lines.length >= 2) {
-            const je = await JournalEntry.create({
-              owner,
-              fecha,
-              descripcion: descripcion || `Movimiento inventario (${tipo})`,
-              lines,
-              referencia: referencia || "",
-              source: "inventario",
-              source_id: String(created._id),
-            });
+            if (lines.length >= 2) {
+              const je = await JournalEntry.create({
+                owner,
+                fecha,
+                descripcion: descripcion || `Movimiento inventario (${tipo})`,
+                lines,
+                referencia: referencia || "",
+                source: "inventario",
+                source_id: String(created._id),
+              });
 
-            asientoId = String(je._id);
+              asientoId = String(je._id);
 
-            created.asientoId = asientoId;
-            created.asiento_id = asientoId;
-            created.journalEntryId = asientoId;
-            created.journal_entry_id = asientoId;
+              created.asientoId = asientoId;
+              created.asiento_id = asientoId;
+              created.journalEntryId = asientoId;
+              created.journal_entry_id = asientoId;
 
-            await created.save();
+              await created.save();
+            }
           }
         }
+      } catch (e) {
+        console.error("Asiento inventario error (no rompe movimiento):", e);
+        asientoWarning = e?.message || "Error generando asiento contable";
       }
     }
 
@@ -583,10 +590,19 @@ router.post("/", ensureAuth, async (req, res) => {
       ok: true,
       data: mapMovementForUI(out),
       asientoId: asientoId || null,
+      warning: asientoWarning || null,
     });
   } catch (err) {
     console.error("POST /api/movimientos-inventario error:", err);
-    return res.status(500).json({ ok: false, message: "Error creando movimiento de inventario" });
+
+    if (err?.name === "ValidationError") {
+      return res.status(400).json({ ok: false, message: err.message, details: err.errors || null });
+    }
+    if (err?.name === "CastError") {
+      return res.status(400).json({ ok: false, message: `CastError: ${err.message}` });
+    }
+
+    return res.status(500).json({ ok: false, message: err?.message || "Error creando movimiento de inventario" });
   }
 });
 
