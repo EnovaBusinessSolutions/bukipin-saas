@@ -6,6 +6,34 @@ const JournalEntry = require("../models/JournalEntry");
 const Account = require("../models/Account");
 const ensureAuth = require("../middleware/ensureAuth");
 
+// ✅ Opcional: Counter (para folio tipo 2026-0010)
+let Counter = null;
+try {
+  Counter = require("../models/Counter");
+} catch (_) {}
+
+// ✅ Opcional: modelo de movimientos de inventario (para resolver asiento real desde Inventario)
+let InventoryMovement = null;
+try {
+  InventoryMovement = require("../models/InventoryMovement");
+} catch (_) {
+  try {
+    InventoryMovement = require("../models/InventoryTransaction");
+  } catch (_) {
+    try {
+      InventoryMovement = require("../models/InventarioMovimiento");
+    } catch (_) {
+      try {
+        InventoryMovement = require("../models/StockMovement");
+      } catch (_) {
+        try {
+          InventoryMovement = require("../models/MovimientoInventario");
+        } catch (_) {}
+      }
+    }
+  }
+}
+
 // ✅ FIX: num() robusto (soporta "$1,200", " 1,200 ", etc.)
 function num(v, def = 0) {
   if (v === null || typeof v === "undefined") return def;
@@ -14,7 +42,6 @@ function num(v, def = 0) {
   const s = String(v).trim();
   if (!s) return def;
 
-  // quita $ , espacios y símbolos comunes
   const cleaned = s.replace(/[$,\s]/g, "");
   const n = Number(cleaned);
   return Number.isFinite(n) ? n : def;
@@ -52,21 +79,95 @@ function pickDateField() {
   return "createdAt";
 }
 
+function isObjectId(v) {
+  return !!v && mongoose.Types.ObjectId.isValid(String(v));
+}
+
+function pickEntryDate(entry) {
+  return entry?.date ?? entry?.fecha ?? entry?.entryDate ?? entry?.createdAt ?? entry?.created_at ?? null;
+}
+
+function pickEntryNumero(entry) {
+  return entry?.numeroAsiento ?? entry?.numero_asiento ?? entry?.numero ?? entry?.folio ?? null;
+}
+
+function pickEntryConcept(entry) {
+  return entry?.concept ?? entry?.concepto ?? entry?.descripcion ?? entry?.memo ?? "";
+}
+
+/**
+ * ✅ Genera folio tipo YYYY-0001 si falta numeroAsiento (y lo persiste)
+ * Solo aplica si existe Counter.
+ */
+async function ensureNumeroAsiento(owner, entry) {
+  try {
+    if (!entry) return entry;
+
+    const existing = pickEntryNumero(entry);
+    if (existing) return entry;
+
+    if (!Counter) return entry;
+
+    const dateObj = pickEntryDate(entry) ? new Date(pickEntryDate(entry)) : new Date();
+    const year = Number.isFinite(dateObj.getTime()) ? dateObj.getFullYear() : new Date().getFullYear();
+    const key = `journal-${year}`;
+
+    const doc = await Counter.findOneAndUpdate(
+      { owner, key },
+      { $inc: { seq: 1 } },
+      { new: true, upsert: true }
+    ).lean();
+
+    const seq = doc?.seq || 1;
+    const numeroAsiento = `${year}-${String(seq).padStart(4, "0")}`;
+
+    // Persistimos para que ya no vuelva a mostrarse el ObjectId en UI
+    await JournalEntry.updateOne(
+      { owner, _id: entry._id },
+      { $set: { numeroAsiento, numero_asiento: numeroAsiento, numero: numeroAsiento } }
+    ).catch(() => {});
+
+    return { ...entry, numeroAsiento, numero_asiento: numeroAsiento, numero: numeroAsiento };
+  } catch {
+    return entry;
+  }
+}
+
+function ensureConceptFallback(entry) {
+  const c = String(pickEntryConcept(entry) || "").trim();
+  if (c) return entry;
+
+  const src = String(entry?.source ?? entry?.fuente ?? "asiento").trim();
+  const d = pickEntryDate(entry);
+  const ymd = d ? toYMD(d) : null;
+
+  const fallback = ymd ? `Asiento: ${src} (${ymd})` : `Asiento: ${src}`;
+  return { ...entry, concept: fallback, concepto: fallback, descripcion: fallback, memo: fallback };
+}
+
 async function getAccountNameMap(owner, codes) {
   const unique = Array.from(new Set((codes || []).filter(Boolean).map((c) => String(c).trim())));
   if (!unique.length) return {};
 
-  const rows = await Account.find({ owner, code: { $in: unique } }).select("code name nombre").lean();
+  // ✅ soportar code o codigo
+  const rows = await Account.find({
+    owner,
+    $or: [{ code: { $in: unique } }, { codigo: { $in: unique } }],
+  })
+    .select("code codigo name nombre")
+    .lean();
 
   const map = {};
   for (const r of rows) {
-    map[String(r.code)] = r.name ?? r.nombre ?? "";
+    const code = String(r.code ?? r.codigo ?? "").trim();
+    if (!code) continue;
+    map[code] = r.name ?? r.nombre ?? "";
   }
   return map;
 }
 
 /**
- * ✅ NUEVO: Mapa por CODE y por ID
+ * ✅ NUEVO: Mapa por CODE y por ID (soporta code/codigo)
  */
 async function getAccountMaps(owner, rawLines) {
   const byCode = {};
@@ -107,20 +208,26 @@ async function getAccountMaps(owner, rawLines) {
   }
 
   const uniqueCodes = Array.from(new Set(codes.filter(Boolean)));
-  const uniqueIds = Array.from(new Set(ids.map((x) => String(x)))).map((x) => new mongoose.Types.ObjectId(x));
+  const uniqueIds = Array.from(new Set(ids.map((x) => String(x)))).map(
+    (x) => new mongoose.Types.ObjectId(x)
+  );
 
   if (!uniqueCodes.length && !uniqueIds.length) {
     return { byCode, byId };
   }
 
   const or = [];
-  if (uniqueCodes.length) or.push({ code: { $in: uniqueCodes } });
+  if (uniqueCodes.length) {
+    or.push({ $or: [{ code: { $in: uniqueCodes } }, { codigo: { $in: uniqueCodes } }] });
+  }
   if (uniqueIds.length) or.push({ _id: { $in: uniqueIds } });
 
-  const rows = await Account.find({ owner, $or: or }).select("_id code name nombre").lean();
+  const rows = await Account.find({ owner, $or: or })
+    .select("_id code codigo name nombre")
+    .lean();
 
   for (const r of rows) {
-    const code = String(r.code || "").trim();
+    const code = String(r.code ?? r.codigo ?? "").trim();
     const name = r.name ?? r.nombre ?? "";
     if (code) byCode[code] = name;
 
@@ -132,7 +239,7 @@ async function getAccountMaps(owner, rawLines) {
 }
 
 /**
- * ✅ UI mapper (lo mantengo igual que tú lo tienes)
+ * ✅ UI mapper (igual al tuyo, solo con mapas más robustos)
  */
 function mapEntryForUI(entry, accountMapsOrNameMap = {}) {
   const byCode = accountMapsOrNameMap?.byCode ? accountMapsOrNameMap.byCode : accountMapsOrNameMap;
@@ -193,7 +300,6 @@ function mapEntryForUI(entry, accountMapsOrNameMap = {}) {
 
     const side = String(l?.side || "").toLowerCase().trim();
 
-    // ✅ FIX: monto y debit/credit robustos (strings con $)
     const monto =
       num(l?.monto, 0) ||
       num(l?.amount, 0) ||
@@ -224,10 +330,10 @@ function mapEntryForUI(entry, accountMapsOrNameMap = {}) {
     haber: d.haber,
   }));
 
-  const concepto = entry.concept ?? entry.concepto ?? entry.descripcion ?? entry.memo ?? "";
-  const numeroAsiento = entry.numeroAsiento ?? entry.numero_asiento ?? entry.numero ?? null;
+  const concepto = pickEntryConcept(entry);
+  const numeroAsiento = pickEntryNumero(entry);
 
-  const fechaReal = entry.date ?? entry.fecha ?? entry.createdAt ?? entry.created_at ?? null;
+  const fechaReal = pickEntryDate(entry);
   const source = entry.source ?? entry.fuente ?? "";
 
   const txId = entry.sourceId
@@ -269,14 +375,6 @@ router.get("/depreciaciones", ensureAuth, async (_req, res) => {
 /**
  * ✅ Endpoint saldo por cuentas:
  * GET /api/asientos/detalle?cuentas=1001,1002&start=YYYY-MM-DD&end=YYYY-MM-DD
- *
- * Devuelve: [{ cuenta_codigo, cuenta_nombre, debe, haber, neto, saldo }]
- *
- * ✅ FIX E2E:
- * - soporta líneas con code o con accountId
- * - usa dateField real (date/fecha/createdAt)
- * - num() robusto (soporta strings con "$")
- * - agrega "saldo" (alias de neto) para hooks/UI
  */
 router.get("/detalle", ensureAuth, async (req, res) => {
   try {
@@ -304,7 +402,6 @@ router.get("/detalle", ensureAuth, async (req, res) => {
     const start = parseYMD(startRaw);
     const end = parseYMD(endRaw);
 
-    // cuentas=1001,1002
     let cuentas = req.query.cuentas;
     if (Array.isArray(cuentas)) {
       cuentas = cuentas.flatMap((x) => String(x).split(","));
@@ -314,23 +411,25 @@ router.get("/detalle", ensureAuth, async (req, res) => {
 
     let codes = (cuentas || []).map((c) => String(c || "").trim()).filter(Boolean);
 
-    // Si no mandan cuentas, inferimos 50/51/52 (egresos)
     if (!codes.length) {
       const rows = await Account.find({
         owner,
-        $or: [{ code: /^50/ }, { code: /^51/ }, { code: /^52/ }],
+        $or: [{ code: /^50/ }, { code: /^51/ }, { code: /^52/ }, { codigo: /^50/ }, { codigo: /^51/ }, { codigo: /^52/ }],
       })
-        .select("code")
+        .select("code codigo")
         .lean();
 
-      codes = Array.from(new Set((rows || []).map((r) => String(r.code || "").trim()).filter(Boolean)));
+      codes = Array.from(
+        new Set((rows || [])
+          .map((r) => String(r.code ?? r.codigo ?? "").trim())
+          .filter(Boolean))
+      );
     }
 
     if (!codes.length) {
       return res.json({ ok: true, data: [], items: [], byCode: {} });
     }
 
-    // Construir filtro base
     const match = { owner };
     if (start || end) {
       match[dateField] = {};
@@ -338,12 +437,10 @@ router.get("/detalle", ensureAuth, async (req, res) => {
       if (end) match[dateField].$lte = dayEnd(end);
     }
 
-    // Traer SOLO lo necesario para calcular saldos
     const docs = await JournalEntry.find(match)
       .select(`${dateField} lines detalle_asientos detalles_asiento`)
       .lean();
 
-    // juntar líneas para resolver mapas (por accountId también)
     const allLines = [];
     for (const e of docs) {
       const lines = e.lines || e.detalle_asientos || e.detalles_asiento || [];
@@ -353,7 +450,6 @@ router.get("/detalle", ensureAuth, async (req, res) => {
     const accountMaps = await getAccountMaps(owner, allLines);
     const nameMap = await getAccountNameMap(owner, codes);
 
-    // init
     const byCode = {};
     for (const code of codes) {
       byCode[code] = {
@@ -362,17 +458,15 @@ router.get("/detalle", ensureAuth, async (req, res) => {
         debe: 0,
         haber: 0,
         neto: 0,
-        saldo: 0, // ✅ alias útil para UI/hook
+        saldo: 0,
       };
     }
 
-    // sumar
     for (const e of docs) {
       const lines = e.lines || e.detalle_asientos || e.detalles_asiento || [];
       if (!Array.isArray(lines) || !lines.length) continue;
 
       for (const l of lines) {
-        // resolver cuenta code directo
         let code =
           l?.accountCodigo ??
           l?.accountCode ??
@@ -387,7 +481,6 @@ router.get("/detalle", ensureAuth, async (req, res) => {
 
         code = code ? String(code).trim() : "";
 
-        // si no hay code, resolver por id
         if (!code) {
           const idCandidate =
             l?.accountId ??
@@ -426,11 +519,7 @@ router.get("/detalle", ensureAuth, async (req, res) => {
 
     const items = Object.values(byCode).map((r) => {
       const neto = num(r.debe, 0) - num(r.haber, 0);
-      return {
-        ...r,
-        neto,
-        saldo: neto, // ✅ alias
-      };
+      return { ...r, neto, saldo: neto };
     });
 
     return res.json({
@@ -453,7 +542,6 @@ router.get("/detalle", ensureAuth, async (req, res) => {
 });
 
 /**
- * ✅ LO QUE TU UI ESTÁ PIDIENDO:
  * GET /api/asientos?start=YYYY-MM-DD&end=YYYY-MM-DD&include_detalles=1&limit=200
  */
 router.get("/", ensureAuth, async (req, res) => {
@@ -530,12 +618,15 @@ async function handleByNumero(req, res) {
       return res.status(400).json({ ok: false, error: "VALIDATION", message: "numero_asiento es requerido" });
     }
 
-    const asiento =
+    let asiento =
       (await JournalEntry.findOne({ owner, numeroAsiento: numero }).sort({ createdAt: -1 }).lean()) ||
       (await JournalEntry.findOne({ owner, numero: numero }).sort({ createdAt: -1 }).lean()) ||
       (await JournalEntry.findOne({ owner, numero_asiento: numero }).sort({ createdAt: -1 }).lean());
 
     if (!asiento) return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+
+    asiento = ensureConceptFallback(asiento);
+    asiento = await ensureNumeroAsiento(owner, asiento);
 
     const rawLines = asiento.lines || asiento.detalle_asientos || asiento.detalles_asiento || [];
     const accountMaps = await getAccountMaps(owner, rawLines);
@@ -567,7 +658,7 @@ router.get("/by-ref", ensureAuth, async (req, res) => {
 
 /**
  * ✅ CLAVE:
- * GET /api/asientos/by-transaccion?source=ingreso|egreso|...&id=XXXXXXXX
+ * GET /api/asientos/by-transaccion?source=ingreso|egreso|inventario|...&id=XXXXXXXX
  */
 router.get("/by-transaccion", ensureAuth, async (req, res) => {
   try {
@@ -588,17 +679,26 @@ router.get("/by-transaccion", ensureAuth, async (req, res) => {
 
     const sourceAliases = new Set();
     if (source) {
-      sourceAliases.add(source.toLowerCase());
-      if (source.toLowerCase() === "ingresos") sourceAliases.add("ingreso");
-      if (source.toLowerCase() === "ingreso") sourceAliases.add("ingresos");
-      if (source.toLowerCase() === "egresos") sourceAliases.add("egreso");
-      if (source.toLowerCase() === "egreso") sourceAliases.add("egresos");
+      const s = source.toLowerCase();
+      sourceAliases.add(s);
+      if (s === "ingresos") sourceAliases.add("ingreso");
+      if (s === "ingreso") sourceAliases.add("ingresos");
+      if (s === "egresos") sourceAliases.add("egreso");
+      if (s === "egreso") sourceAliases.add("egresos");
+      if (s === "movimientos_inventario") sourceAliases.add("inventario");
+      if (s === "movimiento_inventario") sourceAliases.add("inventario");
+      if (s === "inventario") {
+        sourceAliases.add("movimiento_inventario");
+        sourceAliases.add("movimientos_inventario");
+        sourceAliases.add("inventory");
+      }
     }
 
     const findBy = async (q) => JournalEntry.findOne(q).sort({ createdAt: -1 }).lean();
 
     let asiento = null;
 
+    // 1) Buscar por source + sourceId
     if (sourceAliases.size) {
       const srcList = Array.from(sourceAliases);
       asiento =
@@ -608,6 +708,7 @@ router.get("/by-transaccion", ensureAuth, async (req, res) => {
         (await findBy({ owner, "references.source": { $in: srcList }, "references.id": id }));
     }
 
+    // 2) Fallback: solo por id
     if (!asiento) {
       asiento =
         (await findBy({ owner, sourceId: { $in: sourceIdCandidates } })) ||
@@ -616,13 +717,52 @@ router.get("/by-transaccion", ensureAuth, async (req, res) => {
         (await findBy({ owner, "references.id": id }));
     }
 
+    // 3) ✅ ESPECIAL INVENTARIO: si no encontró asiento, resolver desde InventoryMovement -> journalEntryId/asientoId
+    if (!asiento && InventoryMovement && isObjectId(id)) {
+      const mov = await InventoryMovement.findOne({ owner, _id: new mongoose.Types.ObjectId(id) }).lean().catch(() => null);
+
+      if (mov) {
+        const jeId =
+          mov.journalEntryId ??
+          mov.asientoId ??
+          mov.journal_entry_id ??
+          mov.asiento_id ??
+          mov.journalEntry ??
+          mov.asiento ??
+          null;
+
+        if (jeId && isObjectId(jeId)) {
+          asiento = await findBy({ owner, _id: new mongoose.Types.ObjectId(String(jeId)) });
+        }
+
+        // Si no hay id directo, intentar por source/sourceId del movimiento
+        if (!asiento) {
+          const movSrc = String(mov.source || "").trim().toLowerCase();
+          const movSid = mov.sourceId ?? mov.source_id ?? mov.transaccionId ?? mov.transaccion_id ?? null;
+
+          if (movSrc && movSid) {
+            const cand = [movSid];
+            if (isObjectId(movSid)) cand.push(new mongoose.Types.ObjectId(String(movSid)));
+
+            asiento =
+              (await findBy({ owner, source: movSrc, sourceId: { $in: cand } })) ||
+              (await findBy({ owner, source: movSrc, source_id: { $in: cand } })) ||
+              (await findBy({ owner, source: movSrc, transaccionId: { $in: cand } }));
+          }
+        }
+      }
+    }
+
     if (!asiento) return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+
+    asiento = ensureConceptFallback(asiento);
+    asiento = await ensureNumeroAsiento(owner, asiento);
 
     const rawLines = asiento.lines || asiento.detalle_asientos || asiento.detalles_asiento || [];
     const accountMaps = await getAccountMaps(owner, rawLines);
     const asientoUI = mapEntryForUI(asiento, accountMaps);
 
-    const numeroAsiento = asientoUI.numeroAsiento || asientoUI.numero_asiento || String(asiento._id);
+    const numeroAsiento = asientoUI.numeroAsiento || asientoUI.numero_asiento || pickEntryNumero(asiento) || null;
 
     return res.json({
       ok: true,
@@ -651,8 +791,11 @@ router.get("/:id", ensureAuth, async (req, res) => {
       return res.status(400).json({ ok: false, error: "VALIDATION", message: "id inválido" });
     }
 
-    const asiento = await JournalEntry.findOne({ _id: id, owner }).lean();
+    let asiento = await JournalEntry.findOne({ _id: id, owner }).lean();
     if (!asiento) return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+
+    asiento = ensureConceptFallback(asiento);
+    asiento = await ensureNumeroAsiento(owner, asiento);
 
     const rawLines = asiento.lines || asiento.detalle_asientos || asiento.detalles_asiento || [];
     const accountMaps = await getAccountMaps(owner, rawLines);
