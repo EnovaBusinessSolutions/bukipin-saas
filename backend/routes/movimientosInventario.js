@@ -2,6 +2,7 @@
 const express = require("express");
 const router = express.Router();
 
+const mongoose = require("mongoose");
 const ensureAuth = require("../middleware/ensureAuth");
 
 // Modelos
@@ -9,6 +10,7 @@ let InventoryMovement = null;
 let JournalEntry = null;
 let Account = null;
 let Product = null;
+let Counter = null;
 
 try {
   InventoryMovement = require("../models/InventoryMovement");
@@ -34,11 +36,18 @@ try {
   Product = null;
 }
 
+try {
+  Counter = require("../models/Counter");
+} catch (_) {
+  Counter = null;
+}
+
 // --------------------
 // Helpers
 // --------------------
 function num(v, def = 0) {
   if (v === null || v === undefined) return def;
+  if (typeof v === "number") return Number.isFinite(v) ? v : def;
   const s = String(v).trim();
   if (!s) return def;
   const cleaned = s.replace(/[$,\s]/g, "");
@@ -48,6 +57,7 @@ function num(v, def = 0) {
 
 function numOrNaN(v) {
   if (v === null || v === undefined) return NaN;
+  if (typeof v === "number") return Number.isFinite(v) ? v : NaN;
   const s = String(v).trim();
   if (!s) return NaN;
   const cleaned = s.replace(/[$,\s]/g, "");
@@ -56,7 +66,7 @@ function numOrNaN(v) {
 }
 
 function isValidObjectId(str) {
-  return typeof str === "string" && /^[a-f\d]{24}$/i.test(str);
+  return mongoose.Types.ObjectId.isValid(String(str || ""));
 }
 
 function accCode(acc) {
@@ -66,6 +76,8 @@ function accCode(acc) {
 
 /**
  * Fechas (evitar UTC con YYYY-MM-DD)
+ * Nota: aquí usamos fecha local “naive” como lo venías haciendo.
+ * (Si quieres igualarlo a TZ_OFFSET_MINUTES como ingresos.js, lo hacemos después.)
  */
 function parseStartDate(s) {
   if (!s) return null;
@@ -130,13 +142,21 @@ async function findAccountByCode(owner, code) {
 
 async function findAccountByName(owner, nameRegex, type) {
   if (!Account) return null;
-  const q = { owner, name: { $regex: nameRegex, $options: "i" } };
+
+  // soportar name/nombre
+  const q = {
+    owner,
+    $or: [
+      { name: { $regex: nameRegex, $options: "i" } },
+      { nombre: { $regex: nameRegex, $options: "i" } },
+    ],
+  };
+
   if (type) q.type = type;
   return await Account.findOne(q).lean();
 }
 
 async function resolveInventoryAccounts(owner) {
-  // ✅ Inventario real del prototipo
   const inv =
     (await findAccountByCode(owner, "1005")) ||
     (await findAccountByName(owner, "inventario de mercanc", "activo")) ||
@@ -159,7 +179,6 @@ async function resolveInventoryAccounts(owner) {
     (await findAccountByName(owner, "cuentas por pagar", "pasivo")) ||
     (await findAccountByName(owner, "por pagar", "pasivo"));
 
-  // ✅ Costo de ventas inventario (sale por ventas / ajustes salida)
   const costoVentasInv =
     (await findAccountByCode(owner, "5002")) ||
     (await findAccountByName(owner, "costo de ventas invent", "gasto")) ||
@@ -196,7 +215,13 @@ function parseTipoPago(body) {
 }
 
 function isCredito(tipoPago) {
-  return tipoPago.includes("credito") || tipoPago.includes("crédito") || tipoPago.includes("pendiente");
+  const t = String(tipoPago || "");
+  return (
+    t.includes("credito") ||
+    t.includes("crédito") ||
+    t.includes("pendiente") ||
+    t.includes("por_pagar")
+  );
 }
 
 function pickAsientoIdFromBody(body) {
@@ -209,6 +234,88 @@ function pickAsientoIdFromBody(body) {
     null;
   if (!raw) return null;
   return String(raw).trim();
+}
+
+function pickNumeroAsientoFromBody(body) {
+  const raw = body?.numeroAsiento ?? body?.numero_asiento ?? body?.folioAsiento ?? null;
+  if (!raw) return null;
+  const s = String(raw).trim();
+  return s || null;
+}
+
+// --------------------
+// ✅ JournalEntry helpers (modo lines por accountCodigo o accountId)
+// --------------------
+function journalLineMode() {
+  const schema = JournalEntry?.schema;
+  if (!schema) return "code";
+
+  const hasAccountId =
+    schema.path("lines.accountId") ||
+    schema.path("lines.$.accountId") ||
+    schema.path("lines.0.accountId");
+
+  if (hasAccountId) return "id";
+
+  const hasAccountCodigo =
+    schema.path("lines.accountCodigo") ||
+    schema.path("lines.$.accountCodigo") ||
+    schema.path("lines.0.accountCodigo");
+
+  if (hasAccountCodigo) return "code";
+
+  return "code";
+}
+
+async function accountIdByCode(owner, code) {
+  if (!Account || !code) return null;
+  const c = String(code).trim();
+  const acc = await Account.findOne({
+    owner,
+    $or: [{ code: c }, { codigo: c }, { cuentaCodigo: c }, { accountCode: c }],
+  })
+    .select("_id")
+    .lean();
+  return acc?._id || null;
+}
+
+async function buildLine(owner, { code, debit = 0, credit = 0, memo = "" }) {
+  const mode = journalLineMode();
+
+  const base = {
+    debit: num(debit, 0),
+    credit: num(credit, 0),
+    memo: memo || "",
+  };
+
+  if (mode === "id") {
+    const id = await accountIdByCode(owner, code);
+    if (!id) {
+      const err = new Error(
+        `No existe la cuenta contable con code/codigo="${String(code).trim()}" para este usuario.`
+      );
+      err.statusCode = 400;
+      throw err;
+    }
+    return { ...base, accountId: id };
+  }
+
+  return { ...base, accountCodigo: String(code).trim() };
+}
+
+async function nextJournalNumber(owner, dateObj) {
+  if (!Counter) return null;
+  const year = new Date(dateObj).getFullYear();
+  const key = `journal-${year}`;
+
+  const doc = await Counter.findOneAndUpdate(
+    { owner, key },
+    { $inc: { seq: 1 } },
+    { new: true, upsert: true }
+  ).lean();
+
+  const seq = doc?.seq || 1;
+  return `${year}-${String(seq).padStart(4, "0")}`;
 }
 
 // --------------------
@@ -258,6 +365,7 @@ function mapMovementForUI(m) {
   const estado = pickEstado(m) || "activo";
 
   const asientoId = m.asientoId || m.asiento_id || m.journalEntryId || m.journal_entry_id || null;
+  const numeroAsiento = m.numeroAsiento || m.numero_asiento || null;
 
   return {
     id: String(m._id),
@@ -289,6 +397,9 @@ function mapMovementForUI(m) {
     asientoId: asientoId ? String(asientoId) : null,
     asiento_id: asientoId ? String(asientoId) : null,
     journalEntryId: asientoId ? String(asientoId) : null,
+
+    numeroAsiento: numeroAsiento || null,
+    numero_asiento: numeroAsiento || null,
 
     created_at: m.createdAt,
     updated_at: m.updatedAt,
@@ -325,10 +436,17 @@ router.get("/", ensureAuth, async (req, res) => {
     if (estadoRaw && estadoRaw !== "todos") {
       if (estadoRaw === "activo") {
         and.push({
-          $or: [{ status: "activo" }, { status: { $exists: false } }, { status: null }],
+          $or: [
+            { status: "activo" },
+            { status: { $exists: false } },
+            { status: null },
+            { estado: "activo" },
+            { estado: { $exists: false } },
+            { estado: null },
+          ],
         });
       } else {
-        and.push({ status: estadoRaw });
+        and.push({ $or: [{ status: estadoRaw }, { estado: estadoRaw }] });
       }
     }
 
@@ -338,12 +456,23 @@ router.get("/", ensureAuth, async (req, res) => {
       });
     }
 
-    if (start && end) and.push({ fecha: { $gte: start, $lte: end } });
-    else if (start && !end) and.push({ fecha: { $gte: start } });
-    else if (!start && end) and.push({ fecha: { $lte: end } });
+    // fecha/date
+    if (start && end) and.push({ $or: [{ fecha: { $gte: start, $lte: end } }, { date: { $gte: start, $lte: end } }] });
+    else if (start && !end) and.push({ $or: [{ fecha: { $gte: start } }, { date: { $gte: start } }] });
+    else if (!start && end) and.push({ $or: [{ fecha: { $lte: end } }, { date: { $lte: end } }] });
 
     if (productoId) {
-      and.push({ productId: productoId });
+      if (isValidObjectId(productoId)) {
+        and.push({
+          $or: [
+            { productId: new mongoose.Types.ObjectId(productoId) },
+            { productoId: new mongoose.Types.ObjectId(productoId) },
+            { producto_id: new mongoose.Types.ObjectId(productoId) },
+          ],
+        });
+      } else {
+        and.push({ $or: [{ productId: productoId }, { productoId: productoId }, { producto_id: productoId }] });
+      }
     }
 
     const filter = and.length > 1 ? { $and: and } : and[0];
@@ -375,6 +504,8 @@ router.get("/", ensureAuth, async (req, res) => {
 // - Inventario = 1005
 // - Salidas: 5002 vs 1005 (NO toca Caja/Bancos)
 // - Si llega asientoId (desde ingresos.js) NO crear asiento nuevo
+// - ✅ FIX: si creamos asiento aquí, SIEMPRE generamos numeroAsiento
+// - ✅ FIX: JournalEntry shape canónico (date/concept/source/sourceId/lines/numeroAsiento)
 // --------------------
 router.post("/", ensureAuth, async (req, res) => {
   try {
@@ -388,7 +519,7 @@ router.post("/", ensureAuth, async (req, res) => {
     const owner = req.user._id;
 
     const tipo = String(req.body?.tipo ?? req.body?.tipo_movimiento ?? "ajuste").trim().toLowerCase();
-    const estado = String(req.body?.estado ?? "activo").trim().toLowerCase();
+    const estado = String(req.body?.estado ?? req.body?.status ?? "activo").trim().toLowerCase();
 
     const productoIdRaw = req.body?.productoId ?? req.body?.producto_id ?? req.body?.productId ?? null;
     const productoId = productoIdRaw ? String(productoIdRaw).trim() : "";
@@ -403,7 +534,12 @@ router.post("/", ensureAuth, async (req, res) => {
       req.body?.precioUnitario ??
       null;
 
-    const costoTotalRaw = req.body?.costoTotal ?? req.body?.costo_total ?? req.body?.total ?? req.body?.monto_total ?? null;
+    const costoTotalRaw =
+      req.body?.costoTotal ??
+      req.body?.costo_total ??
+      req.body?.total ??
+      req.body?.monto_total ??
+      null;
 
     let costoUnitario = numOrNaN(costoUnitarioRaw);
     let costoTotal = numOrNaN(costoTotalRaw);
@@ -425,12 +561,15 @@ router.post("/", ensureAuth, async (req, res) => {
 
     // ✅ 1) si no vino costoUnitario, tomarlo del producto
     if ((!Number.isFinite(costoUnitario) || costoUnitario <= 0) && Product) {
-      const prod = await Product.findOne({ _id: productoId, owner })
+      const prod = await Product.findOne({ _id: new mongoose.Types.ObjectId(productoId), owner })
         .select("costoCompra costo_compra precio price")
         .lean();
 
       const fallback =
-        numOrNaN(prod?.costoCompra) || numOrNaN(prod?.costo_compra) || numOrNaN(prod?.precio) || numOrNaN(prod?.price);
+        numOrNaN(prod?.costoCompra) ||
+        numOrNaN(prod?.costo_compra) ||
+        numOrNaN(prod?.precio) ||
+        numOrNaN(prod?.price);
 
       if (Number.isFinite(fallback) && fallback > 0) costoUnitario = fallback;
     }
@@ -445,21 +584,23 @@ router.post("/", ensureAuth, async (req, res) => {
       if (costoUnitario === 0 && cantidad) costoUnitario = costoTotal / Math.abs(cantidad);
     }
 
-    // Si el tipo es salida/venta, guardamos qty como cantidad positiva para consistencia visual
-    // (la UI ya trae "Tipo" separado, no necesitamos qty negativa).
+    // qty canónico positivo
     const qtyCanon = Math.abs(cantidad);
 
     // Si llega un asientoId externo (ej. desde ingresos.js), NO creamos asiento aquí.
     const asientoIdExterno = pickAsientoIdFromBody(req.body) || null;
+    const numeroAsientoExterno = pickNumeroAsientoFromBody(req.body) || null;
 
     const payload = {
       owner,
       fecha,
+      date: fecha,
 
       tipo,
       status: estado,
+      estado: estado,
 
-      productId: productoId,
+      productId: new mongoose.Types.ObjectId(productoId),
       qty: qtyCanon,
       unitCost: costoUnitario,
       total: costoTotal,
@@ -473,8 +614,8 @@ router.post("/", ensureAuth, async (req, res) => {
       tipo_movimiento: tipo,
       tipoMovimiento: tipo,
 
-      productoId,
-      producto_id: productoId,
+      productoId: new mongoose.Types.ObjectId(productoId),
+      producto_id: new mongoose.Types.ObjectId(productoId),
 
       cantidad: qtyCanon,
       costoUnitario,
@@ -491,6 +632,9 @@ router.post("/", ensureAuth, async (req, res) => {
       asiento_id: asientoIdExterno || undefined,
       journalEntryId: asientoIdExterno || undefined,
       journal_entry_id: asientoIdExterno || undefined,
+
+      numeroAsiento: numeroAsientoExterno || undefined,
+      numero_asiento: numeroAsientoExterno || undefined,
     };
 
     const created = await InventoryMovement.create(payload);
@@ -502,22 +646,26 @@ router.post("/", ensureAuth, async (req, res) => {
     // - Si es SALIDA: 5002 vs 1005 (NO Caja/Bancos)
     // --------------------
     let asientoId = asientoIdExterno || null;
+    let numeroAsiento = numeroAsientoExterno || null;
     let asientoWarning = null;
 
-    const debeGenerarAsiento = !asientoIdExterno && (isEntrada(tipo) || isSalida(tipo)) && costoTotal > 0;
+    const debeGenerarAsiento =
+      !asientoIdExterno && (isEntrada(tipo) || isSalida(tipo)) && costoTotal > 0;
 
     if (debeGenerarAsiento && JournalEntry && Account) {
       try {
-        const { inv, caja, bancos, proveedores, costoVentasInv } = await resolveInventoryAccounts(owner);
+        const { inv, caja, bancos, proveedores, costoVentasInv } =
+          await resolveInventoryAccounts(owner);
 
-        const invCode = accCode(inv); // ✅ 1005
+        const invCode = accCode(inv); // 1005
         const cajaCode = accCode(caja); // 1001
         const bancosCode = accCode(bancos); // 1002
         const provCode = accCode(proveedores); // 2001
-        const cogsCode = accCode(costoVentasInv); // ✅ 5002
+        const cogsCode = accCode(costoVentasInv); // 5002
 
         if (!invCode) {
-          asientoWarning = "No se pudo generar asiento: falta cuenta 1005 Inventario de Mercancías.";
+          asientoWarning =
+            "No se pudo generar asiento: falta cuenta 1005 Inventario de Mercancías.";
         } else {
           const lines = [];
 
@@ -534,24 +682,33 @@ router.post("/", ensureAuth, async (req, res) => {
               metodoPago.includes("tdd") ||
               metodoPago.includes("tdc");
 
-            const contraCode = usarProveedores ? provCode : (usarBancos ? bancosCode : cajaCode);
+            const contraCode = usarProveedores
+              ? provCode
+              : (usarBancos ? bancosCode : cajaCode);
 
             if (!contraCode) {
-              asientoWarning = "No se pudo generar asiento de compra: falta Caja/Bancos/Proveedores.";
+              asientoWarning =
+                "No se pudo generar asiento de compra: falta Caja/Bancos/Proveedores.";
             } else {
-              lines.push({
-                accountCodigo: invCode,
-                debit: Math.abs(costoTotal),
-                credit: 0,
-                memo: "Compra / Entrada a inventario",
-              });
+              lines.push(
+                await buildLine(owner, {
+                  code: invCode,
+                  debit: Math.abs(costoTotal),
+                  credit: 0,
+                  memo: "Compra / Entrada a inventario",
+                })
+              );
 
-              lines.push({
-                accountCodigo: contraCode,
-                debit: 0,
-                credit: Math.abs(costoTotal),
-                memo: usarProveedores ? "Compra a crédito (Proveedores)" : "Pago compra inventario",
-              });
+              lines.push(
+                await buildLine(owner, {
+                  code: contraCode,
+                  debit: 0,
+                  credit: Math.abs(costoTotal),
+                  memo: usarProveedores
+                    ? "Compra a crédito (Proveedores)"
+                    : "Pago compra inventario",
+                })
+              );
             }
           }
 
@@ -561,34 +718,40 @@ router.post("/", ensureAuth, async (req, res) => {
               asientoWarning =
                 "No se pudo generar asiento de salida: falta cuenta 5002 Costo de Ventas Inventario.";
             } else {
-              // ✅ IMPORTANTE:
-              // Este asiento es SOLO la parte de inventario/costo.
+              // Este asiento es SOLO inventario/costo.
               // Caja/Bancos + Ventas (4001) se generan en ingresos.js cuando es venta real.
-              lines.push({
-                accountCodigo: cogsCode,
-                debit: Math.abs(costoTotal),
-                credit: 0,
-                memo: "Salida inventario (Costo)",
-              });
+              lines.push(
+                await buildLine(owner, {
+                  code: cogsCode,
+                  debit: Math.abs(costoTotal),
+                  credit: 0,
+                  memo: "Salida inventario (Costo)",
+                })
+              );
 
-              lines.push({
-                accountCodigo: invCode,
-                debit: 0,
-                credit: Math.abs(costoTotal),
-                memo: "Salida inventario (Reduce stock)",
-              });
+              lines.push(
+                await buildLine(owner, {
+                  code: invCode,
+                  debit: 0,
+                  credit: Math.abs(costoTotal),
+                  memo: "Salida inventario (Reduce stock)",
+                })
+              );
             }
           }
 
           if (lines.length >= 2) {
+            // ✅ FIX: siempre generar numeroAsiento (evita null/duplicate)
+            numeroAsiento = (await nextJournalNumber(owner, fecha)) || null;
+
             const je = await JournalEntry.create({
               owner,
-              fecha,
-              descripcion: descripcion || `Movimiento inventario (${tipo})`,
-              lines,
-              referencia: referencia || "",
+              date: fecha,
+              concept: descripcion || `Movimiento inventario (${tipo})`,
               source: "inventario",
-              source_id: String(created._id),
+              sourceId: created._id,
+              lines,
+              ...(numeroAsiento ? { numeroAsiento } : {}),
             });
 
             asientoId = String(je._id);
@@ -597,6 +760,11 @@ router.post("/", ensureAuth, async (req, res) => {
             created.asiento_id = asientoId;
             created.journalEntryId = asientoId;
             created.journal_entry_id = asientoId;
+
+            if (numeroAsiento) {
+              created.numeroAsiento = numeroAsiento;
+              created.numero_asiento = numeroAsiento;
+            }
 
             await created.save();
           }
@@ -615,6 +783,7 @@ router.post("/", ensureAuth, async (req, res) => {
       ok: true,
       data: mapMovementForUI(fresh || created),
       asientoId: asientoId || null,
+      numeroAsiento: numeroAsiento || null,
       warning: asientoWarning || null,
     });
   } catch (err) {
@@ -635,9 +804,10 @@ router.post("/", ensureAuth, async (req, res) => {
 // DELETE /api/movimientos-inventario/:id
 // ✅ Prototipo: "Cancelar" (soft cancel) en vez de borrar
 // - status => cancelado
-// - Si el asiento fue creado por este módulo (source=inventario y source_id==movimiento),
+// - Si el asiento fue creado por este módulo (source=inventario y sourceId==movimiento),
 //   crea reversa contable. Si no, NO toca el asiento (ej. ventas creadas en ingresos.js).
-// - Si mandas ?hard=1 => borra físicamente (por si lo necesitas).
+// - Si mandas ?hard=1 => borra físicamente
+// - ✅ FIX: reversa también genera numeroAsiento y usa shape canónico
 // --------------------
 router.delete("/:id", ensureAuth, async (req, res) => {
   try {
@@ -663,7 +833,6 @@ router.delete("/:id", ensureAuth, async (req, res) => {
 
     // Soft cancel
     found.status = "cancelado";
-    // compat
     found.estado = "cancelado";
 
     let reversalId = null;
@@ -678,26 +847,52 @@ router.delete("/:id", ensureAuth, async (req, res) => {
 
         // Solo revertimos si el asiento fue generado por ESTE módulo.
         const isFromThisModule =
-          je && String(je.source || "") === "inventario" && String(je.source_id || "") === String(found._id);
+          je &&
+          String(je.source || "") === "inventario" &&
+          String(je.sourceId || "") === String(found._id);
 
         if (isFromThisModule) {
           const originalLines = Array.isArray(je.lines) ? je.lines : [];
-          const reversedLines = originalLines.map((ln) => ({
-            accountCodigo: ln.accountCodigo ?? ln.cuentaCodigo ?? ln.accountCode ?? ln.code,
-            debit: num(ln.credit, 0),
-            credit: num(ln.debit, 0),
-            memo: `Reversa: ${ln.memo || "Movimiento inventario"}`,
-          }));
+
+          const reversedLines = [];
+          for (const ln of originalLines) {
+            const code =
+              ln.accountCodigo ??
+              ln.accountCode ??
+              ln.cuentaCodigo ??
+              ln.cuenta_codigo ??
+              null;
+
+            // si es modo accountId, preservamos accountId
+            const lineMode = journalLineMode();
+            if (lineMode === "id" && ln.accountId) {
+              reversedLines.push({
+                accountId: ln.accountId,
+                debit: num(ln.credit, 0),
+                credit: num(ln.debit, 0),
+                memo: `Reversa: ${ln.memo || "Movimiento inventario"}`,
+              });
+            } else {
+              reversedLines.push({
+                accountCodigo: code ? String(code).trim() : null,
+                debit: num(ln.credit, 0),
+                credit: num(ln.debit, 0),
+                memo: `Reversa: ${ln.memo || "Movimiento inventario"}`,
+              });
+            }
+          }
+
+          const numeroAsiento = (await nextJournalNumber(owner, new Date())) || null;
 
           const rev = await JournalEntry.create({
             owner,
-            fecha: new Date(),
-            descripcion: `REVERSA - ${je.descripcion || "Asiento inventario"}`,
-            lines: reversedLines,
-            referencia: `REV-${je.referencia || ""}`.trim(),
+            date: new Date(),
+            concept: `REVERSA - ${je.concept ?? je.concepto ?? je.descripcion ?? "Asiento inventario"}`,
             source: "inventario_reversal",
-            source_id: String(found._id),
+            sourceId: found._id,
+            lines: reversedLines,
             reversal_of: String(je._id),
+            ...(numeroAsiento ? { numeroAsiento } : {}),
           });
 
           reversalId = String(rev._id);
@@ -710,7 +905,12 @@ router.delete("/:id", ensureAuth, async (req, res) => {
 
     await found.save();
 
-    return res.json({ ok: true, canceled: true, reversalId: reversalId || null, warning: warning || null });
+    return res.json({
+      ok: true,
+      canceled: true,
+      reversalId: reversalId || null,
+      warning: warning || null,
+    });
   } catch (err) {
     console.error("DELETE /api/movimientos-inventario/:id error:", err);
     return res.status(500).json({ ok: false, message: "Error cancelando movimiento" });

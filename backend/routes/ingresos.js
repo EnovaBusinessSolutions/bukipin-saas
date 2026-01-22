@@ -889,13 +889,9 @@ function getProductName(p) {
   return p?.nombre ?? p?.name ?? p?.title ?? p?.producto ?? p?.descripcion ?? "Producto";
 }
 
-async function updateProductStockSafe(owner, productDoc, qtyToDecrement) {
-  if (!Product || !productDoc?._id) return;
-
-  const inc = {};
-  const present = new Set(Object.keys(productDoc || {}));
-
-  const maybeDec = [
+// ✅ Elegir SOLO una llave de stock (evita decrementar varias a la vez)
+function pickStockKey(productDoc) {
+  const candidates = [
     "stock",
     "stockActual",
     "stock_actual",
@@ -905,31 +901,33 @@ async function updateProductStockSafe(owner, productDoc, qtyToDecrement) {
     "cantidad_actual",
     "cantidadActual",
   ];
-
-  const maybeInc = [
-    "totalUsadoVendido",
-    "total_usado_vendido",
-    "totalVendido",
-    "total_vendido",
-    "usadoVendido",
-    "usado_vendido",
-  ];
-
-  for (const k of maybeDec) {
-    if (present.has(k)) inc[k] = (inc[k] || 0) - qtyToDecrement;
+  for (const k of candidates) {
+    if (Object.prototype.hasOwnProperty.call(productDoc || {}, k)) return k;
   }
-  for (const k of maybeInc) {
-    if (present.has(k)) inc[k] = (inc[k] || 0) + qtyToDecrement;
-  }
+  return "stock";
+}
 
-  if (!Object.keys(inc).length) {
-    if (present.has("stock")) inc.stock = -qtyToDecrement;
-    else if (present.has("stockActual")) inc.stockActual = -qtyToDecrement;
+async function updateProductStockAtomic(owner, productId, stockKey, qtyToDecrement) {
+  if (!Product || !productId || !stockKey || !qtyToDecrement) return { ok: false };
+
+  // También incrementamos una métrica si existe, sin ser agresivos
+  const inc = { [stockKey]: -qtyToDecrement };
+  const bumpCandidates = ["totalVendido", "total_vendido", "totalUsadoVendido", "total_usado_vendido"];
+  for (const k of bumpCandidates) {
+    // no sabemos si existe: lo hacemos con $inc igual, mongo lo crea si no existe.
+    // si no quieres que se cree, dime y lo quitamos.
+    inc[k] = (inc[k] || 0) + qtyToDecrement;
+    break;
   }
 
-  if (!Object.keys(inc).length) return;
+  const r = await Product.updateOne(
+    { owner, _id: new mongoose.Types.ObjectId(String(productId)), [stockKey]: { $gte: qtyToDecrement } },
+    { $inc: inc }
+  ).catch(() => null);
 
-  await Product.updateOne({ owner, _id: productDoc._id }, { $inc: inc }).catch(() => {});
+  const matched = r?.matchedCount ?? r?.n ?? 0;
+  if (!matched) return { ok: false };
+  return { ok: true };
 }
 
 async function createInventorySalidaIfPossible(owner, payload) {
@@ -1245,7 +1243,7 @@ router.post("/", ensureAuth, async (req, res) => {
   let tx = null;
 
   try {
-    const tipoIngreso = String(req.body?.tipoIngreso || "general");
+    const tipoIngreso = String(req.body?.tipoIngreso || "general").trim();
     const descripcion = String(req.body?.descripcion || "Ingreso").trim();
 
     const total = num(req.body?.montoTotal ?? req.body?.total, 0);
@@ -1270,26 +1268,95 @@ router.post("/", ensureAuth, async (req, res) => {
     const productIdRaw = pickProductId(req.body);
     const qty = pickQty(req.body);
 
-    // ✅ FIX: evitar crash si productIdRaw no es ObjectId
-    if (!subcuentaRef && productIdRaw && isObjectId(productIdRaw)) {
-      const p = await Product?.findOne({
+    // ✅ Detectar inventariado (YA NO se activa solo por “hay productId”)
+    const isInventariado =
+      normalizeTipoIngresoInventario(tipoIngreso) ||
+      lower(req.body?.tipoProducto) === "inventariado" ||
+      lower(req.body?.productoTipo) === "inventariado" ||
+      req.body?.isInventariado === true ||
+      req.body?.forceInventario === true;
+
+    // ✅ Si es inventariado: validamos productId y pre-calculamos meta (stock/costo)
+    let invMeta = null; // { productId, productName, qty, costUnit, costTotal, stockKey }
+    let productDoc = null;
+
+    if (isInventariado) {
+      if (!Product) {
+        return res.status(400).json({
+          ok: false,
+          message: "No existe modelo Product activo; no puedo procesar inventario.",
+        });
+      }
+      if (!productIdRaw || !isObjectId(productIdRaw)) {
+        return res.status(400).json({
+          ok: false,
+          message: "Para ventas inventariadas se requiere productId válido.",
+        });
+      }
+
+      productDoc = await Product.findOne({
         owner,
         _id: new mongoose.Types.ObjectId(String(productIdRaw)),
-      })
-        .select("subcuentaId subcuenta_id subcuenta subcuentaCodigo subcuenta_codigo")
-        .lean()
-        .catch(() => null);
+      }).lean();
 
-      subcuentaRef =
-        p?.subcuentaId ??
-        p?.subcuenta_id ??
-        p?.subcuenta ??
-        p?.subcuentaCodigo ??
-        p?.subcuenta_codigo ??
-        null;
+      if (!productDoc) {
+        return res.status(404).json({ ok: false, message: "Producto inventariado no encontrado." });
+      }
+
+      const stockKey = pickStockKey(productDoc);
+      const stock = num(productDoc?.[stockKey], 0);
+      if (stock < qty) {
+        return res.status(400).json({
+          ok: false,
+          message: `Stock insuficiente. Stock actual: ${stock}. Requerido: ${qty}.`,
+        });
+      }
+
+      const pname = getProductName(productDoc);
+      const costUnit = getProductCostUnit(productDoc);
+      const costTotal = Number((costUnit * qty).toFixed(2));
+
+      // inferir subcuenta si no venía
+      if (!subcuentaRef) {
+        subcuentaRef =
+          productDoc?.subcuentaId ??
+          productDoc?.subcuenta_id ??
+          productDoc?.subcuenta ??
+          productDoc?.subcuentaCodigo ??
+          productDoc?.subcuenta_codigo ??
+          null;
+      }
+
+      invMeta = {
+        productId: String(productDoc._id),
+        productName: pname,
+        qty,
+        costUnit,
+        costTotal,
+        stockKey,
+      };
+    } else {
+      // ✅ FIX: evitar crash si productIdRaw no es ObjectId
+      if (!subcuentaRef && productIdRaw && isObjectId(productIdRaw)) {
+        const p = await Product?.findOne({
+          owner,
+          _id: new mongoose.Types.ObjectId(String(productIdRaw)),
+        })
+          .select("subcuentaId subcuenta_id subcuenta subcuentaCodigo subcuenta_codigo")
+          .lean()
+          .catch(() => null);
+
+        subcuentaRef =
+          p?.subcuentaId ??
+          p?.subcuenta_id ??
+          p?.subcuenta ??
+          p?.subcuentaCodigo ??
+          p?.subcuenta_codigo ??
+          null;
+      }
     }
 
-    // ✅ resolver a id+code
+    // ✅ resolver subcuenta a id+code
     const { id: subcuentaIdResolved, code: subcuentaCodigoResolved } = await resolveAccountFromRef(
       owner,
       subcuentaRef
@@ -1332,14 +1399,6 @@ router.post("/", ensureAuth, async (req, res) => {
     const COD_COGS = "5002";
     const COD_INVENTARIO = "1005";
 
-    // ✅ Detectar inventariado
-    const isInventariado =
-      normalizeTipoIngresoInventario(tipoIngreso) ||
-      lower(req.body?.tipoProducto) === "inventariado" ||
-      lower(req.body?.productoTipo) === "inventariado" ||
-      req.body?.isInventariado === true ||
-      (!!productIdRaw && !!Product);
-
     const txPayload = {
       owner,
       fecha,
@@ -1365,10 +1424,20 @@ router.post("/", ensureAuth, async (req, res) => {
       productId: productIdRaw ?? null,
       product_id: productIdRaw ?? null,
 
-      // ✅ qty (para trazabilidad)
+      // qty (para trazabilidad)
       cantidad: qty,
       qty,
       unidades: qty,
+
+      // inventario meta (si aplica)
+      ...(invMeta
+        ? {
+            costoUnitario: invMeta.costUnit,
+            costo_unitario: invMeta.costUnit,
+            costoTotal: invMeta.costTotal,
+            costo_total: invMeta.costTotal,
+          }
+        : {}),
 
       saldoPendiente,
       saldo_pendiente: saldoPendiente,
@@ -1455,56 +1524,26 @@ router.post("/", ensureAuth, async (req, res) => {
      * ✅ INVENTARIO (venta inventariada) — PROTOTIPO
      *   - Debe 5002 (costo de venta)
      *   - Haber 1005 (salida inventario)
-     *   - Registrar movimiento “SALIDA” si existe modelo
-     *   - Ajustar stock del producto
      * ==========================================================
      */
-    let invMeta = null;
+    if (invMeta && invMeta.costTotal > 0) {
+      lines.push(
+        await buildLine(owner, {
+          code: COD_COGS,
+          debit: invMeta.costTotal,
+          credit: 0,
+          memo: `Costo de venta - ${invMeta.productName} (${invMeta.qty} unidades)`,
+        })
+      );
 
-    if (isInventariado && Product && productIdRaw && isObjectId(productIdRaw)) {
-      const p = await Product.findOne({
-        owner,
-        _id: new mongoose.Types.ObjectId(String(productIdRaw)),
-      })
-        .lean()
-        .catch(() => null);
-
-      if (p) {
-        const costUnit = getProductCostUnit(p);
-        const costTotal = Number((costUnit * qty).toFixed(2));
-        const pname = getProductName(p);
-
-        if (costTotal > 0) {
-          lines.push(
-            await buildLine(owner, {
-              code: COD_COGS,
-              debit: costTotal,
-              credit: 0,
-              memo: `Costo de venta - ${pname} (${qty} unidades)`,
-            })
-          );
-
-          lines.push(
-            await buildLine(owner, {
-              code: COD_INVENTARIO,
-              debit: 0,
-              credit: costTotal,
-              memo: `Salida de inventario - ${pname} (${qty} unidades)`,
-            })
-          );
-        }
-
-        // update stock (no bloqueante)
-        await updateProductStockSafe(owner, p, qty);
-
-        invMeta = {
-          productId: String(p._id),
-          productName: pname,
-          qty,
-          costUnit,
-          costTotal,
-        };
-      }
+      lines.push(
+        await buildLine(owner, {
+          code: COD_INVENTARIO,
+          debit: 0,
+          credit: invMeta.costTotal,
+          memo: `Salida de inventario - ${invMeta.productName} (${invMeta.qty} unidades)`,
+        })
+      );
     }
 
     const numeroAsiento = await nextJournalNumber(owner, tx.fecha);
@@ -1519,6 +1558,20 @@ router.post("/", ensureAuth, async (req, res) => {
       numeroAsiento,
     });
 
+    // ✅ Si inventariado: decrementar stock de forma atómica (evita negativos)
+    if (invMeta?.productId && Product) {
+      const ok = await updateProductStockAtomic(owner, invMeta.productId, invMeta.stockKey, invMeta.qty);
+      if (!ok?.ok) {
+        // rollback contable y tx, porque inventario no se pudo ajustar
+        await JournalEntry.deleteOne({ _id: entry._id, owner }).catch(() => {});
+        await IncomeTransaction.deleteOne({ _id: tx._id, owner }).catch(() => {});
+        return res.status(400).json({
+          ok: false,
+          message: "No se pudo actualizar el stock (posible carrera / stock insuficiente). Intenta de nuevo.",
+        });
+      }
+    }
+
     // ✅ crear movimiento de inventario “SALIDA” (si existe modelo) para que aparezca en Resumen Transacciones
     if (invMeta?.productId) {
       await createInventorySalidaIfPossible(owner, {
@@ -1526,6 +1579,7 @@ router.post("/", ensureAuth, async (req, res) => {
         fecha: tx.fecha,
         date: tx.fecha,
 
+        // vínculos
         source: "ingreso",
         sourceId: tx._id,
         transaccion_ingreso_id: tx._id,
@@ -1534,6 +1588,7 @@ router.post("/", ensureAuth, async (req, res) => {
         asientoId: entry._id,
         numeroAsiento,
 
+        // producto
         productId: invMeta.productId,
         productoId: invMeta.productId,
         product_id: invMeta.productId,
@@ -1542,13 +1597,16 @@ router.post("/", ensureAuth, async (req, res) => {
         producto: invMeta.productName,
         productName: invMeta.productName,
 
+        // tipo movimiento
         tipo: "salida",
         tipoMovimiento: "salida",
         tipo_movimiento: "salida",
+        motivo: "venta",
+        concept: `Venta: ${tx.descripcion}`,
 
+        // cantidades/costos
         cantidad: invMeta.qty,
         qty: invMeta.qty,
-
         costoUnitario: invMeta.costUnit,
         costo_unitario: invMeta.costUnit,
         costoTotal: invMeta.costTotal,
