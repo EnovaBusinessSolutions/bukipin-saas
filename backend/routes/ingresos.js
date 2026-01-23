@@ -819,7 +819,7 @@ function normalizeTipoPago(raw) {
 }
 
 /**
- * ✅ Inventario helpers (PROTOTIPO)
+ * ✅ Inventario helpers (E2E real)
  */
 function normalizeTipoIngresoInventario(tipoIngresoRaw) {
   const t = lower(tipoIngresoRaw);
@@ -905,6 +905,96 @@ function pickStockKey(productDoc) {
     if (Object.prototype.hasOwnProperty.call(productDoc || {}, k)) return k;
   }
   return "stock";
+}
+
+/**
+ * ✅ NUEVO: calcular stock REAL por movimientos (entradas - salidas).
+ * Si existe InventoryMovement, esta es la fuente de verdad para validar stock.
+ */
+async function getStockByMovements(owner, productIdRaw) {
+  if (!InventoryMovement) return null;
+  if (!productIdRaw) return null;
+
+  const pidStr = String(productIdRaw).trim();
+  const pidObj = isObjectId(pidStr) ? new mongoose.Types.ObjectId(pidStr) : null;
+
+  // match robusto para diferentes nombres de campo
+  const or = [];
+  if (pidObj) {
+    or.push({ productId: pidObj }, { productoId: pidObj }, { product_id: pidObj }, { producto_id: pidObj });
+    or.push({ product: pidObj }, { producto: pidObj });
+  }
+  or.push({ productId: pidStr }, { productoId: pidStr }, { product_id: pidStr }, { producto_id: pidStr });
+
+  const match = {
+    owner,
+    cancelado: { $ne: true },
+    $or: or,
+  };
+
+  const rows = await InventoryMovement.aggregate([
+    { $match: match },
+    {
+      $project: {
+        tipo: {
+          $toLower: {
+            $ifNull: ["$tipo", { $ifNull: ["$tipo_movimiento", { $ifNull: ["$tipoMovimiento", ""] }] }],
+          },
+        },
+        cantidad: {
+          $toDouble: { $ifNull: ["$cantidad", { $ifNull: ["$qty", { $ifNull: ["$quantity", 0] }] }] },
+        },
+        estado: { $toLower: { $ifNull: ["$estado", { $ifNull: ["$status", "activo"] }] } },
+      },
+    },
+    // ignorar anulados si existen estados
+    { $match: { estado: { $ne: "cancelado" } } },
+    {
+      $group: {
+        _id: null,
+        entradas: {
+          $sum: {
+            $cond: [
+              { $in: ["$tipo", ["entrada", "compra", "ajuste_entrada", "ingreso"]] },
+              "$cantidad",
+              0,
+            ],
+          },
+        },
+        salidas: {
+          $sum: {
+            $cond: [
+              { $in: ["$tipo", ["salida", "venta", "ajuste_salida", "egreso"]] },
+              "$cantidad",
+              0,
+            ],
+          },
+        },
+      },
+    },
+  ]);
+
+  const entradas = num(rows?.[0]?.entradas, 0);
+  const salidas = num(rows?.[0]?.salidas, 0);
+  const stock = Number((entradas - salidas).toFixed(6));
+  return Number.isFinite(stock) ? stock : 0;
+}
+
+/**
+ * ✅ NUEVO: sincronizar campo stock del producto (best-effort)
+ * Esto evita que tu Product se quede con stock 0 mientras la UI calcula por movimientos.
+ */
+async function syncProductStockBestEffort(owner, productId, stockKey, newStock) {
+  if (!Product || !productId || !stockKey) return;
+  const n = num(newStock, null);
+  if (n === null) return;
+
+  try {
+    await Product.updateOne(
+      { owner, _id: new mongoose.Types.ObjectId(String(productId)) },
+      { $set: { [stockKey]: n } }
+    ).catch(() => {});
+  } catch (_) {}
 }
 
 async function updateProductStockAtomic(owner, productId, stockKey, qtyToDecrement) {
@@ -1274,7 +1364,7 @@ router.post("/", ensureAuth, async (req, res) => {
       req.body?.forceInventario === true;
 
     // ✅ Si es inventariado: validamos productId y pre-calculamos meta (stock/costo)
-    let invMeta = null; // { productIdStr, productIdObj, productName, qty, costUnit, costTotal, stockKey }
+    let invMeta = null; // { productIdStr, productIdObj, productName, qty, costUnit, costTotal, stockKey, stockBefore, stockAfter, stockSource }
     let productDoc = null;
 
     if (isInventariado) {
@@ -1301,11 +1391,23 @@ router.post("/", ensureAuth, async (req, res) => {
       }
 
       const stockKey = pickStockKey(productDoc);
-      const stock = num(productDoc?.[stockKey], 0);
+
+      // ✅ NUEVO: stock real por movimientos (si existe modelo)
+      const stockByMov = await getStockByMovements(owner, productDoc._id);
+      const hasMovStock = typeof stockByMov === "number";
+
+      // fallback a campo (legacy)
+      const stockByField = num(productDoc?.[stockKey], 0);
+
+      const stock = hasMovStock ? stockByMov : stockByField;
+      const stockSource = hasMovStock ? "movements" : "product_field";
+
       if (stock < qty) {
         return res.status(400).json({
           ok: false,
           message: `Stock insuficiente. Stock actual: ${stock}. Requerido: ${qty}.`,
+          code: "STOCK_INSUFICIENTE",
+          meta: { stockSource, stockKey, stockByMov, stockByField },
         });
       }
 
@@ -1332,7 +1434,16 @@ router.post("/", ensureAuth, async (req, res) => {
         costUnit,
         costTotal,
         stockKey,
+        stockBefore: stock,
+        stockAfter: Number((stock - qty).toFixed(6)),
+        stockSource,
       };
+
+      // ✅ si el stock real viene de movimientos y el campo en Product está desalineado,
+      // sincronizamos para que deje de existir el "stock 0" en Product.
+      if (invMeta.stockSource === "movements") {
+        await syncProductStockBestEffort(owner, invMeta.productIdStr, invMeta.stockKey, invMeta.stockBefore);
+      }
     } else {
       // ✅ FIX: evitar crash si productIdRaw no es ObjectId
       if (!subcuentaRef && productIdRaw && isObjectId(productIdRaw)) {
@@ -1393,7 +1504,7 @@ router.post("/", ensureAuth, async (req, res) => {
     const COD_DESCUENTOS = "4002";
     const codCobro = metodoPago === "bancos" ? COD_BANCOS : COD_CAJA;
 
-    // ✅ Inventario (prototipo)
+    // ✅ Inventario
     const COD_COGS = "5002";
     const COD_INVENTARIO = "1005";
 
@@ -1434,6 +1545,9 @@ router.post("/", ensureAuth, async (req, res) => {
             costo_unitario: invMeta.costUnit,
             costoTotal: invMeta.costTotal,
             costo_total: invMeta.costTotal,
+            stock_before: invMeta.stockBefore,
+            stock_after: invMeta.stockAfter,
+            stock_source: invMeta.stockSource,
           }
         : {}),
 
@@ -1518,11 +1632,9 @@ router.post("/", ensureAuth, async (req, res) => {
     );
 
     /**
-     * ==========================================================
-     * ✅ INVENTARIO (venta inventariada) — PROTOTIPO
+     * ✅ INVENTARIO (venta inventariada)
      *   - Debe 5002 (costo de venta)
      *   - Haber 1005 (salida inventario)
-     * ==========================================================
      */
     if (invMeta && invMeta.costTotal > 0) {
       lines.push(
@@ -1556,10 +1668,7 @@ router.post("/", ensureAuth, async (req, res) => {
       numeroAsiento,
     });
 
-    // ============================
-    // ✅ FIX 1: espejo en la tx
-    // (útil para UI/queries; si tu schema no lo tiene, mongo igual lo guarda si no es strict)
-    // ============================
+    // espejo en la tx
     try {
       tx.asientoId = tx.asientoId ?? entry._id;
       tx.asiento_id = tx.asiento_id ?? entry._id;
@@ -1572,21 +1681,29 @@ router.post("/", ensureAuth, async (req, res) => {
       await tx.save().catch(() => {});
     } catch (_) {}
 
-    // ✅ Si inventariado: decrementar stock de forma atómica (evita negativos)
+    /**
+     * ✅ Stock: si usamos campo (legacy), mantenemos atomic decrement.
+     * ✅ Si usamos movimientos, NO bloqueamos la venta por $gte del campo,
+     *    pero sincronizamos el stock del producto al final (best-effort).
+     */
     if (invMeta?.productIdStr && Product) {
-      const ok = await updateProductStockAtomic(owner, invMeta.productIdStr, invMeta.stockKey, invMeta.qty);
-      if (!ok?.ok) {
-        // rollback contable y tx, porque inventario no se pudo ajustar
-        await JournalEntry.deleteOne({ _id: entry._id, owner }).catch(() => {});
-        await IncomeTransaction.deleteOne({ _id: tx._id, owner }).catch(() => {});
-        return res.status(400).json({
-          ok: false,
-          message: "No se pudo actualizar el stock (posible carrera / stock insuficiente). Intenta de nuevo.",
-        });
+      if (invMeta.stockSource === "product_field") {
+        const ok = await updateProductStockAtomic(owner, invMeta.productIdStr, invMeta.stockKey, invMeta.qty);
+        if (!ok?.ok) {
+          await JournalEntry.deleteOne({ _id: entry._id, owner }).catch(() => {});
+          await IncomeTransaction.deleteOne({ _id: tx._id, owner }).catch(() => {});
+          return res.status(400).json({
+            ok: false,
+            message: "No se pudo actualizar el stock (posible carrera / stock insuficiente). Intenta de nuevo.",
+          });
+        }
+      } else {
+        // movimientos = fuente de verdad → set stock al valor final
+        await syncProductStockBestEffort(owner, invMeta.productIdStr, invMeta.stockKey, invMeta.stockAfter);
       }
     }
 
-    // ✅ crear movimiento de inventario “SALIDA” (si existe modelo) para que aparezca en Resumen Transacciones
+    // ✅ crear movimiento de inventario “SALIDA” (si existe modelo)
     if (invMeta?.productIdStr) {
       const asientoId = entry._id;
 
@@ -1595,14 +1712,10 @@ router.post("/", ensureAuth, async (req, res) => {
         fecha: tx.fecha,
         date: tx.fecha,
 
-        // vínculos (sourceId = tx._id; el asiento REAL es entry._id)
         source: "ingreso",
         sourceId: tx._id,
         transaccion_ingreso_id: tx._id,
 
-        // ============================
-        // ✅ FIX 2: TODAS las llaves compat
-        // ============================
         journalEntryId: asientoId,
         journal_entry_id: asientoId,
         asientoId: asientoId,
@@ -1611,7 +1724,6 @@ router.post("/", ensureAuth, async (req, res) => {
         numeroAsiento,
         numero_asiento: numeroAsiento,
 
-        // producto (ideal: ObjectId)
         productId: invMeta.productIdObj,
         productoId: invMeta.productIdObj,
         product_id: invMeta.productIdObj,
@@ -1620,14 +1732,13 @@ router.post("/", ensureAuth, async (req, res) => {
         producto: invMeta.productName,
         productName: invMeta.productName,
 
-        // tipo movimiento
+        // tipo movimiento (IMPORTANTE para cálculos)
         tipo: "salida",
         tipoMovimiento: "salida",
         tipo_movimiento: "salida",
         motivo: "venta",
         concept: `Venta: ${tx.descripcion}`,
 
-        // cantidades/costos
         cantidad: invMeta.qty,
         qty: invMeta.qty,
         costoUnitario: invMeta.costUnit,
@@ -1638,7 +1749,6 @@ router.post("/", ensureAuth, async (req, res) => {
         descripcion: tx.descripcion,
         memo: tx.descripcion,
 
-        // estado/status (consistente con filtros)
         estado: "activo",
         status: "activo",
       });
@@ -1677,7 +1787,6 @@ router.post("/", ensureAuth, async (req, res) => {
 
 /**
  * GET /api/ingresos/highlights
- * Devuelve totales SOLO del día/mes/año actuales (NO depende de filtros de analítica).
  */
 router.get("/highlights", ensureAuth, async (req, res) => {
   try {
