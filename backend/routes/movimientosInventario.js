@@ -76,6 +76,16 @@ function toObjectId(v) {
   return new mongoose.Types.ObjectId(s);
 }
 
+function toYMD(d) {
+  if (!d) return null;
+  const dt = new Date(d);
+  if (Number.isNaN(dt.getTime())) return null;
+  const y = dt.getFullYear();
+  const m = String(dt.getMonth() + 1).padStart(2, "0");
+  const day = String(dt.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
 function accCode(acc) {
   if (!acc) return "";
   return String(acc.code ?? acc.codigo ?? acc.accountCode ?? acc.cuentaCodigo ?? "").trim();
@@ -129,11 +139,6 @@ function isSalida(tipo) {
 
 // --------------------
 // Contabilidad (resolver cuentas)
-// 1001 Caja
-// 1002 Bancos
-// 1005 Inventario de Mercancías
-// 2001 Proveedores
-// 5002 Costo de Ventas Inventario
 // --------------------
 async function findAccountByCode(owner, code) {
   if (!Account || !code) return null;
@@ -247,8 +252,6 @@ function pickNumeroAsientoFromBody(body) {
 
 // --------------------
 // ✅ JournalEntry helpers
-// CLAVE: guardar SIEMPRE accountCodigo (para que UI no muestre "-")
-// y además accountId si existe (mejor para integridad)
 // --------------------
 async function accountByCode(owner, code) {
   if (!Account || !code) return null;
@@ -269,20 +272,14 @@ async function buildLine(owner, { code, debit = 0, credit = 0, memo = "" }) {
     throw err;
   }
 
-  // buscamos cuenta para obtener accountId
   const acc = await accountByCode(owner, c);
 
-  // SIEMPRE dejamos accountCodigo (para UI),
-  // y si existe accountId lo incluimos también.
   return {
     accountCodigo: c,
-    // compat extra (por si alguna ruta/UI usa estos)
     accountCode: c,
     cuentaCodigo: c,
     cuenta_codigo: c,
-
     ...(acc?._id ? { accountId: acc._id } : {}),
-
     debit: num(debit, 0),
     credit: num(credit, 0),
     memo: memo || "",
@@ -302,6 +299,186 @@ async function nextJournalNumber(owner, dateObj) {
 
   const seq = doc?.seq || 1;
   return `${year}-${String(seq).padStart(4, "0")}`;
+}
+
+/**
+ * ✅ NUEVO: resolver nombres por code y por id (para asiento completo)
+ */
+async function getAccountMaps(owner, rawLines) {
+  const byCode = {};
+  const byId = {};
+  const lines = Array.isArray(rawLines) ? rawLines : [];
+  const codes = [];
+  const ids = [];
+
+  for (const l of lines) {
+    const code =
+      l?.accountCodigo ??
+      l?.accountCode ??
+      l?.cuentaCodigo ??
+      l?.cuenta_codigo ??
+      l?.code ??
+      l?.cuenta?.code ??
+      l?.cuenta?.codigo ??
+      l?.account?.code ??
+      l?.account?.codigo ??
+      null;
+
+    if (code) codes.push(String(code).trim());
+
+    const idCandidate =
+      l?.accountId ??
+      l?.account_id ??
+      l?.accountID ??
+      l?.cuentaId ??
+      l?.cuenta_id ??
+      l?.account?._id ??
+      l?.cuenta?._id ??
+      null;
+
+    if (idCandidate) {
+      const sid = String(idCandidate).trim();
+      if (mongoose.Types.ObjectId.isValid(sid)) ids.push(new mongoose.Types.ObjectId(sid));
+    }
+  }
+
+  const uniqueCodes = Array.from(new Set(codes.filter(Boolean)));
+  const uniqueIds = Array.from(new Set(ids.map((x) => String(x)))).map((x) => new mongoose.Types.ObjectId(x));
+
+  if (!uniqueCodes.length && !uniqueIds.length) return { byCode, byId };
+
+  const or = [];
+  if (uniqueCodes.length) or.push({ code: { $in: uniqueCodes } });
+  if (uniqueIds.length) or.push({ _id: { $in: uniqueIds } });
+
+  const rows = await Account.find({ owner, $or: or }).select("_id code name nombre").lean();
+
+  for (const r of rows) {
+    const code = String(r.code || "").trim();
+    const name = r.name ?? r.nombre ?? "";
+    if (code) byCode[code] = name;
+
+    const id = String(r._id || "").trim();
+    if (id) byId[id] = { code: code || null, name: name || null };
+  }
+
+  return { byCode, byId };
+}
+
+function mapJournalForUI(entry, accountMaps = { byCode: {}, byId: {} }) {
+  if (!entry) return null;
+
+  const byCode = accountMaps.byCode || {};
+  const byId = accountMaps.byId || {};
+
+  const numeroAsiento = entry.numeroAsiento ?? entry.numero_asiento ?? entry.numero ?? null;
+  const fechaReal = entry.date ?? entry.fecha ?? entry.createdAt ?? entry.created_at ?? null;
+
+  const concepto =
+    entry.concept ??
+    entry.concepto ??
+    entry.descripcion ??
+    entry.memo ??
+    entry.detalle ??
+    "";
+
+  const rawLines = entry.lines || entry.detalle_asientos || entry.detalles_asiento || [];
+
+  const detalle_asientos = (rawLines || []).map((l) => {
+    let cuenta_codigo =
+      l?.accountCodigo ??
+      l?.accountCode ??
+      l?.cuentaCodigo ??
+      l?.cuenta_codigo ??
+      l?.code ??
+      l?.cuenta?.code ??
+      l?.cuenta?.codigo ??
+      l?.account?.code ??
+      l?.account?.codigo ??
+      "";
+
+    cuenta_codigo = cuenta_codigo ? String(cuenta_codigo).trim() : "";
+
+    const idCandidate =
+      l?.accountId ??
+      l?.account_id ??
+      l?.accountID ??
+      l?.cuentaId ??
+      l?.cuenta_id ??
+      l?.account?._id ??
+      l?.cuenta?._id ??
+      null;
+
+    const sid = idCandidate ? String(idCandidate).trim() : "";
+
+    if (!cuenta_codigo && sid && byId[sid]?.code) {
+      cuenta_codigo = String(byId[sid].code || "").trim();
+    }
+
+    const nameFromLine =
+      l?.cuenta_nombre ??
+      l?.cuentaNombre ??
+      l?.accountName ??
+      l?.account_name ??
+      l?.cuenta?.name ??
+      l?.cuenta?.nombre ??
+      l?.account?.name ??
+      l?.account?.nombre ??
+      null;
+
+    const cuenta_nombre =
+      nameFromLine != null && String(nameFromLine).trim()
+        ? String(nameFromLine).trim()
+        : cuenta_codigo
+        ? byCode[cuenta_codigo] || (sid && byId[sid]?.name ? byId[sid].name : null)
+        : sid && byId[sid]?.name
+        ? byId[sid].name
+        : null;
+
+    const side = String(l?.side || "").toLowerCase().trim();
+
+    const monto =
+      num(l?.monto, 0) ||
+      num(l?.amount, 0) ||
+      num(l?.importe, 0) ||
+      num(l?.valor, 0) ||
+      0;
+
+    const debe = num(l?.debit, 0) || num(l?.debe, 0) || (side === "debit" ? monto : 0);
+    const haber = num(l?.credit, 0) || num(l?.haber, 0) || (side === "credit" ? monto : 0);
+
+    const memo = l?.memo ?? l?.descripcion ?? l?.concepto ?? l?.description ?? "";
+
+    return {
+      cuenta_codigo: cuenta_codigo || null,
+      cuenta_nombre: cuenta_nombre || null,
+      debe,
+      haber,
+      descripcion: memo || "",
+      memo: memo || "",
+    };
+  });
+
+  return {
+    id: String(entry._id),
+    _id: entry._id,
+    numeroAsiento: numeroAsiento || null,
+    numero_asiento: numeroAsiento || null,
+    fecha: fechaReal,
+    asiento_fecha: fechaReal ? toYMD(fechaReal) : null,
+    descripcion: concepto || "",
+    concepto: concepto || "",
+    detalle_asientos,
+    detalles: detalle_asientos.map((d) => ({
+      cuenta_codigo: d.cuenta_codigo,
+      cuenta_nombre: d.cuenta_nombre,
+      descripcion: d.descripcion || "",
+      debe: d.debe,
+      haber: d.haber,
+    })),
+    source: entry.source ?? entry.fuente ?? "",
+    sourceId: entry.sourceId ?? entry.source_id ?? null,
+  };
 }
 
 // --------------------
@@ -417,6 +594,8 @@ router.get("/", ensureAuth, async (req, res) => {
     const limit = Math.min(5000, Number(req.query.limit || 500));
     const sort = parseOrder(req.query.order);
 
+    const includeAsiento = String(req.query.include_asiento || req.query.includeAsiento || "0").trim() === "1";
+
     const and = [{ owner }];
 
     if (estadoRaw && estadoRaw !== "todos") {
@@ -467,7 +646,46 @@ router.get("/", ensureAuth, async (req, res) => {
       .populate("productId", "nombre name imagen_url imagenUrl image sku codigo code costoCompra costo_compra precio price")
       .lean();
 
-    const items = (rows || []).map(mapMovementForUI);
+    let items = (rows || []).map(mapMovementForUI);
+
+    // ✅ OPCIONAL: enriquecer con numero/concepto del asiento (para que UI no muestre ObjectId)
+    if (includeAsiento && JournalEntry) {
+      const ids = [];
+      for (const it of items) {
+        const aid = it.asientoId || it.asiento_id || it.journalEntryId;
+        if (aid && isValidObjectId(aid)) ids.push(new mongoose.Types.ObjectId(aid));
+      }
+      const uniqueIds = Array.from(new Set(ids.map((x) => String(x)))).map((x) => new mongoose.Types.ObjectId(x));
+
+      if (uniqueIds.length) {
+        const jes = await JournalEntry.find({ owner, _id: { $in: uniqueIds } })
+          .select("_id numeroAsiento numero_asiento numero concept concepto descripcion memo date fecha createdAt lines detalle_asientos detalles_asiento")
+          .lean();
+
+        const mapById = {};
+        for (const je of jes) mapById[String(je._id)] = je;
+
+        // Para resolver nombres de cuentas en resumen si lo quisieras después
+        // (aquí solo ponemos numero y concepto)
+        items = items.map((it) => {
+          const aid = it.asientoId || it.asiento_id || it.journalEntryId || null;
+          const je = aid ? mapById[String(aid)] : null;
+          if (!je) return it;
+
+          const numero =
+            je.numeroAsiento ?? je.numero_asiento ?? je.numero ?? it.numeroAsiento ?? it.numero_asiento ?? null;
+
+          const concepto =
+            je.concept ?? je.concepto ?? je.descripcion ?? je.memo ?? "";
+
+          return {
+            ...it,
+            asiento_numero: numero || null,
+            asiento_concepto: concepto || null,
+          };
+        });
+      }
+    }
 
     return res.json({
       ok: true,
@@ -478,6 +696,85 @@ router.get("/", ensureAuth, async (req, res) => {
   } catch (err) {
     console.error("GET /api/movimientos-inventario error:", err);
     return res.status(500).json({ ok: false, message: "Error cargando movimientos de inventario" });
+  }
+});
+
+// --------------------
+// ✅ NUEVO: GET /api/movimientos-inventario/:id?include_asiento=1
+// Devuelve movimiento + asiento completo (como Bukipin prototipo CAP 2)
+// --------------------
+router.get("/:id", ensureAuth, async (req, res) => {
+  try {
+    if (!InventoryMovement) {
+      return res.status(500).json({
+        ok: false,
+        message: "No se encontró el modelo InventoryMovement. Verifica backend/models/InventoryMovement.js",
+      });
+    }
+
+    const owner = req.user._id;
+    const id = String(req.params.id || "").trim();
+
+    if (!isValidObjectId(id)) {
+      return res.status(400).json({ ok: false, message: "id inválido" });
+    }
+
+    const includeAsiento = String(req.query.include_asiento || req.query.includeAsiento || "1").trim() !== "0";
+
+    const mov = await InventoryMovement.findOne({ _id: new mongoose.Types.ObjectId(id), owner })
+      .setOptions({ strictPopulate: false })
+      .populate("productId", "nombre name imagen_url imagenUrl image sku codigo code costoCompra costo_compra precio price")
+      .lean();
+
+    if (!mov) return res.status(404).json({ ok: false, message: "Movimiento no encontrado." });
+
+    const movimiento = mapMovementForUI(mov);
+
+    let asiento = null;
+
+    if (includeAsiento && JournalEntry) {
+      const asientoId =
+        mov.asientoId || mov.asiento_id || mov.journalEntryId || mov.journal_entry_id || null;
+
+      // 1) Si tengo asientoId, lo cargo directo
+      if (asientoId && isValidObjectId(asientoId)) {
+        const je = await JournalEntry.findOne({ _id: new mongoose.Types.ObjectId(asientoId), owner }).lean();
+        if (je) {
+          const rawLines = je.lines || je.detalle_asientos || je.detalles_asiento || [];
+          const accountMaps = await getAccountMaps(owner, rawLines);
+          asiento = mapJournalForUI(je, accountMaps);
+        }
+      }
+
+      // 2) Si NO tengo asientoId, intento buscar por source=inventario + sourceId=movimiento
+      if (!asiento) {
+        const je =
+          (await JournalEntry.findOne({ owner, source: "inventario", sourceId: mov._id }).sort({ createdAt: -1 }).lean()) ||
+          null;
+
+        if (je) {
+          const rawLines = je.lines || je.detalle_asientos || je.detalles_asiento || [];
+          const accountMaps = await getAccountMaps(owner, rawLines);
+          asiento = mapJournalForUI(je, accountMaps);
+        }
+      }
+
+      // 3) Si el movimiento trae numeroAsiento pero el asiento viene sin numero, lo relleno
+      if (asiento && !asiento.numeroAsiento && (mov.numeroAsiento || mov.numero_asiento)) {
+        asiento.numeroAsiento = mov.numeroAsiento || mov.numero_asiento;
+        asiento.numero_asiento = mov.numeroAsiento || mov.numero_asiento;
+      }
+    }
+
+    return res.json({
+      ok: true,
+      data: { movimiento, asiento },
+      movimiento,
+      asiento,
+    });
+  } catch (err) {
+    console.error("GET /api/movimientos-inventario/:id error:", err);
+    return res.status(500).json({ ok: false, message: "Error leyendo movimiento" });
   }
 });
 
@@ -704,7 +1001,6 @@ router.post("/", ensureAuth, async (req, res) => {
           }
 
           if (lines.length >= 2) {
-            // ✅ SIEMPRE folio (numeroAsiento)
             numeroAsiento = (await nextJournalNumber(owner, fecha)) || null;
 
             const je = await JournalEntry.create({
@@ -803,7 +1099,6 @@ router.delete("/:id", ensureAuth, async (req, res) => {
       try {
         const je = await JournalEntry.findOne({ _id: asientoId, owner }).lean();
 
-        // Solo revertimos si el asiento fue generado por ESTE módulo
         const isFromThisModule =
           je &&
           String(je.source || "") === "inventario" &&
@@ -817,7 +1112,6 @@ router.delete("/:id", ensureAuth, async (req, res) => {
               (ln.accountCodigo ?? ln.accountCode ?? ln.cuentaCodigo ?? ln.cuenta_codigo ?? "").toString().trim();
 
             return {
-              // ✅ CLAVE: siempre dejar accountCodigo para que UI no muestre "-"
               ...(code ? { accountCodigo: code, accountCode: code, cuentaCodigo: code, cuenta_codigo: code } : {}),
               ...(ln.accountId ? { accountId: ln.accountId } : {}),
               debit: num(ln.credit, 0),
