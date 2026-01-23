@@ -860,9 +860,61 @@ function pickProductId(body) {
   );
 }
 
+/**
+ * ✅ NUEVO (CRÍTICO): leer costo desde el body si el frontend lo manda
+ * - soporta múltiples llaves (Bukipin 1/2)
+ */
+function getCostFromBody(body, qty) {
+  const q = Math.max(1, num(qty, 1));
+
+  // si llega costo total, lo usamos directo (y derivamos unitario)
+  const costTotalRaw =
+    body?.costoTotal ??
+    body?.costo_total ??
+    body?.costTotal ??
+    body?.cost_total ??
+    body?.totalCosto ??
+    body?.total_costo ??
+    null;
+
+  const costTotal = num(costTotalRaw, 0);
+  if (costTotal > 0) {
+    const costUnit = Number((costTotal / q).toFixed(6));
+    return { costUnit, costTotal };
+  }
+
+  // si llega unitario
+  const costUnitRaw =
+    body?.costoUnitario ??
+    body?.costo_unitario ??
+    body?.costUnitario ??
+    body?.cost_unitario ??
+    body?.unitCost ??
+    body?.unit_cost ??
+    body?.costoCompra ??
+    body?.costo_compra ??
+    body?.purchaseCost ??
+    body?.purchase_cost ??
+    null;
+
+  const costUnit = num(costUnitRaw, 0);
+  if (costUnit > 0) {
+    return { costUnit, costTotal: Number((costUnit * q).toFixed(2)) };
+  }
+
+  return { costUnit: 0, costTotal: 0 };
+}
+
+/**
+ * ✅ ACTUALIZADO (CRÍTICO): detectar costo unitario del producto en MUCHAS variantes
+ * Esto arregla el caso típico Bukipin 1: el producto sí tiene costo, pero en otra llave.
+ */
 function getProductCostUnit(p) {
   if (!p) return 0;
+
+  // candidatos directos
   const candidates = [
+    // originales
     p.costoUnitario,
     p.costo_unitario,
     p.costUnitario,
@@ -877,11 +929,54 @@ function getProductCostUnit(p) {
     p.precio_compra,
     p.purchasePrice,
     p.purchase_price,
+
+    // variantes comunes extra
+    p.costoDeCompra,
+    p.costo_de_compra,
+    p.costoCompra,
+    p.costo_compra,
+    p.costPrice,
+    p.cost_price,
+    p.unitCost,
+    p.unit_cost,
+    p.unit_cost_price,
+    p.lastCost,
+    p.last_cost,
+    p.ultimoCosto,
+    p.ultimo_costo,
+    p.ultimoCostoUnitario,
+    p.ultimo_costo_unitario,
+
+    // algunos catálogos usan "costoProm" o "avgCost"
+    p.costoProm,
+    p.costo_prom,
+    p.avgCost,
+    p.avg_cost,
+    p.averageCost,
+    p.average_cost,
   ];
+
   for (const v of candidates) {
     const n = num(v, NaN);
-    if (Number.isFinite(n) && n >= 0) return n;
+    if (Number.isFinite(n) && n > 0) return n;
   }
+
+  // variantes anidadas (por si el producto guarda costos en un subobjeto)
+  const nested = [
+    p.costos?.unitario,
+    p.costos?.costoUnitario,
+    p.costos?.costo_unitario,
+    p.costs?.unit,
+    p.costs?.unit_cost,
+    p.pricing?.cost,
+    p.pricing?.unitCost,
+  ];
+
+  for (const v of nested) {
+    const n = num(v, NaN);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+
   return 0;
 }
 
@@ -908,6 +1003,64 @@ function pickStockKey(productDoc) {
 }
 
 /**
+ * ✅ NUEVO: si el producto no trae costo, intentamos tomarlo del último movimiento de ENTRADA/COMPRA.
+ * Esto hace que Bukipin 1 también genere 5002/1005 aunque el catálogo no tenga costo unitario guardado.
+ */
+async function getCostUnitFromLastEntrada(owner, productIdRaw) {
+  if (!InventoryMovement) return 0;
+  if (!productIdRaw) return 0;
+
+  const pidStr = String(productIdRaw).trim();
+  const pidObj = isObjectId(pidStr) ? new mongoose.Types.ObjectId(pidStr) : null;
+
+  const or = [];
+  if (pidObj) {
+    or.push(
+      { productId: pidObj },
+      { productoId: pidObj },
+      { product_id: pidObj },
+      { producto_id: pidObj },
+      { product: pidObj },
+      { producto: pidObj }
+    );
+  }
+  or.push(
+    { productId: pidStr },
+    { productoId: pidStr },
+    { product_id: pidStr },
+    { producto_id: pidStr }
+  );
+
+  const rows = await InventoryMovement.find({
+    owner,
+    cancelado: { $ne: true },
+    $or: or,
+    $or_tipo: { $exists: false }, // placeholder (no afecta)
+  })
+    .select(
+      "tipo tipo_movimiento tipoMovimiento estado status createdAt fecha date costoUnitario costo_unitario costoTotal costo_total"
+    )
+    .sort({ date: -1, fecha: -1, createdAt: -1 })
+    .lean()
+    .catch(() => []);
+
+  // filtramos en JS porque los nombres de campo varían
+  for (const r of rows || []) {
+    const tipo = lower(r.tipo ?? r.tipo_movimiento ?? r.tipoMovimiento ?? "");
+    const estado = lower(r.estado ?? r.status ?? "activo");
+    if (estado === "cancelado") continue;
+    if (!["entrada", "compra", "ajuste_entrada", "ingreso"].includes(tipo)) continue;
+
+    const cu = num(r.costoUnitario ?? r.costo_unitario, 0);
+    if (cu > 0) return cu;
+
+    // si sólo tiene costoTotal y quizá qty, no lo podemos derivar aquí sin qty; omitimos.
+  }
+
+  return 0;
+}
+
+/**
  * ✅ NUEVO: calcular stock REAL por movimientos (entradas - salidas).
  * Si existe InventoryMovement, esta es la fuente de verdad para validar stock.
  */
@@ -921,10 +1074,20 @@ async function getStockByMovements(owner, productIdRaw) {
   // match robusto para diferentes nombres de campo
   const or = [];
   if (pidObj) {
-    or.push({ productId: pidObj }, { productoId: pidObj }, { product_id: pidObj }, { producto_id: pidObj });
+    or.push(
+      { productId: pidObj },
+      { productoId: pidObj },
+      { product_id: pidObj },
+      { producto_id: pidObj }
+    );
     or.push({ product: pidObj }, { producto: pidObj });
   }
-  or.push({ productId: pidStr }, { productoId: pidStr }, { product_id: pidStr }, { producto_id: pidStr });
+  or.push(
+    { productId: pidStr },
+    { productoId: pidStr },
+    { product_id: pidStr },
+    { producto_id: pidStr }
+  );
 
   const match = {
     owner,
@@ -947,7 +1110,6 @@ async function getStockByMovements(owner, productIdRaw) {
         estado: { $toLower: { $ifNull: ["$estado", { $ifNull: ["$status", "activo"] }] } },
       },
     },
-    // ignorar anulados si existen estados
     { $match: { estado: { $ne: "cancelado" } } },
     {
       $group: {
@@ -1008,7 +1170,11 @@ async function updateProductStockAtomic(owner, productId, stockKey, qtyToDecreme
   }
 
   const r = await Product.updateOne(
-    { owner, _id: new mongoose.Types.ObjectId(String(productId)), [stockKey]: { $gte: qtyToDecrement } },
+    {
+      owner,
+      _id: new mongoose.Types.ObjectId(String(productId)),
+      [stockKey]: { $gte: qtyToDecrement },
+    },
     { $inc: inc }
   ).catch(() => null);
 
@@ -1090,9 +1256,7 @@ async function buildAccountMaps(owner, entries) {
   if (ids.size)
     query.$or.push({ _id: { $in: [...ids].map((x) => new mongoose.Types.ObjectId(x)) } });
 
-  const rows = await Account.find(query)
-    .select("_id code codigo name nombre")
-    .lean();
+  const rows = await Account.find(query).select("_id code codigo name nombre").lean();
 
   const nameByCode = {};
   const codeById = {};
@@ -1412,8 +1576,31 @@ router.post("/", ensureAuth, async (req, res) => {
       }
 
       const pname = getProductName(productDoc);
-      const costUnit = getProductCostUnit(productDoc);
-      const costTotal = Number((costUnit * qty).toFixed(2));
+
+      /**
+       * ================================
+       * ✅ FIX PRINCIPAL (Bukipin 1):
+       * 1) costo desde body (si viene)
+       * 2) si no, costo desde Product (muchas llaves)
+       * 3) si sigue 0, costo desde último movimiento de ENTRADA/COMPRA
+       * ================================
+       */
+      const fromBody = getCostFromBody(req.body, qty);
+      let costUnit = num(fromBody.costUnit, 0);
+      let costTotal = num(fromBody.costTotal, 0);
+
+      if (!(costUnit > 0) && !(costTotal > 0)) {
+        costUnit = num(getProductCostUnit(productDoc), 0);
+        costTotal = costUnit > 0 ? Number((costUnit * qty).toFixed(2)) : 0;
+      }
+
+      if (!(costUnit > 0) && !(costTotal > 0)) {
+        const cuMov = await getCostUnitFromLastEntrada(owner, productDoc._id);
+        if (cuMov > 0) {
+          costUnit = cuMov;
+          costTotal = Number((costUnit * qty).toFixed(2));
+        }
+      }
 
       // inferir subcuenta si no venía
       if (!subcuentaRef) {
@@ -1635,14 +1822,26 @@ router.post("/", ensureAuth, async (req, res) => {
      * ✅ INVENTARIO (venta inventariada)
      *   - Debe 5002 (costo de venta)
      *   - Haber 1005 (salida inventario)
+     *
+     * ✅ IMPORTANTE:
+     * - Antes solo entraba si costTotal > 0 → por eso Bukipin 1 no mostraba 5002/1005.
+     * - Ahora:
+     *    - Si tenemos costo > 0: registramos normal.
+     *    - Si NO hay costo configurado: también registramos líneas (0) con memo de aviso,
+     *      para que SIEMPRE aparezcan 5002 y 1005 en el modal (como Bukipin 2).
      */
-    if (invMeta && invMeta.costTotal > 0) {
+    if (invMeta) {
+      const costTotalSafe = num(invMeta.costTotal, 0);
+
       lines.push(
         await buildLine(owner, {
           code: COD_COGS,
-          debit: invMeta.costTotal,
+          debit: costTotalSafe,
           credit: 0,
-          memo: `Costo de venta - ${invMeta.productName} (${invMeta.qty} unidades)`,
+          memo:
+            costTotalSafe > 0
+              ? `Costo de venta - ${invMeta.productName} (${invMeta.qty} unidades)`
+              : `Costo de venta - ${invMeta.productName} (SIN COSTO CONFIGURADO)`,
         })
       );
 
@@ -1650,8 +1849,11 @@ router.post("/", ensureAuth, async (req, res) => {
         await buildLine(owner, {
           code: COD_INVENTARIO,
           debit: 0,
-          credit: invMeta.costTotal,
-          memo: `Salida de inventario - ${invMeta.productName} (${invMeta.qty} unidades)`,
+          credit: costTotalSafe,
+          memo:
+            costTotalSafe > 0
+              ? `Salida de inventario - ${invMeta.productName} (${invMeta.qty} unidades)`
+              : `Salida de inventario - ${invMeta.productName} (SIN COSTO CONFIGURADO)`,
         })
       );
     }
