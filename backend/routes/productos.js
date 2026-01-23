@@ -5,6 +5,20 @@ const router = express.Router();
 const ensureAuth = require("../middleware/ensureAuth");
 const Product = require("../models/Product");
 
+// ✅ Movimientos de inventario (nuevo backend)
+let InventoryMovement = null;
+try {
+  // nombre probable
+  InventoryMovement = require("../models/InventoryMovement");
+} catch (_) {
+  try {
+    // nombre alterno común
+    InventoryMovement = require("../models/MovimientoInventario");
+  } catch (_) {
+    InventoryMovement = null;
+  }
+}
+
 // Opcional: validación contra Account si existe
 let Account = null;
 try {
@@ -106,7 +120,7 @@ function normalizeOut(doc) {
     nombre: doc.nombre ?? doc.name ?? "",
     descripcion: doc.descripcion ?? doc.description ?? "",
 
-    // ✅ compat actual (tu UI lo usa como costo)
+    // ✅ compat actual (tu UI lo usa como costo legacy)
     precio,
 
     // ✅ inventario (camel + snake)
@@ -186,7 +200,203 @@ async function validateSubcuenta({ owner, cuentaCodigo, subcuentaId }) {
 }
 
 /**
+ * ✅ Inventario: calcula métricas por producto desde movimientos
+ * Retorna un Map(productIdString -> metrics)
+ */
+async function buildInventoryMetricsMap({ owner, productIds }) {
+  const map = new Map();
+
+  if (!InventoryMovement) return map;
+  if (!Array.isArray(productIds) || productIds.length === 0) return map;
+
+  // convertir ids a ObjectId cuando aplique (sin romper si alguno no lo es)
+  const mongoose = require("mongoose");
+  const oid = (v) => {
+    try {
+      return new mongoose.Types.ObjectId(String(v));
+    } catch (_) {
+      return null;
+    }
+  };
+
+  const oids = productIds.map(oid).filter(Boolean);
+
+  // Si por algún motivo no se pudo convertir ninguno, no hacemos nada
+  if (!oids.length) return map;
+
+  const cancelledStatuses = ["cancelado", "canceled", "cancelled", "anulado"];
+
+  // Pipeline robusto: detecta pid/tipo/qty/costos por aliases
+  const pipeline = [
+    {
+      $match: {
+        owner,
+        $or: [
+          { productoId: { $in: oids } },
+          { productId: { $in: oids } },
+          { producto_id: { $in: oids } },
+          { product_id: { $in: oids } },
+        ],
+        $nor: [
+          { cancelado: true },
+          { canceled: true },
+          { cancelled: true },
+          { isCanceled: true },
+          { isCancelled: true },
+          { isCanceled: true },
+          { isCancelled: true },
+          { estado: { $in: cancelledStatuses } },
+          { status: { $in: cancelledStatuses } },
+        ],
+      },
+    },
+    {
+      $addFields: {
+        _pid: {
+          $toString: {
+            $ifNull: [
+              "$productoId",
+              { $ifNull: ["$productId", { $ifNull: ["$producto_id", "$product_id"] }] },
+            ],
+          },
+        },
+        _tipo: {
+          $toLower: {
+            $trim: {
+              input: {
+                $ifNull: [
+                  "$tipo_movimiento",
+                  { $ifNull: ["$tipoMovimiento", { $ifNull: ["$tipo", "$type"] }] },
+                ],
+              },
+            },
+          },
+        },
+        _qty: {
+          $toDouble: {
+            $ifNull: [
+              "$cantidad",
+              {
+                $ifNull: [
+                  "$qty",
+                  { $ifNull: ["$quantity", { $ifNull: ["$unidades", "$units"] }] },
+                ],
+              },
+            ],
+          },
+        },
+        _costoUnit: {
+          $toDouble: {
+            $ifNull: [
+              "$costo_unitario",
+              {
+                $ifNull: [
+                  "$costoUnitario",
+                  {
+                    $ifNull: [
+                      "$unitCost",
+                      {
+                        $ifNull: [
+                          "$costoCompra",
+                          { $ifNull: ["$costo_compra", { $ifNull: ["$precio_unitario", "$precioUnitario"] }] },
+                        ],
+                      },
+                    ],
+                  },
+                ],
+              },
+            ],
+          },
+        },
+        _costoTotal: {
+          $toDouble: {
+            $ifNull: [
+              "$costo_total",
+              {
+                $ifNull: [
+                  "$costoTotal",
+                  { $ifNull: ["$total", { $ifNull: ["$monto_total", "$montoTotal"] }] },
+                ],
+              },
+            ],
+          },
+        },
+        _fecha: {
+          $ifNull: ["$fecha", { $ifNull: ["$createdAt", "$created_at"] }],
+        },
+      },
+    },
+    {
+      $addFields: {
+        _unitEff: {
+          $cond: [
+            { $gt: ["$_costoUnit", 0] },
+            "$_costoUnit",
+            {
+              $cond: [
+                { $and: [{ $gt: ["$_costoTotal", 0] }, { $gt: ["$_qty", 0] }] },
+                { $divide: ["$_costoTotal", "$_qty"] },
+                0,
+              ],
+            },
+          ],
+        },
+      },
+    },
+    {
+      $addFields: {
+        _isEntrada: { $in: ["$_tipo", ["entrada", "compra"]] },
+        _isSalida: { $in: ["$_tipo", ["salida", "venta"]] },
+        _isAjuste: { $eq: ["$_tipo", "ajuste"] },
+      },
+    },
+    {
+      $group: {
+        _id: "$_pid",
+        entradasQty: { $sum: { $cond: ["$_isEntrada", "$_qty", 0] } },
+        salidasQty: { $sum: { $cond: ["$_isSalida", "$_qty", 0] } },
+        ajustesQty: { $sum: { $cond: ["$_isAjuste", "$_qty", 0] } },
+        costSum: {
+          $sum: {
+            $cond: ["$_isEntrada", { $multiply: ["$_unitEff", "$_qty"] }, 0],
+          },
+        },
+        costQty: { $sum: { $cond: ["$_isEntrada", "$_qty", 0] } },
+        lastDate: { $max: "$_fecha" },
+      },
+    },
+  ];
+
+  const rows = await InventoryMovement.aggregate(pipeline).exec();
+
+  for (const r of rows) {
+    const entradas = Number(r.entradasQty || 0);
+    const salidas = Number(r.salidasQty || 0);
+    const ajustes = Number(r.ajustesQty || 0);
+
+    const costQty = Number(r.costQty || 0);
+    const costSum = Number(r.costSum || 0);
+
+    const costo_unitario = costQty > 0 ? costSum / costQty : 0;
+
+    const cantidad_stock = entradas - salidas + ajustes;
+
+    map.set(String(r._id), {
+      cantidad_comprada: entradas,
+      cantidad_vendida: salidas,
+      cantidad_stock,
+      costo_unitario,
+      valor_total_inventario: cantidad_stock * costo_unitario,
+      ultimo_movimiento: r.lastDate ? new Date(r.lastDate).toISOString() : null,
+    });
+  }
+
+  return map;
+}
+
+/**
  * GET /api/productos
+ * ✅ Ahora soporta inventario=1 para devolver métricas calculadas desde movimientos
  */
 router.get("/", ensureAuth, async (req, res) => {
   try {
@@ -195,6 +405,9 @@ router.get("/", ensureAuth, async (req, res) => {
     const activo = boolFromQuery(req.query.activo);
     const cuentaCodigo = req.query.cuenta_codigo ? String(req.query.cuenta_codigo).trim() : null;
     const includeSubcuentas = boolFromQuery(req.query.include_subcuentas);
+
+    // ✅ NUEVO: inventario=1 (preferido por tu UI)
+    const inventario = boolFromQuery(req.query.inventario);
 
     const qText = req.query.q ? String(req.query.q).trim() : "";
 
@@ -209,11 +422,15 @@ router.get("/", ensureAuth, async (req, res) => {
       and.push({ $or: [{ activo }, { isActive: activo }] });
     }
 
-    if (cuentaCodigo) {
+    // ✅ Si inventario=1, forzamos cuenta 1005
+    // (esto evita que el endpoint mezcle productos no inventariados)
+    const effectiveCuenta = inventario ? "1005" : cuentaCodigo;
+
+    if (effectiveCuenta) {
       if (includeSubcuentas && Account) {
         const children = await Account.find({
           owner,
-          parentCode: cuentaCodigo,
+          parentCode: effectiveCuenta,
         })
           .select("code codigo")
           .lean();
@@ -222,14 +439,14 @@ router.get("/", ensureAuth, async (req, res) => {
           .map((a) => String(a.code ?? a.codigo ?? "").trim())
           .filter(Boolean);
 
-        const codes = [cuentaCodigo, ...childCodes];
+        const codes = [effectiveCuenta, ...childCodes];
 
         and.push({
           $or: [{ cuentaCodigo: { $in: codes } }, { accountCode: { $in: codes } }],
         });
       } else {
         and.push({
-          $or: [{ cuentaCodigo }, { accountCode: cuentaCodigo }],
+          $or: [{ cuentaCodigo: effectiveCuenta }, { accountCode: effectiveCuenta }],
         });
       }
     }
@@ -244,7 +461,41 @@ router.get("/", ensureAuth, async (req, res) => {
     if (and.length) q.$and = and;
 
     const items = await Product.find(q).sort({ createdAt: -1 }).limit(limit).lean();
-    return res.json({ ok: true, data: items.map(normalizeOut) });
+
+    // ✅ si NO es inventario, respuesta legacy igual que antes
+    if (!inventario) {
+      return res.json({ ok: true, data: items.map(normalizeOut) });
+    }
+
+    // ✅ inventario=1: calcular métricas desde movimientos
+    const productIds = items.map((p) => String(p._id));
+    const metricsMap = await buildInventoryMetricsMap({ owner, productIds });
+
+    const out = items.map((doc) => {
+      const base = normalizeOut(doc);
+      const m = metricsMap.get(base.id) || {
+        cantidad_comprada: 0,
+        cantidad_vendida: 0,
+        cantidad_stock: 0,
+        costo_unitario: 0,
+        valor_total_inventario: 0,
+        ultimo_movimiento: null,
+      };
+
+      return {
+        ...base,
+
+        // ✅ métricas E2E para inventario (lo que tu frontend necesita)
+        cantidad_comprada: m.cantidad_comprada,
+        cantidad_vendida: m.cantidad_vendida,
+        cantidad_stock: m.cantidad_stock,
+        costo_unitario: m.costo_unitario,
+        valor_total_inventario: m.valor_total_inventario,
+        ultimo_movimiento: m.ultimo_movimiento,
+      };
+    });
+
+    return res.json({ ok: true, data: out });
   } catch (err) {
     console.error("GET /api/productos error:", err);
     return res.status(500).json({ ok: false, message: "Error cargando productos" });
