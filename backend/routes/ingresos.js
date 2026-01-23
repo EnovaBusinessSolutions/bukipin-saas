@@ -211,10 +211,7 @@ async function nextJournalNumber(owner, dateObj) {
  */
 function computeMontos(tx) {
   const total = num(tx?.montoTotal ?? tx?.monto_total ?? tx?.total, 0);
-  const descuento = num(
-    tx?.montoDescuento ?? tx?.monto_descuento ?? tx?.descuento,
-    0
-  );
+  const descuento = num(tx?.montoDescuento ?? tx?.monto_descuento ?? tx?.descuento, 0);
 
   const neto = num(
     tx?.montoNeto ?? tx?.monto_neto ?? tx?.neto,
@@ -225,9 +222,7 @@ function computeMontos(tx) {
   const tipoPago = lower(tx?.tipoPago ?? tx?.tipo_pago);
 
   const pendiente =
-    tipoPago === "contado"
-      ? 0
-      : Math.max(0, Number((neto - pagado).toFixed(2)));
+    tipoPago === "contado" ? 0 : Math.max(0, Number((neto - pagado).toFixed(2)));
 
   return { total, descuento, neto, pagado, pendiente, tipoPago };
 }
@@ -283,8 +278,7 @@ async function attachAccountInfo(owner, items) {
 
     if (!code) return it;
 
-    const nombre =
-      accountNameMap[code] || it.cuenta_nombre || it.cuentaName || null;
+    const nombre = accountNameMap[code] || it.cuenta_nombre || it.cuentaName || null;
     const display = nombre ? `${code} - ${nombre}` : code;
 
     return {
@@ -439,12 +433,7 @@ async function attachSubcuentaFromProduct(owner, items) {
       ({ it, pid }) =>
         !!pid &&
         isObjectId(pid) &&
-        !(
-          it.subcuentaId ||
-          it.subcuenta_id ||
-          it.subcuentaCodigo ||
-          it.subcuenta_codigo
-        )
+        !(it.subcuentaId || it.subcuenta_id || it.subcuentaCodigo || it.subcuenta_codigo)
     );
 
   if (!need.length) return items;
@@ -529,12 +518,7 @@ async function attachClientInfo(owner, items) {
 
   return items.map((it) => {
     const cidRaw =
-      it.clienteId ||
-      it.clientId ||
-      it.cliente_id ||
-      it.client_id ||
-      it.clienteID ||
-      "";
+      it.clienteId || it.clientId || it.cliente_id || it.client_id || it.clienteID || "";
     const cid = cidRaw ? String(cidRaw) : "";
     const c = cid ? map.get(cid) : null;
     if (!c) return it;
@@ -822,8 +806,7 @@ function flattenDetalles(entries, accountMaps = null) {
 
 function normalizeMetodoPago(raw) {
   let v = typeof raw === "string" ? raw.trim().toLowerCase() : "";
-  if (["tarjeta", "transferencia", "spei", "banco", "bancos"].includes(v))
-    return "bancos";
+  if (["tarjeta", "transferencia", "spei", "banco", "bancos"].includes(v)) return "bancos";
   if (["efectivo", "cash", "caja"].includes(v)) return "efectivo";
   if (!v) return "efectivo";
   return v;
@@ -878,90 +861,88 @@ function pickProductId(body) {
 }
 
 /**
- * ✅ NUEVO (CRÍTICO): soportar ventas desde inventario con MULTI items
- * El frontend suele mandar arrays: items / productos / lineItems / cartItems / etc.
+ * ✅ NUEVO (CRÍTICO): detectar arrays de productos en la venta.
+ * Esto arregla tu caso: vendes 15, pero el backend tomaba qty=1 porque estaba ignorando el array.
  */
-function pickItemQty(it) {
-  const q =
-    it?.cantidad ??
-    it?.qty ??
-    it?.quantity ??
-    it?.unidades ??
-    it?.units ??
-    it?.cantidadVender ??
-    it?.cantidad_vender ??
-    it?.cantidad_producto ??
-    it?.cantidadProducto ??
-    null;
+function extractSaleItems(body) {
+  const candidates = [
+    body?.items,
+    body?.productos,
+    body?.products,
+    body?.productosVenta,
+    body?.productos_venta,
+    body?.productos_en_venta,
+    body?.lineItems,
+    body?.line_items,
+    body?.detalleProductos,
+    body?.detalle_productos,
+    body?.detalles,
+  ];
 
-  const n = num(q, 0);
-  return n > 0 ? n : 1;
-}
+  const arr = candidates.find((v) => Array.isArray(v)) || null;
+  if (!arr) return [];
 
-function pickItemProductId(it) {
-  return (
-    it?.productId ??
-    it?.productoId ??
-    it?.product_id ??
-    it?.producto_id ??
-    it?.itemId ??
-    it?.item_id ??
-    it?._id ??
-    it?.id ??
-    null
-  );
-}
+  const out = [];
+  for (const it of arr) {
+    if (!it || typeof it !== "object") continue;
 
-function pickInventoryItemsFromBody(body) {
-  const candidates =
-    body?.items ??
-    body?.productos ??
-    body?.productosVenta ??
-    body?.productos_venta ??
-    body?.lineItems ??
-    body?.line_items ??
-    body?.cartItems ??
-    body?.cart_items ??
-    body?.ventaItems ??
-    body?.venta_items ??
-    body?.productosEnVenta ??
-    body?.productos_en_venta ??
-    body?.productosSeleccionados ??
-    body?.productos_seleccionados ??
-    null;
+    const pid =
+      it.productId ??
+      it.product_id ??
+      it.productoId ??
+      it.producto_id ??
+      it.itemId ??
+      it.item_id ??
+      it._id ??
+      it.id ??
+      null;
 
-  if (Array.isArray(candidates) && candidates.length) {
-    return candidates
-      .map((it) => {
-        const productId = pickItemProductId(it);
-        const qty = pickItemQty(it);
-        return productId ? { productId, qty, raw: it } : null;
-      })
-      .filter(Boolean);
+    const qty = num(
+      it.cantidad ??
+        it.qty ??
+        it.quantity ??
+        it.unidades ??
+        it.units ??
+        it.cant ??
+        it.cantidadVender ??
+        it.cantidad_vender ??
+        it.cantidad_producto ??
+        0,
+      0
+    );
+
+    // si no hay pid o qty válido, lo ignoramos
+    if (!pid) continue;
+
+    out.push({
+      raw: it,
+      productId: pid,
+      qty: qty > 0 ? qty : 1,
+      // hints para inventariado
+      tipo: it.tipo ?? it.tipoIngreso ?? it.tipo_ingreso ?? it.tipoProducto ?? it.productoTipo ?? null,
+      isInventariado:
+        it.isInventariado === true ||
+        it.forceInventario === true ||
+        normalizeTipoIngresoInventario(it.tipo ?? it.tipoIngreso ?? it.tipoProducto ?? it.productoTipo ?? ""),
+    });
   }
 
-  // fallback a tu payload actual (1 solo producto)
-  const pid = pickProductId(body);
-  if (pid) return [{ productId: pid, qty: pickQty(body), raw: body }];
-
-  return [];
+  return out;
 }
 
 /**
- * ✅ NUEVO (CRÍTICO): leer costo desde el body si el frontend lo manda
- * - soporta múltiples llaves (Bukipin 1/2)
+ * ✅ NUEVO (CRÍTICO): leer costo desde “cualquier objeto” (item o body)
  */
-function getCostFromBody(body, qty) {
+function getCostFromAny(obj, qty) {
   const q = Math.max(1, num(qty, 1));
 
-  // si llega costo total, lo usamos directo (y derivamos unitario)
   const costTotalRaw =
-    body?.costoTotal ??
-    body?.costo_total ??
-    body?.costTotal ??
-    body?.cost_total ??
-    body?.totalCosto ??
-    body?.total_costo ??
+    obj?.costoTotal ??
+    obj?.costo_total ??
+    obj?.costTotal ??
+    obj?.cost_total ??
+    obj?.totalCosto ??
+    obj?.total_costo ??
     null;
 
   const costTotal = num(costTotalRaw, 0);
@@ -970,18 +951,17 @@ function getCostFromBody(body, qty) {
     return { costUnit, costTotal };
   }
 
-  // si llega unitario
   const costUnitRaw =
-    body?.costoUnitario ??
-    body?.costo_unitario ??
-    body?.costUnitario ??
-    body?.cost_unitario ??
-    body?.unitCost ??
-    body?.unit_cost ??
-    body?.costoCompra ??
-    body?.costo_compra ??
-    body?.purchaseCost ??
-    body?.purchase_cost ??
+    obj?.costoUnitario ??
+    obj?.costo_unitario ??
+    obj?.costUnitario ??
+    obj?.cost_unitario ??
+    obj?.unitCost ??
+    obj?.unit_cost ??
+    obj?.costoCompra ??
+    obj?.costo_compra ??
+    obj?.purchaseCost ??
+    obj?.purchase_cost ??
     null;
 
   const costUnit = num(costUnitRaw, 0);
@@ -1084,7 +1064,7 @@ function pickStockKey(productDoc) {
 }
 
 /**
- * ✅ NUEVO: si el producto no trae costo, intentamos tomarlo del último movimiento de ENTRADA/COMPRA.
+ * ✅ NUEVO: si el producto no trae costo, intentamos tomarlo del último movimiento ENTRADA/COMPRA.
  */
 async function getCostUnitFromLastEntrada(owner, productIdRaw) {
   if (!InventoryMovement) return 0;
@@ -1127,13 +1107,11 @@ async function getCostUnitFromLastEntrada(owner, productIdRaw) {
     const tipo = lower(r.tipo ?? r.tipo_movimiento ?? r.tipoMovimiento ?? "");
     const estado = lower(r.estado ?? r.status ?? "activo");
     if (estado === "cancelado") continue;
-
     if (!["entrada", "compra", "ajuste_entrada", "ingreso"].includes(tipo)) continue;
 
     const cu = num(r.costoUnitario ?? r.costo_unitario, 0);
     if (cu > 0) return cu;
 
-    // Si solo hay costo_total y cantidad, derivamos
     const ct = num(r.costoTotal ?? r.costo_total, 0);
     const q = num(r.cantidad ?? r.qty ?? r.quantity, 0);
     if (ct > 0 && q > 0) return Number((ct / q).toFixed(6));
@@ -1182,10 +1160,7 @@ async function getStockByMovements(owner, productIdRaw) {
       $project: {
         tipo: {
           $toLower: {
-            $ifNull: [
-              "$tipo",
-              { $ifNull: ["$tipo_movimiento", { $ifNull: ["$tipoMovimiento", ""] }] },
-            ],
+            $ifNull: ["$tipo", { $ifNull: ["$tipo_movimiento", { $ifNull: ["$tipoMovimiento", ""] }] }],
           },
         },
         cantidad: {
@@ -1591,182 +1566,13 @@ router.post("/", ensureAuth, async (req, res) => {
       req.body?.cuentaCodigo || req.body?.cuentaPrincipalCodigo || "4001"
     ).trim();
 
-    // ✅ subcuenta puede venir por body o inferirse por producto
+    // ✅ subcuenta puede venir por body (NO la inferimos por producto si hay varios)
     let subcuentaRef =
       req.body?.subcuentaId ??
       req.body?.subcuenta_id ??
       req.body?.subcuentaCodigo ??
       req.body?.subcuenta_codigo ??
       null;
-
-    // ✅ Multi-items desde inventario (CRÍTICO)
-    const invItemsRaw = pickInventoryItemsFromBody(req.body);
-
-    // ✅ Detectar inventariado: por tipo/flags o por existencia de items + flags de origen
-    const isInventariado =
-      normalizeTipoIngresoInventario(tipoIngreso) ||
-      lower(req.body?.tipoProducto) === "inventariado" ||
-      lower(req.body?.productoTipo) === "inventariado" ||
-      req.body?.isInventariado === true ||
-      req.body?.forceInventario === true ||
-      req.body?.ventaDesdeInventario === true ||
-      req.body?.fromInventory === true ||
-      lower(req.body?.origen) === "inventario" ||
-      (Array.isArray(invItemsRaw) && invItemsRaw.length > 0 && lower(req.body?.modo) !== "general");
-
-    // ✅ Para compat: producto/cantidad “principal”
-    const productIdRaw = pickProductId(req.body);
-    const qtySingle = pickQty(req.body);
-
-    // ✅ Si es inventariado: validamos items y pre-calculamos meta (stock/costo) por item
-    let invMetaItems = []; // [{ productIdStr, productIdObj, productName, qty, costUnit, costTotal, stockKey, stockBefore, stockAfter, stockSource, itemSubRef }]
-    let invCostTotalSum = 0;
-
-    if (isInventariado) {
-      if (!Product) {
-        return res.status(400).json({
-          ok: false,
-          message: "No existe modelo Product activo; no puedo procesar inventario.",
-        });
-      }
-      if (!invItemsRaw.length) {
-        return res.status(400).json({
-          ok: false,
-          message:
-            "Para ventas inventariadas se requiere al menos un producto inventariado (items/productId).",
-        });
-      }
-
-      for (const it of invItemsRaw) {
-        const pid = it?.productId;
-        const qty = Math.max(1, num(it?.qty, 1));
-
-        if (!pid || !isObjectId(pid)) {
-          return res.status(400).json({
-            ok: false,
-            message: "Para ventas inventariadas se requiere productId válido en cada item.",
-          });
-        }
-
-        const productDoc = await Product.findOne({
-          owner,
-          _id: new mongoose.Types.ObjectId(String(pid)),
-        }).lean();
-
-        if (!productDoc) {
-          return res.status(404).json({
-            ok: false,
-            message: `Producto inventariado no encontrado (${String(pid)}).`,
-          });
-        }
-
-        const stockKey = pickStockKey(productDoc);
-
-        const stockByMov = await getStockByMovements(owner, productDoc._id);
-        const hasMovStock = typeof stockByMov === "number";
-
-        const stockByField = num(productDoc?.[stockKey], 0);
-        const stock = hasMovStock ? stockByMov : stockByField;
-        const stockSource = hasMovStock ? "movements" : "product_field";
-
-        if (stock < qty) {
-          return res.status(400).json({
-            ok: false,
-            message: `Stock insuficiente para "${getProductName(productDoc)}". Stock actual: ${stock}. Requerido: ${qty}.`,
-            code: "STOCK_INSUFICIENTE",
-            meta: { stockSource, stockKey, stockByMov, stockByField, productId: String(productDoc._id) },
-          });
-        }
-
-        const pname = getProductName(productDoc);
-
-        // 1) costo desde item/raw si viene
-        const fromBodyItem = getCostFromBody(it?.raw || it, qty);
-        let costUnit = num(fromBodyItem.costUnit, 0);
-        let costTotal = num(fromBodyItem.costTotal, 0);
-
-        // 2) si no viene en item, intentar desde body global (a veces lo mandan fuera)
-        if (!(costUnit > 0) && !(costTotal > 0)) {
-          const fromBodyGlobal = getCostFromBody(req.body, qty);
-          costUnit = num(fromBodyGlobal.costUnit, 0);
-          costTotal = num(fromBodyGlobal.costTotal, 0);
-        }
-
-        // 3) si sigue 0, tomar del product
-        if (!(costUnit > 0) && !(costTotal > 0)) {
-          costUnit = num(getProductCostUnit(productDoc), 0);
-          costTotal = costUnit > 0 ? Number((costUnit * qty).toFixed(2)) : 0;
-        }
-
-        // 4) si sigue 0, tomar del último movimiento ENTRADA
-        if (!(costUnit > 0) && !(costTotal > 0)) {
-          const cuMov = await getCostUnitFromLastEntrada(owner, productDoc._id);
-          if (cuMov > 0) {
-            costUnit = cuMov;
-            costTotal = Number((costUnit * qty).toFixed(2));
-          }
-        }
-
-        const itemSubRef =
-          productDoc?.subcuentaId ??
-          productDoc?.subcuenta_id ??
-          productDoc?.subcuenta ??
-          productDoc?.subcuentaCodigo ??
-          productDoc?.subcuenta_codigo ??
-          null;
-
-        // Si NO venía subcuenta en body, toma la del primer item (para que no diga “sin subcuenta”)
-        if (!subcuentaRef && itemSubRef) subcuentaRef = itemSubRef;
-
-        const meta = {
-          productIdStr: String(productDoc._id),
-          productIdObj: new mongoose.Types.ObjectId(String(productDoc._id)),
-          productName: pname,
-          qty,
-          costUnit,
-          costTotal,
-          stockKey,
-          stockBefore: stock,
-          stockAfter: Number((stock - qty).toFixed(6)),
-          stockSource,
-          itemSubRef: itemSubRef ? String(itemSubRef) : null,
-        };
-
-        if (meta.stockSource === "movements") {
-          await syncProductStockBestEffort(owner, meta.productIdStr, meta.stockKey, meta.stockBefore);
-        }
-
-        invMetaItems.push(meta);
-        invCostTotalSum += num(costTotal, 0);
-      }
-
-      invCostTotalSum = Number(invCostTotalSum.toFixed(2));
-    } else {
-      // ✅ No inventariado: inferir subcuenta desde producto si se puede
-      if (!subcuentaRef && productIdRaw && isObjectId(productIdRaw)) {
-        const p = await Product?.findOne({
-          owner,
-          _id: new mongoose.Types.ObjectId(String(productIdRaw)),
-        })
-          .select("subcuentaId subcuenta_id subcuenta subcuentaCodigo subcuenta_codigo")
-          .lean()
-          .catch(() => null);
-
-        subcuentaRef =
-          p?.subcuentaId ??
-          p?.subcuenta_id ??
-          p?.subcuenta ??
-          p?.subcuentaCodigo ??
-          p?.subcuenta_codigo ??
-          null;
-      }
-    }
-
-    // ✅ resolver subcuenta a id+code
-    const { id: subcuentaIdResolved, code: subcuentaCodigoResolved } = await resolveAccountFromRef(
-      owner,
-      subcuentaRef
-    );
 
     const now = new Date();
     let fecha = parseTxDateSmart(req.body?.fecha, now);
@@ -1805,16 +1611,140 @@ router.post("/", ensureAuth, async (req, res) => {
     const COD_COGS = "5002";
     const COD_INVENTARIO = "1005";
 
-    // Compat: cantidad total vendida de inventario
-    const qtyTotalInventario = Array.isArray(invMetaItems) && invMetaItems.length
-      ? invMetaItems.reduce((acc, it) => acc + num(it.qty, 0), 0)
-      : qtySingle;
+    /**
+     * ============================
+     * ✅ FIX PRINCIPAL:
+     * Detectar productos vendidos desde arrays (items/productos/...)
+     * ============================
+     */
+    const saleItems = extractSaleItems(req.body);
 
-    // Compat: productId principal (primer item)
-    const primaryProductId =
-      Array.isArray(invMetaItems) && invMetaItems.length
-        ? invMetaItems[0].productIdStr
-        : (productIdRaw ?? null);
+    // fallback legacy (1 producto suelto)
+    const legacyProductId = pickProductId(req.body);
+    const legacyQty = pickQty(req.body);
+
+    const hasArrayItems = saleItems.length > 0;
+
+    // inventariado: por tipoIngreso, flags, o porque trae array de productos inventariados
+    const isInventariado =
+      normalizeTipoIngresoInventario(tipoIngreso) ||
+      lower(req.body?.tipoProducto) === "inventariado" ||
+      lower(req.body?.productoTipo) === "inventariado" ||
+      req.body?.isInventariado === true ||
+      req.body?.forceInventario === true ||
+      (hasArrayItems && saleItems.some((x) => x.isInventariado === true));
+
+    // Meta inventario por cada item
+    const invItemsMeta = []; // [{ productIdStr, productIdObj, productName, qty, costUnit, costTotal, stockKey, stockBefore, stockAfter, stockSource, raw }]
+    let totalQty = 0;
+
+    if (isInventariado) {
+      if (!Product) {
+        return res.status(400).json({
+          ok: false,
+          message: "No existe modelo Product activo; no puedo procesar inventario.",
+        });
+      }
+
+      const itemsToProcess = hasArrayItems
+        ? saleItems
+        : legacyProductId
+          ? [{ productId: legacyProductId, qty: legacyQty, raw: req.body, isInventariado: true }]
+          : [];
+
+      if (!itemsToProcess.length) {
+        return res.status(400).json({
+          ok: false,
+          message: "Para ventas inventariadas se requiere al menos un producto (items/productId).",
+        });
+      }
+
+      // Validación + cálculo por producto
+      for (const it of itemsToProcess) {
+        const productIdRaw = it.productId;
+        const qty = Math.max(1, num(it.qty, 1));
+        totalQty += qty;
+
+        if (!productIdRaw || !isObjectId(productIdRaw)) {
+          return res.status(400).json({
+            ok: false,
+            message: "Para ventas inventariadas se requiere productId válido en cada item.",
+          });
+        }
+
+        const productDoc = await Product.findOne({
+          owner,
+          _id: new mongoose.Types.ObjectId(String(productIdRaw)),
+        }).lean();
+
+        if (!productDoc) {
+          return res.status(404).json({ ok: false, message: "Producto inventariado no encontrado." });
+        }
+
+        const stockKey = pickStockKey(productDoc);
+
+        const stockByMov = await getStockByMovements(owner, productDoc._id);
+        const hasMovStock = typeof stockByMov === "number";
+        const stockByField = num(productDoc?.[stockKey], 0);
+
+        const stock = hasMovStock ? stockByMov : stockByField;
+        const stockSource = hasMovStock ? "movements" : "product_field";
+
+        if (stock < qty) {
+          return res.status(400).json({
+            ok: false,
+            message: `Stock insuficiente para "${getProductName(productDoc)}". Stock actual: ${stock}. Requerido: ${qty}.`,
+            code: "STOCK_INSUFICIENTE",
+            meta: { stockSource, stockKey, stockByMov, stockByField, productId: String(productDoc._id) },
+          });
+        }
+
+        // costo: 1) desde item, 2) desde body, 3) desde Product, 4) desde último movimiento ENTRADA
+        const fromItem = getCostFromAny(it.raw, qty);
+        const fromBody = getCostFromAny(req.body, qty);
+
+        let costUnit = num(fromItem.costUnit, 0) || num(fromBody.costUnit, 0);
+        let costTotal = num(fromItem.costTotal, 0) || num(fromBody.costTotal, 0);
+
+        if (!(costUnit > 0) && !(costTotal > 0)) {
+          costUnit = num(getProductCostUnit(productDoc), 0);
+          costTotal = costUnit > 0 ? Number((costUnit * qty).toFixed(2)) : 0;
+        }
+
+        if (!(costUnit > 0) && !(costTotal > 0)) {
+          const cuMov = await getCostUnitFromLastEntrada(owner, productDoc._id);
+          if (cuMov > 0) {
+            costUnit = cuMov;
+            costTotal = Number((costUnit * qty).toFixed(2));
+          }
+        }
+
+        // si el stock viene de movimientos, sincronizamos best-effort el campo del producto para UI
+        if (stockSource === "movements") {
+          await syncProductStockBestEffort(owner, String(productDoc._id), stockKey, stock);
+        }
+
+        invItemsMeta.push({
+          raw: it.raw,
+          productIdStr: String(productDoc._id),
+          productIdObj: new mongoose.Types.ObjectId(String(productDoc._id)),
+          productName: getProductName(productDoc),
+          qty,
+          costUnit: num(costUnit, 0),
+          costTotal: num(costTotal, 0),
+          stockKey,
+          stockBefore: stock,
+          stockAfter: Number((stock - qty).toFixed(6)),
+          stockSource,
+        });
+      }
+    }
+
+    // ✅ resolver subcuenta a id+code (solo para la línea de ingresos)
+    const { id: subcuentaIdResolved, code: subcuentaCodigoResolved } = await resolveAccountFromRef(
+      owner,
+      subcuentaRef
+    );
 
     const txPayload = {
       owner,
@@ -1838,39 +1768,23 @@ router.post("/", ensureAuth, async (req, res) => {
       subcuentaCodigo: subcuentaCodigoResolved ?? null,
       subcuenta_codigo: subcuentaCodigoResolved ?? null,
 
-      // compat
-      productId: primaryProductId ?? null,
-      product_id: primaryProductId ?? null,
+      // compat legacy
+      productId: legacyProductId ?? (invItemsMeta?.[0]?.productIdStr ?? null),
+      product_id: legacyProductId ?? (invItemsMeta?.[0]?.productIdStr ?? null),
 
-      // qty (compat/trazabilidad)
-      cantidad: qtyTotalInventario,
-      qty: qtyTotalInventario,
-      unidades: qtyTotalInventario,
+      // qty total (si hubo varios productos)
+      cantidad: hasArrayItems ? totalQty : legacyQty,
+      qty: hasArrayItems ? totalQty : legacyQty,
+      unidades: hasArrayItems ? totalQty : legacyQty,
 
-      // inventario meta MULTI (CRÍTICO)
-      inventario_items: Array.isArray(invMetaItems)
-        ? invMetaItems.map((x) => ({
-            productId: x.productIdStr,
-            productName: x.productName,
-            qty: x.qty,
-            costUnit: x.costUnit,
-            costTotal: x.costTotal,
-            stock_before: x.stockBefore,
-            stock_after: x.stockAfter,
-            stock_source: x.stockSource,
-          }))
-        : [],
-      inventario_costo_total: invCostTotalSum,
-
-      // legacy (si UI vieja lo usa)
-      ...(Array.isArray(invMetaItems) && invMetaItems.length
-        ? {
-            costoUnitario: num(invMetaItems[0]?.costUnit, 0),
-            costo_unitario: num(invMetaItems[0]?.costUnit, 0),
-            costoTotal: num(invCostTotalSum, 0),
-            costo_total: num(invCostTotalSum, 0),
-          }
-        : {}),
+      // guardamos items para trazabilidad (no rompe mongo aunque el schema no lo tenga)
+      items: invItemsMeta.map((x) => ({
+        productId: x.productIdStr,
+        productName: x.productName,
+        qty: x.qty,
+        costUnit: x.costUnit,
+        costTotal: x.costTotal,
+      })),
 
       saldoPendiente,
       saldo_pendiente: saldoPendiente,
@@ -1892,8 +1806,41 @@ router.post("/", ensureAuth, async (req, res) => {
       txPayload.client_id = clienteIdRaw;
     }
 
+    // ✅ Creamos tx
     tx = await IncomeTransaction.create(txPayload);
 
+    /**
+     * ✅ STOCK UPDATE (pre-commit seguro para product_field):
+     * Si algún producto usa stock por campo, descontamos en forma atómica.
+     * Si falla uno, revertimos best-effort los anteriores y abortamos.
+     */
+    const decremented = [];
+    for (const meta of invItemsMeta) {
+      if (meta.stockSource !== "product_field") continue;
+
+      const ok = await updateProductStockAtomic(owner, meta.productIdStr, meta.stockKey, meta.qty);
+      if (!ok?.ok) {
+        // revertimos lo que sí descontamos
+        for (const prev of decremented) {
+          try {
+            await Product.updateOne(
+              { owner, _id: new mongoose.Types.ObjectId(prev.productIdStr) },
+              { $inc: { [prev.stockKey]: prev.qty } }
+            ).catch(() => {});
+          } catch (_) {}
+        }
+
+        await IncomeTransaction.deleteOne({ _id: tx._id, owner }).catch(() => {});
+        return res.status(400).json({
+          ok: false,
+          message: "No se pudo actualizar el stock (posible carrera / stock insuficiente). Intenta de nuevo.",
+        });
+      }
+
+      decremented.push(meta);
+    }
+
+    // ✅ Asiento contable
     const lines = [];
 
     if (descuento > 0) {
@@ -1953,13 +1900,15 @@ router.post("/", ensureAuth, async (req, res) => {
     );
 
     /**
-     * ✅ INVENTARIO (venta inventariada) — MULTI
-     *   - Debe 5002 (costo de venta) por item = costoUnit * qty
-     *   - Haber 1005 (salida inventario) por item = costoUnit * qty
+     * ✅ INVENTARIO (por producto)
+     *   - Debe 5002 (costo de venta)
+     *   - Haber 1005 (salida inventario)
+     *
+     * Aquí está la clave: si vendes 15, el costo total será costoUnit * 15.
      */
-    if (Array.isArray(invMetaItems) && invMetaItems.length) {
-      for (const it of invMetaItems) {
-        const costTotalSafe = num(it.costTotal, 0);
+    if (invItemsMeta.length) {
+      for (const meta of invItemsMeta) {
+        const costTotalSafe = num(meta.costTotal, 0);
 
         lines.push(
           await buildLine(owner, {
@@ -1968,8 +1917,8 @@ router.post("/", ensureAuth, async (req, res) => {
             credit: 0,
             memo:
               costTotalSafe > 0
-                ? `Costo de venta - ${it.productName} (${it.qty} unidades)`
-                : `Costo de venta - ${it.productName} (SIN COSTO CONFIGURADO)`,
+                ? `Costo de venta - ${meta.productName} (${meta.qty} unidades)`
+                : `Costo de venta - ${meta.productName} (SIN COSTO CONFIGURADO)`,
           })
         );
 
@@ -1980,8 +1929,8 @@ router.post("/", ensureAuth, async (req, res) => {
             credit: costTotalSafe,
             memo:
               costTotalSafe > 0
-                ? `Salida de inventario - ${it.productName} (${it.qty} unidades)`
-                : `Salida de inventario - ${it.productName} (SIN COSTO CONFIGURADO)`,
+                ? `Salida de inventario - ${meta.productName} (${meta.qty} unidades)`
+                : `Salida de inventario - ${meta.productName} (SIN COSTO CONFIGURADO)`,
           })
         );
       }
@@ -2013,87 +1962,62 @@ router.post("/", ensureAuth, async (req, res) => {
     } catch (_) {}
 
     /**
-     * ✅ Stock:
-     * - si product_field: atomic decrement por item
-     * - si movements: set best-effort al valor final por item
+     * ✅ Si el stock viene de movimientos, sincronizamos el campo stock para UI (best-effort)
      */
-    if (Array.isArray(invMetaItems) && invMetaItems.length && Product) {
-      for (const it of invMetaItems) {
-        if (!it?.productIdStr) continue;
-
-        if (it.stockSource === "product_field") {
-          const ok = await updateProductStockAtomic(
-            owner,
-            it.productIdStr,
-            it.stockKey,
-            it.qty
-          );
-
-          if (!ok?.ok) {
-            await JournalEntry.deleteOne({ _id: entry._id, owner }).catch(() => {});
-            await IncomeTransaction.deleteOne({ _id: tx._id, owner }).catch(() => {});
-            return res.status(400).json({
-              ok: false,
-              message:
-                "No se pudo actualizar el stock (posible carrera / stock insuficiente). Intenta de nuevo.",
-            });
-          }
-        } else {
-          await syncProductStockBestEffort(owner, it.productIdStr, it.stockKey, it.stockAfter);
-        }
+    for (const meta of invItemsMeta) {
+      if (meta.stockSource === "movements") {
+        await syncProductStockBestEffort(owner, meta.productIdStr, meta.stockKey, meta.stockAfter);
       }
     }
 
-    // ✅ crear movimientos de inventario “SALIDA” por item (si existe modelo)
-    if (Array.isArray(invMetaItems) && invMetaItems.length) {
-      const asientoId = entry._id;
+    /**
+     * ✅ crear movimientos de inventario “SALIDA” (uno por producto)
+     */
+    for (const meta of invItemsMeta) {
+      await createInventorySalidaIfPossible(owner, {
+        owner,
+        fecha: tx.fecha,
+        date: tx.fecha,
 
-      for (const it of invMetaItems) {
-        await createInventorySalidaIfPossible(owner, {
-          owner,
-          fecha: tx.fecha,
-          date: tx.fecha,
+        source: "ingreso",
+        sourceId: tx._id,
+        transaccion_ingreso_id: tx._id,
 
-          source: "ingreso",
-          sourceId: tx._id,
-          transaccion_ingreso_id: tx._id,
+        journalEntryId: entry._id,
+        journal_entry_id: entry._id,
+        asientoId: entry._id,
+        asiento_id: entry._id,
 
-          journalEntryId: asientoId,
-          journal_entry_id: asientoId,
-          asientoId: asientoId,
-          asiento_id: asientoId,
+        numeroAsiento,
+        numero_asiento: numeroAsiento,
 
-          numeroAsiento,
-          numero_asiento: numeroAsiento,
+        productId: meta.productIdObj,
+        productoId: meta.productIdObj,
+        product_id: meta.productIdObj,
+        producto_id: meta.productIdObj,
 
-          productId: it.productIdObj,
-          productoId: it.productIdObj,
-          product_id: it.productIdObj,
-          producto_id: it.productIdObj,
+        producto: meta.productName,
+        productName: meta.productName,
 
-          producto: it.productName,
-          productName: it.productName,
+        tipo: "salida",
+        tipoMovimiento: "salida",
+        tipo_movimiento: "salida",
+        motivo: "venta",
+        concept: `Venta: ${tx.descripcion}`,
 
-          tipo: "salida",
-          tipoMovimiento: "salida",
-          tipo_movimiento: "salida",
-          motivo: "venta",
-          concept: `Venta: ${tx.descripcion}`,
+        cantidad: meta.qty,
+        qty: meta.qty,
+        costoUnitario: meta.costUnit,
+        costo_unitario: meta.costUnit,
+        costoTotal: meta.costTotal,
+        costo_total: meta.costTotal,
 
-          cantidad: it.qty,
-          qty: it.qty,
-          costoUnitario: it.costUnit,
-          costo_unitario: it.costUnit,
-          costoTotal: it.costTotal,
-          costo_total: it.costTotal,
+        descripcion: tx.descripcion,
+        memo: tx.descripcion,
 
-          descripcion: tx.descripcion,
-          memo: tx.descripcion,
-
-          estado: "activo",
-          status: "activo",
-        });
-      }
+        estado: "activo",
+        status: "activo",
+      });
     }
 
     const accountMaps = await buildAccountMaps(owner, [entry]);
@@ -2114,9 +2038,7 @@ router.post("/", ensureAuth, async (req, res) => {
         asiento,
         numeroAsiento,
         journalEntryId: String(entry._id),
-        inventario: Array.isArray(invMetaItems) && invMetaItems.length
-          ? { items: invMetaItems, costo_total: invCostTotalSum }
-          : null,
+        inventario: invItemsMeta.length ? invItemsMeta : null,
       },
     });
   } catch (err) {
