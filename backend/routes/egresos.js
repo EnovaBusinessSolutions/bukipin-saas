@@ -13,7 +13,7 @@ const ExpenseTransaction = require("../models/ExpenseTransaction");
 const JournalEntry = require("../models/JournalEntry");
 
 function num(v, def = 0) {
-  const n = Number(v);
+  const n = Number(String(v ?? "").replace(/,/g, ""));
   return Number.isFinite(n) ? n : def;
 }
 
@@ -38,7 +38,12 @@ function mapEgresoForUI(doc) {
   return {
     id,
     tipo_egreso: String(t.tipo_egreso ?? t.tipoEgreso ?? t.tipo ?? ""),
-    subtipo_egreso: t.subtipo_egreso != null ? String(t.subtipo_egreso) : (t.subtipoEgreso != null ? String(t.subtipoEgreso) : null),
+    subtipo_egreso:
+      t.subtipo_egreso != null
+        ? String(t.subtipo_egreso)
+        : t.subtipoEgreso != null
+        ? String(t.subtipoEgreso)
+        : null,
 
     descripcion: String(t.descripcion ?? t.concepto ?? t.memo ?? ""),
     concepto: t.concepto != null ? String(t.concepto) : null,
@@ -48,27 +53,151 @@ function mapEgresoForUI(doc) {
     monto_pendiente: num(t.monto_pendiente ?? t.montoPendiente ?? 0),
 
     tipo_pago: String(t.tipo_pago ?? t.tipoPago ?? ""),
-    metodo_pago: t.metodo_pago != null ? String(t.metodo_pago) : (t.metodoPago != null ? String(t.metodoPago) : null),
+    metodo_pago:
+      t.metodo_pago != null
+        ? String(t.metodo_pago)
+        : t.metodoPago != null
+        ? String(t.metodoPago)
+        : null,
 
-    proveedor_nombre: t.proveedor_nombre != null ? String(t.proveedor_nombre) : (t.proveedorNombre != null ? String(t.proveedorNombre) : null),
-    proveedor_telefono: t.proveedor_telefono != null ? String(t.proveedor_telefono) : (t.proveedorTelefono != null ? String(t.proveedorTelefono) : null),
-    proveedor_email: t.proveedor_email != null ? String(t.proveedor_email) : (t.proveedorEmail != null ? String(t.proveedorEmail) : null),
-    proveedor_rfc: t.proveedor_rfc != null ? String(t.proveedor_rfc) : (t.proveedorRfc != null ? String(t.proveedorRfc) : null),
+    proveedor_nombre:
+      t.proveedor_nombre != null
+        ? String(t.proveedor_nombre)
+        : t.proveedorNombre != null
+        ? String(t.proveedorNombre)
+        : null,
+    proveedor_telefono:
+      t.proveedor_telefono != null
+        ? String(t.proveedor_telefono)
+        : t.proveedorTelefono != null
+        ? String(t.proveedorTelefono)
+        : null,
+    proveedor_email:
+      t.proveedor_email != null
+        ? String(t.proveedor_email)
+        : t.proveedorEmail != null
+        ? String(t.proveedorEmail)
+        : null,
+    proveedor_rfc:
+      t.proveedor_rfc != null
+        ? String(t.proveedor_rfc)
+        : t.proveedorRfc != null
+        ? String(t.proveedorRfc)
+        : null,
 
     cantidad: t.cantidad != null ? num(t.cantidad, 0) : null,
-    precio_unitario: t.precio_unitario != null ? num(t.precio_unitario, 0) : (t.precioUnitario != null ? num(t.precioUnitario, 0) : null),
+    precio_unitario:
+      t.precio_unitario != null
+        ? num(t.precio_unitario, 0)
+        : t.precioUnitario != null
+        ? num(t.precioUnitario, 0)
+        : null,
 
     created_at: new Date(t.created_at ?? t.createdAt ?? t.fecha ?? new Date()).toISOString(),
     comentarios: t.comentarios != null ? String(t.comentarios) : null,
-    fecha_vencimiento: t.fecha_vencimiento != null ? String(t.fecha_vencimiento) : (t.fechaVencimiento != null ? String(t.fechaVencimiento) : null),
+    fecha_vencimiento:
+      t.fecha_vencimiento != null
+        ? String(t.fecha_vencimiento)
+        : t.fechaVencimiento != null
+        ? String(t.fechaVencimiento)
+        : null,
 
-    imagen_comprobante: t.imagen_comprobante != null ? String(t.imagen_comprobante) : (t.imagenComprobante != null ? String(t.imagenComprobante) : null),
+    imagen_comprobante:
+      t.imagen_comprobante != null
+        ? String(t.imagen_comprobante)
+        : t.imagenComprobante != null
+        ? String(t.imagenComprobante)
+        : null,
 
-    cuenta_codigo: t.cuenta_codigo != null ? String(t.cuenta_codigo) : (t.cuentaCodigo != null ? String(t.cuentaCodigo) : null),
-    subcuenta_id: t.subcuenta_id != null ? String(t.subcuenta_id) : (t.subcuentaId != null ? String(t.subcuentaId) : null),
+    cuenta_codigo:
+      t.cuenta_codigo != null
+        ? String(t.cuenta_codigo)
+        : t.cuentaCodigo != null
+        ? String(t.cuentaCodigo)
+        : null,
+    subcuenta_id:
+      t.subcuenta_id != null
+        ? String(t.subcuenta_id)
+        : t.subcuentaId != null
+        ? String(t.subcuentaId)
+        : null,
 
     estado: String(t.estado ?? "activo"),
   };
+}
+
+/** -----------------------------
+ * Helpers para JournalEntry -> UI
+ * ----------------------------- */
+function lineAccountCode(l) {
+  return String(
+    l?.accountCodigo ??
+      l?.accountCode ??
+      l?.cuenta_codigo ??
+      l?.cuentaCodigo ??
+      l?.code ??
+      ""
+  ).trim();
+}
+
+function lineDebit(l) {
+  // soporta: debit / debe / monto+side
+  const side = String(l?.side || "").toLowerCase();
+  if (side === "debit") return num(l?.monto, 0);
+  return num(l?.debit ?? l?.debe ?? 0, 0);
+}
+
+function lineCredit(l) {
+  const side = String(l?.side || "").toLowerCase();
+  if (side === "credit") return num(l?.monto, 0);
+  return num(l?.credit ?? l?.haber ?? 0, 0);
+}
+
+function lineMemo(l) {
+  return String(l?.memo ?? l?.descripcion ?? l?.concepto ?? l?.description ?? "").trim();
+}
+
+function mapJournalEntryDetails(lines) {
+  const arr = Array.isArray(lines) ? lines : [];
+  return arr.map((l) => ({
+    cuenta_codigo: lineAccountCode(l),
+    cuenta_nombre: l?.accountNombre ?? l?.cuenta_nombre ?? l?.cuentaNombre ?? undefined,
+    descripcion: lineMemo(l),
+    debe: lineDebit(l),
+    haber: lineCredit(l),
+  }));
+}
+
+function pickEntryISO(entry) {
+  const v = entry?.date ?? entry?.fecha ?? entry?.createdAt ?? entry?.created_at ?? null;
+  if (!v) return null;
+  const d = new Date(v);
+  return Number.isNaN(d.getTime()) ? null : d.toISOString();
+}
+
+function extractNameQtyFromText(text) {
+  const s = String(text || "").trim();
+  if (!s) return { producto_nombre: "", cantidad: 0 };
+
+  // Ej: "Costo de venta - PRODUCTO 1 (6 unidades)"
+  const m = s.match(/-\s*(.+?)\s*\((\d+)\s*unidades?\)/i);
+  if (m) {
+    return {
+      producto_nombre: String(m[1] || "").trim(),
+      cantidad: num(m[2], 0),
+    };
+  }
+
+  // Ej: "Salida de inventario - PRODUCTO 1 (6 unidades)"
+  const m2 = s.match(/inventario\s*-\s*(.+?)\s*\((\d+)\s*unidades?\)/i);
+  if (m2) {
+    return {
+      producto_nombre: String(m2[1] || "").trim(),
+      cantidad: num(m2[2], 0),
+    };
+  }
+
+  return { producto_nombre: "", cantidad: 0 };
 }
 
 /**
@@ -109,6 +238,97 @@ router.get("/", ensureAuth, async (req, res) => {
     return res.json({ ok: true, data: items, items });
   } catch (e) {
     console.error("GET /api/egresos error:", e);
+    return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
+  }
+});
+
+/**
+ * ✅ NUEVO: Costos de Venta (Inventario) derivado desde JournalEntry (cuenta 5002)
+ * GET /api/egresos/costos-venta-inventario?start=YYYY-MM-DD&end=YYYY-MM-DD&limit=...
+ *
+ * Devuelve items con shape compatible con ResumenEgresos.tsx:
+ * { id, fecha, monto, producto_nombre, producto_imagen, cantidad, costo_unitario, numero_asiento, detalles_asiento }
+ */
+router.get("/costos-venta-inventario", ensureAuth, async (req, res) => {
+  try {
+    const owner = req.user._id;
+
+    const limit = Math.min(Math.max(parseInt(String(req.query.limit || "500"), 10) || 500, 1), 2000);
+    const start = parseYMD(req.query.start);
+    const end = parseYMD(req.query.end);
+
+    const q = { owner };
+
+    // Rango fechas (en JournalEntry suele ser date o createdAt)
+    if (start || end) {
+      const dateFilter = {};
+      if (start) dateFilter.$gte = start;
+      if (end) dateFilter.$lte = endOfDay(end);
+
+      q.$or = [{ date: dateFilter }, { fecha: dateFilter }, { createdAt: dateFilter }, { created_at: dateFilter }];
+    }
+
+    // Excluir cancelados si existen
+    q.$and = q.$and || [];
+    q.$and.push({
+      $or: [
+        { status: { $exists: false } },
+        { status: { $ne: "cancelado" } },
+        { estado: { $exists: false } },
+        { estado: { $ne: "cancelado" } },
+      ],
+    });
+
+    // Debe contener cuenta 5002 en alguna línea (soporta variantes)
+    q.$and.push({
+      $or: [
+        { lines: { $elemMatch: { accountCodigo: "5002" } } },
+        { lines: { $elemMatch: { accountCode: "5002" } } },
+        { lines: { $elemMatch: { cuenta_codigo: "5002" } } },
+        { lines: { $elemMatch: { cuentaCodigo: "5002" } } },
+      ],
+    });
+
+    const entries = await JournalEntry.find(q)
+      .sort({ date: -1, createdAt: -1, created_at: -1 })
+      .limit(limit)
+      .lean();
+
+    const items = (entries || []).map((je) => {
+      const lines = Array.isArray(je.lines) ? je.lines : [];
+
+      const line5002 = lines.filter((l) => lineAccountCode(l) === "5002");
+      const monto = line5002.reduce((sum, l) => sum + lineDebit(l), 0);
+
+      // Intentar extraer producto/cantidad del memo
+      const memoPreferido =
+        lineMemo(line5002?.[0]) ||
+        String(je?.concept ?? je?.concepto ?? je?.memo ?? je?.description ?? "");
+
+      const { producto_nombre, cantidad } = extractNameQtyFromText(memoPreferido);
+      const costo_unitario = cantidad > 0 ? monto / cantidad : null;
+
+      const detalles_asiento = mapJournalEntryDetails(lines);
+
+      return {
+        id: String(je._id),
+        fecha: pickEntryISO(je) || null,
+        numero_asiento: String(je.numeroAsiento ?? je.numero_asiento ?? je.number ?? "N/A"),
+        monto: num(monto, 0),
+
+        // Opcionales / best-effort
+        producto_nombre: producto_nombre || "",
+        producto_imagen: null,
+        cantidad: cantidad > 0 ? cantidad : 0,
+        costo_unitario: costo_unitario != null ? num(costo_unitario, 0) : 0,
+
+        detalles_asiento,
+      };
+    });
+
+    return res.json({ ok: true, data: items, items });
+  } catch (e) {
+    console.error("GET /api/egresos/costos-venta-inventario error:", e);
     return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
   }
 });
@@ -283,7 +503,9 @@ router.post("/:id/cancel", ensureAuth, async (req, res) => {
       data: {
         transaccionId: String(tx._id),
         transaccion: mapEgresoForUI(tx),
-        asiento_original: originalEntry ? (originalEntry.numeroAsiento || originalEntry.numero_asiento || String(originalEntry._id)) : null,
+        asiento_original: originalEntry
+          ? originalEntry.numeroAsiento || originalEntry.numero_asiento || String(originalEntry._id)
+          : null,
         asiento_reversion: asientoReversion,
       },
     });

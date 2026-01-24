@@ -168,6 +168,7 @@ async function getAccountNameMap(owner, codes) {
 
 /**
  * ✅ NUEVO: Mapa por CODE y por ID (soporta code/codigo)
+ * ✅ FIX: $or plano (evita $or anidado dentro de $or)
  */
 async function getAccountMaps(owner, rawLines) {
   const byCode = {};
@@ -218,9 +219,12 @@ async function getAccountMaps(owner, rawLines) {
 
   const or = [];
   if (uniqueCodes.length) {
-    or.push({ $or: [{ code: { $in: uniqueCodes } }, { codigo: { $in: uniqueCodes } }] });
+    or.push({ code: { $in: uniqueCodes } });
+    or.push({ codigo: { $in: uniqueCodes } });
   }
-  if (uniqueIds.length) or.push({ _id: { $in: uniqueIds } });
+  if (uniqueIds.length) {
+    or.push({ _id: { $in: uniqueIds } });
+  }
 
   const rows = await Account.find({ owner, $or: or })
     .select("_id code codigo name nombre")
