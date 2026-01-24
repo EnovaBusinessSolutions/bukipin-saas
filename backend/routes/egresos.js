@@ -11,7 +11,7 @@ const transaccionesEgresosRouter = require("./transaccionesEgresos");
 // Modelos
 const ExpenseTransaction = require("../models/ExpenseTransaction");
 const JournalEntry = require("../models/JournalEntry");
-const Account = require("../models/Account"); // ✅ FALTABA en tu archivo
+const Account = require("../models/Account"); // ✅ OK
 
 function num(v, def = 0) {
   const n = Number(String(v ?? "").replace(/,/g, "").replace(/\$/g, "").trim());
@@ -57,6 +57,10 @@ function mapEgresoForUI(doc) {
 
     descripcion: String(t.descripcion ?? t.concepto ?? t.memo ?? ""),
     concepto: t.concepto != null ? String(t.concepto) : null,
+
+    // ✅ extras para COGS (no rompen UI si no se usan)
+    producto_nombre: t.producto_nombre != null ? String(t.producto_nombre) : null,
+    producto_imagen: t.producto_imagen != null ? String(t.producto_imagen) : null,
 
     monto_total: num(t.monto_total ?? t.montoTotal ?? t.total ?? 0),
     monto_pagado: num(t.monto_pagado ?? t.montoPagado ?? 0),
@@ -137,6 +141,9 @@ function mapEgresoForUI(doc) {
     // Extras (no rompen UI)
     source: t.source ?? null,
     asiento_numero: t.asiento_numero ?? null,
+
+    // ✅ si viene desde COGS, guardamos el detalle completo
+    detalles_asiento: t.detalles_asiento ?? t.detalle_asientos ?? null,
   };
 }
 
@@ -223,16 +230,17 @@ async function buildCogsItemsFromJournal({ owner, start, end, limit = 500 }) {
   const orDates = buildJournalDateOrFilter(start, end);
   if (orDates) match.$or = orDates;
 
-  // Traer asientos candidatos (y limitar para evitar cargas enormes)
   const docs = await JournalEntry.find(match)
-    .select("date fecha entryDate createdAt created_at concept concepto descripcion memo numeroAsiento numero_asiento numero folio lines detalle_asientos detalles_asiento")
+    .select(
+      "date fecha entryDate createdAt created_at concept concepto descripcion memo numeroAsiento numero_asiento numero folio lines detalle_asientos detalles_asiento"
+    )
     .sort({ createdAt: -1 })
     .limit(Math.min(Math.max(limit, 1), 2000))
     .lean();
 
   if (!docs?.length) return [];
 
-  // Resolver nombres de cuentas (opcional, pero útil)
+  // Resolver nombres de cuentas (opcional)
   const allLines = [];
   for (const e of docs) {
     const lines = pickLines(e);
@@ -262,7 +270,7 @@ async function buildCogsItemsFromJournal({ owner, start, end, limit = 500 }) {
 
     // suma debe de 5002
     let debe5002 = 0;
-    let refText = ""; // para extraer producto/cantidad
+    let refText = "";
     for (const l of lines) {
       if (pickCode(l) === "5002") {
         const d = pickDebe(l);
@@ -278,7 +286,6 @@ async function buildCogsItemsFromJournal({ owner, start, end, limit = 500 }) {
 
     const { producto_nombre, cantidad } = extractNameQtyFromText(refText || concepto);
 
-    // detalle_asiento completo (para modal/inspección)
     const detalles_asiento = lines.map((l) => {
       const code = pickCode(l) || null;
       return {
@@ -290,14 +297,19 @@ async function buildCogsItemsFromJournal({ owner, start, end, limit = 500 }) {
       };
     });
 
-    // ✅ mapear a shape de egreso que ResumenEgresos ya sabe pintar
     out.push(
       mapEgresoForUI({
         id: `cogs_${String(e._id)}`,
         tipo_egreso: "costo_inventario",
         subtipo_egreso: "costo_venta_inventario",
-        descripcion: concepto || `Costo de venta inventario${producto_nombre ? ` - ${producto_nombre}` : ""}`,
+
+        descripcion:
+          concepto ||
+          `Costo de venta inventario${producto_nombre ? ` - ${producto_nombre}` : ""}`,
         concepto: concepto || null,
+
+        producto_nombre: producto_nombre || null,
+        producto_imagen: null,
 
         monto_total: Math.round(debe5002 * 100) / 100,
         monto_pagado: Math.round(debe5002 * 100) / 100,
@@ -306,18 +318,11 @@ async function buildCogsItemsFromJournal({ owner, start, end, limit = 500 }) {
         tipo_pago: "contado",
         metodo_pago: "cogs",
 
-        proveedor_nombre: null,
-        proveedor_telefono: null,
-        proveedor_email: null,
-        proveedor_rfc: null,
-
         cantidad: cantidad ?? null,
         precio_unitario: null,
 
+        // ✅ importante: usar fecha del asiento, no “now”
         created_at: new Date(fecha).toISOString(),
-        comentarios: null,
-        fecha_vencimiento: null,
-        imagen_comprobante: null,
 
         cuenta_codigo: "5002",
         subcuenta_id: null,
@@ -337,11 +342,8 @@ async function buildCogsItemsFromJournal({ owner, start, end, limit = 500 }) {
 
 /**
  * ✅ ENDPOINT LEGACY REAL (sin rewrite)
- * Tu UI/bundle viejo pide:
- *   GET /api/egresos?estado=activo&start=YYYY-MM-DD&end=YYYY-MM-DD&limit=...
- *
- * ✅ FIX: incluir COGS (5002) por default (para que NO tengas que tocar frontend)
- * Puedes apagarlo con: include_cogs=0
+ * GET /api/egresos?estado=activo&start=YYYY-MM-DD&end=YYYY-MM-DD&limit=...
+ * ✅ incluye COGS por default (include_cogs=0 lo apaga)
  */
 router.get("/", ensureAuth, async (req, res) => {
   try {
@@ -356,15 +358,12 @@ router.get("/", ensureAuth, async (req, res) => {
     const includeCogs = String(req.query.include_cogs ?? "1") !== "0";
 
     const q = { owner };
-
     if (estado) q.estado = estado;
 
     if (start || end) {
       const dateFilter = {};
       if (start) dateFilter.$gte = start;
       if (end) dateFilter.$lte = endOfDay(end);
-
-      // robusto: algunos guardan fecha, otros createdAt
       q.$or = [{ fecha: dateFilter }, { createdAt: dateFilter }, { created_at: dateFilter }];
     }
 
@@ -375,10 +374,8 @@ router.get("/", ensureAuth, async (req, res) => {
 
     let items = rows.map(mapEgresoForUI);
 
-    // ✅ agregar COGS
     if (includeCogs) {
       const cogs = await buildCogsItemsFromJournal({ owner, start, end, limit: 2000 });
-      // merge y ordenar por created_at desc
       items = items.concat(cogs).sort((a, b) => {
         const da = new Date(a.created_at || 0).getTime();
         const db = new Date(b.created_at || 0).getTime();
@@ -394,7 +391,7 @@ router.get("/", ensureAuth, async (req, res) => {
   }
 });
 
-// ✅ COGS desde asientos (cuenta 5002)
+// ✅ COGS especializado
 // GET /api/egresos/costos-venta-inventario?start=YYYY-MM-DD&end=YYYY-MM-DD
 router.get("/costos-venta-inventario", ensureAuth, async (req, res) => {
   try {
@@ -403,10 +400,8 @@ router.get("/costos-venta-inventario", ensureAuth, async (req, res) => {
     const start = parseYMD(req.query.start);
     const end = parseYMD(req.query.end);
 
-    // ✅ ahora sí: usa OR de fechas (no dateField único)
     const rows = await buildCogsItemsFromJournal({ owner, start, end, limit: 5000 });
 
-    // Este endpoint es “especializado”, regresamos un shape más directo también
     const out = rows.map((x) => ({
       id: x.id,
       fecha: toYMDLocal(x.created_at),
@@ -426,9 +421,63 @@ router.get("/costos-venta-inventario", ensureAuth, async (req, res) => {
 });
 
 /**
- * ✅ Guardar URL del comprobante (la UI lo llama tras el upload)
+ * ✅ CLAVE DEL FIX:
+ * Tu UI está consumiendo /api/egresos/transacciones?... para el Resumen.
+ * Ese endpoint venía del router secundario y NO incluía COGS.
+ *
+ * Aquí lo interceptamos y devolvemos el merge (ExpenseTransaction + COGS)
+ * SIN tocar tu frontend.
+ */
+router.get("/transacciones", ensureAuth, async (req, res) => {
+  try {
+    const owner = req.user._id;
+
+    const estado = String(req.query.estado || "activo").trim();
+    const limitRaw = req.query.limit ?? req.query.take ?? "200";
+    const limit = Math.min(Math.max(parseInt(String(limitRaw), 10) || 200, 1), 1000);
+
+    const start = parseYMD(req.query.start);
+    const end = parseYMD(req.query.end);
+
+    const includeCogs = String(req.query.include_cogs ?? "1") !== "0";
+
+    const q = { owner };
+    if (estado) q.estado = estado;
+
+    if (start || end) {
+      const dateFilter = {};
+      if (start) dateFilter.$gte = start;
+      if (end) dateFilter.$lte = endOfDay(end);
+      q.$or = [{ fecha: dateFilter }, { createdAt: dateFilter }, { created_at: dateFilter }];
+    }
+
+    const rows = await ExpenseTransaction.find(q)
+      .sort({ fecha: -1, createdAt: -1, created_at: -1 })
+      .limit(limit)
+      .lean();
+
+    let items = rows.map(mapEgresoForUI);
+
+    if (includeCogs) {
+      const cogs = await buildCogsItemsFromJournal({ owner, start, end, limit: 5000 });
+      items = items.concat(cogs).sort((a, b) => {
+        const da = new Date(a.created_at || 0).getTime();
+        const db = new Date(b.created_at || 0).getTime();
+        return db - da;
+      });
+      items = items.slice(0, limit);
+    }
+
+    return res.json({ ok: true, data: items, items });
+  } catch (e) {
+    console.error("GET /api/egresos/transacciones (merged) error:", e);
+    return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
+  }
+});
+
+/**
+ * ✅ Guardar URL del comprobante
  * PATCH /api/egresos/:id/comprobante
- * body: { imagen_comprobante: string }
  */
 router.patch("/:id/comprobante", ensureAuth, async (req, res) => {
   try {
@@ -441,7 +490,9 @@ router.patch("/:id/comprobante", ensureAuth, async (req, res) => {
 
     const imagen_comprobante = String(req.body?.imagen_comprobante || "").trim();
     if (!imagen_comprobante) {
-      return res.status(400).json({ ok: false, error: "VALIDATION", message: "imagen_comprobante es requerido" });
+      return res
+        .status(400)
+        .json({ ok: false, error: "VALIDATION", message: "imagen_comprobante es requerido" });
     }
 
     const tx = await ExpenseTransaction.findOneAndUpdate(
@@ -451,7 +502,9 @@ router.patch("/:id/comprobante", ensureAuth, async (req, res) => {
     ).lean();
 
     if (!tx) {
-      return res.status(404).json({ ok: false, error: "NOT_FOUND", message: "No se encontró la transacción" });
+      return res
+        .status(404)
+        .json({ ok: false, error: "NOT_FOUND", message: "No se encontró la transacción" });
     }
 
     return res.json({ ok: true, data: mapEgresoForUI(tx) });
@@ -463,11 +516,7 @@ router.patch("/:id/comprobante", ensureAuth, async (req, res) => {
 
 /**
  * ✅ CANCELAR EGRESO + (si existe) CREAR ASIENTO DE REVERSIÓN
- * UI llama:
- *   POST /api/egresos/:id/cancel
- * body: { motivoCancelacion: string }
- *
- * Importante: si NO hay asiento original, igual cancelamos la tx (para E2E UI).
+ * POST /api/egresos/:id/cancel
  */
 router.post("/:id/cancel", ensureAuth, async (req, res) => {
   try {
@@ -500,7 +549,6 @@ router.post("/:id/cancel", ensureAuth, async (req, res) => {
       return res.json({ ok: true, data: { alreadyCanceled: true, transaccion: mapEgresoForUI(tx) } });
     }
 
-    // 1) Buscar asiento original (por numeroAsiento o por source/sourceId/transaccionId)
     const originalNumero = tx.numeroAsiento || tx.numero_asiento || tx.numeroAsientoEgreso || null;
 
     let originalEntry = null;
@@ -541,7 +589,6 @@ router.post("/:id/cancel", ensureAuth, async (req, res) => {
           .lean());
     }
 
-    // 2) Crear reversión solo si existe asiento original con líneas
     let asientoReversion = null;
 
     if (originalEntry && Array.isArray(originalEntry.lines) && originalEntry.lines.length) {
@@ -566,7 +613,9 @@ router.post("/:id/cancel", ensureAuth, async (req, res) => {
         };
       });
 
-      const revNumero = `EGR-REV-${String(originalEntry.numeroAsiento || originalEntry.numero_asiento || originalEntry._id)}-${Date.now()}`;
+      const revNumero = `EGR-REV-${String(
+        originalEntry.numeroAsiento || originalEntry.numero_asiento || originalEntry._id
+      )}-${Date.now()}`;
 
       const revEntry = await JournalEntry.create({
         owner,
@@ -584,7 +633,6 @@ router.post("/:id/cancel", ensureAuth, async (req, res) => {
       tx.numeroAsientoReversion = asientoReversion;
     }
 
-    // 3) Marcar transacción cancelada
     tx.estado = "cancelado";
     tx.motivoCancelacion = motivoCancelacion;
     tx.canceladoAt = new Date();
@@ -607,8 +655,7 @@ router.post("/:id/cancel", ensureAuth, async (req, res) => {
   }
 });
 
-// ✅ /api/egresos/transacciones  -> (GET/POST)
-// ✅ /api/egresos/transacciones/:id -> (GET)
+// ✅ Importante: dejamos el router secundario para POST /transacciones, GET /transacciones/:id, etc.
 router.use("/transacciones", transaccionesEgresosRouter);
 
 module.exports = router;
