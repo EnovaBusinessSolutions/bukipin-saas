@@ -242,96 +242,151 @@ router.get("/", ensureAuth, async (req, res) => {
   }
 });
 
-/**
- * ✅ NUEVO: Costos de Venta (Inventario) derivado desde JournalEntry (cuenta 5002)
- * GET /api/egresos/costos-venta-inventario?start=YYYY-MM-DD&end=YYYY-MM-DD&limit=...
- *
- * Devuelve items con shape compatible con ResumenEgresos.tsx:
- * { id, fecha, monto, producto_nombre, producto_imagen, cantidad, costo_unitario, numero_asiento, detalles_asiento }
- */
+// ✅ COGS desde asientos (cuenta 5002)
+// GET /api/egresos/costos-venta-inventario?start=YYYY-MM-DD&end=YYYY-MM-DD
 router.get("/costos-venta-inventario", ensureAuth, async (req, res) => {
   try {
     const owner = req.user._id;
 
-    const limit = Math.min(Math.max(parseInt(String(req.query.limit || "500"), 10) || 500, 1), 2000);
     const start = parseYMD(req.query.start);
     const end = parseYMD(req.query.end);
 
-    const q = { owner };
+    // Campo fecha real en JournalEntry (igual filosofía que asientos.js)
+    const p = JournalEntry?.schema?.paths || {};
+    const dateField = p.date ? "date" : p.fecha ? "fecha" : p.entryDate ? "entryDate" : "createdAt";
 
-    // Rango fechas (en JournalEntry suele ser date o createdAt)
+    const match = { owner };
     if (start || end) {
-      const dateFilter = {};
-      if (start) dateFilter.$gte = start;
-      if (end) dateFilter.$lte = endOfDay(end);
-
-      q.$or = [{ date: dateFilter }, { fecha: dateFilter }, { createdAt: dateFilter }, { created_at: dateFilter }];
+      match[dateField] = {};
+      if (start) match[dateField].$gte = start;
+      if (end) match[dateField].$lte = endOfDay(end);
     }
 
-    // Excluir cancelados si existen
-    q.$and = q.$and || [];
-    q.$and.push({
-      $or: [
-        { status: { $exists: false } },
-        { status: { $ne: "cancelado" } },
-        { estado: { $exists: false } },
-        { estado: { $ne: "cancelado" } },
-      ],
-    });
-
-    // Debe contener cuenta 5002 en alguna línea (soporta variantes)
-    q.$and.push({
-      $or: [
-        { lines: { $elemMatch: { accountCodigo: "5002" } } },
-        { lines: { $elemMatch: { accountCode: "5002" } } },
-        { lines: { $elemMatch: { cuenta_codigo: "5002" } } },
-        { lines: { $elemMatch: { cuentaCodigo: "5002" } } },
-      ],
-    });
-
-    const entries = await JournalEntry.find(q)
-      .sort({ date: -1, createdAt: -1, created_at: -1 })
-      .limit(limit)
+    // Traer asientos candidatos
+    const docs = await JournalEntry.find(match)
+      .select(`${dateField} concept concepto descripcion memo numeroAsiento numero_asiento numero folio lines detalle_asientos detalles_asiento`)
+      .sort({ [dateField]: -1, createdAt: -1 })
       .lean();
 
-    const items = (entries || []).map((je) => {
-      const lines = Array.isArray(je.lines) ? je.lines : [];
+    if (!docs?.length) return res.json({ ok: true, data: [], items: [] });
 
-      const line5002 = lines.filter((l) => lineAccountCode(l) === "5002");
-      const monto = line5002.reduce((sum, l) => sum + lineDebit(l), 0);
+    // Helper robusto para detectar codigo y debe/haber (similar a asientos.js)
+    const n = (v) => {
+      if (v == null) return 0;
+      if (typeof v === "number") return Number.isFinite(v) ? v : 0;
+      const s = String(v).trim().replace(/[$,\s]/g, "");
+      const numx = Number(s);
+      return Number.isFinite(numx) ? numx : 0;
+    };
 
-      // Intentar extraer producto/cantidad del memo
-      const memoPreferido =
-        lineMemo(line5002?.[0]) ||
-        String(je?.concept ?? je?.concepto ?? je?.memo ?? je?.description ?? "");
+    const pickCode = (l) =>
+      String(
+        l?.accountCodigo ??
+          l?.accountCode ??
+          l?.cuentaCodigo ??
+          l?.cuenta_codigo ??
+          l?.code ??
+          l?.cuenta?.code ??
+          l?.cuenta?.codigo ??
+          l?.account?.code ??
+          l?.account?.codigo ??
+          ""
+      ).trim();
 
-      const { producto_nombre, cantidad } = extractNameQtyFromText(memoPreferido);
-      const costo_unitario = cantidad > 0 ? monto / cantidad : null;
+    const pickDebe = (l) => {
+      const side = String(l?.side || "").toLowerCase().trim();
+      const monto = n(l?.monto) || n(l?.amount) || n(l?.importe) || n(l?.valor) || 0;
+      return n(l?.debit) || n(l?.debe) || (side === "debit" ? monto : 0);
+    };
 
-      const detalles_asiento = mapJournalEntryDetails(lines);
+    const pickHaber = (l) => {
+      const side = String(l?.side || "").toLowerCase().trim();
+      const monto = n(l?.monto) || n(l?.amount) || n(l?.importe) || n(l?.valor) || 0;
+      return n(l?.credit) || n(l?.haber) || (side === "credit" ? monto : 0);
+    };
 
-      return {
-        id: String(je._id),
-        fecha: pickEntryISO(je) || null,
-        numero_asiento: String(je.numeroAsiento ?? je.numero_asiento ?? je.number ?? "N/A"),
-        monto: num(monto, 0),
+    // Mapa de nombres de cuentas (para detalles)
+    const allLines = [];
+    for (const e of docs) {
+      const lines = e.lines || e.detalle_asientos || e.detalles_asiento || [];
+      if (Array.isArray(lines)) allLines.push(...lines);
+    }
 
-        // Opcionales / best-effort
-        producto_nombre: producto_nombre || "",
+    // Resolver nombres desde Accounts
+    const codes = Array.from(new Set(allLines.map(pickCode).filter(Boolean)));
+    const accRows = await Account.find({
+      owner,
+      $or: [{ code: { $in: codes } }, { codigo: { $in: codes } }],
+    })
+      .select("code codigo name nombre")
+      .lean();
+
+    const nameMap = new Map(
+      (accRows || []).map((a) => [String(a.code ?? a.codigo).trim(), a.name ?? a.nombre ?? ""])
+    );
+
+    const toYMDLocal = (d) => {
+      const dt = new Date(d);
+      if (Number.isNaN(dt.getTime())) return null;
+      const y = dt.getFullYear();
+      const m = String(dt.getMonth() + 1).padStart(2, "0");
+      const day = String(dt.getDate()).padStart(2, "0");
+      return `${y}-${m}-${day}`;
+    };
+
+    const out = [];
+
+    for (const e of docs) {
+      const lines = e.lines || e.detalle_asientos || e.detalles_asiento || [];
+      if (!Array.isArray(lines) || !lines.length) continue;
+
+      // suma debe de 5002
+      let debe5002 = 0;
+      for (const l of lines) {
+        if (pickCode(l) === "5002") {
+          debe5002 += pickDebe(l);
+        }
+      }
+      if (!(debe5002 > 0)) continue;
+
+      const fecha = e?.[dateField] ?? e?.createdAt ?? e?.created_at ?? new Date();
+      const numero =
+        e.numeroAsiento ?? e.numero_asiento ?? e.numero ?? e.folio ?? String(e._id);
+
+      const concepto = (e.concept ?? e.concepto ?? e.descripcion ?? e.memo ?? "").trim();
+
+      const detalles_asiento = lines.map((l) => {
+        const code = pickCode(l) || null;
+        return {
+          cuenta_codigo: code,
+          cuenta_nombre: code ? nameMap.get(code) || null : null,
+          debe: pickDebe(l),
+          haber: pickHaber(l),
+          descripcion: String(l?.memo ?? l?.descripcion ?? l?.concepto ?? l?.description ?? "").trim() || null,
+        };
+      });
+
+      out.push({
+        id: String(e._id),
+        fecha: toYMDLocal(fecha),
+        descripcion: concepto || "Costo de venta inventario",
+        monto: Math.round(debe5002 * 100) / 100,
+        numero_asiento: String(numero),
+        producto_nombre: "Inventario",
         producto_imagen: null,
-        cantidad: cantidad > 0 ? cantidad : 0,
-        costo_unitario: costo_unitario != null ? num(costo_unitario, 0) : 0,
-
+        cantidad: null,
+        costo_unitario: null,
         detalles_asiento,
-      };
-    });
+      });
+    }
 
-    return res.json({ ok: true, data: items, items });
+    return res.json({ ok: true, data: out, items: out });
   } catch (e) {
     console.error("GET /api/egresos/costos-venta-inventario error:", e);
     return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
   }
 });
+
 
 /**
  * ✅ Guardar URL del comprobante (la UI lo llama tras el upload)
