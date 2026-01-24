@@ -11,9 +11,15 @@ const transaccionesEgresosRouter = require("./transaccionesEgresos");
 // Modelos
 const ExpenseTransaction = require("../models/ExpenseTransaction");
 const JournalEntry = require("../models/JournalEntry");
+const Account = require("../models/Account"); // ✅ FIX: faltaba (causaba 500 en /costos-venta-inventario)
 
 function num(v, def = 0) {
-  const n = Number(String(v ?? "").replace(/,/g, ""));
+  if (v === null || typeof v === "undefined") return def;
+  if (typeof v === "number") return Number.isFinite(v) ? v : def;
+  const s = String(v).trim();
+  if (!s) return def;
+  const cleaned = s.replace(/[$,\s]/g, "");
+  const n = Number(cleaned);
   return Number.isFinite(n) ? n : def;
 }
 
@@ -42,8 +48,8 @@ function mapEgresoForUI(doc) {
       t.subtipo_egreso != null
         ? String(t.subtipo_egreso)
         : t.subtipoEgreso != null
-        ? String(t.subtipoEgreso)
-        : null,
+          ? String(t.subtipoEgreso)
+          : null,
 
     descripcion: String(t.descripcion ?? t.concepto ?? t.memo ?? ""),
     concepto: t.concepto != null ? String(t.concepto) : null,
@@ -57,41 +63,41 @@ function mapEgresoForUI(doc) {
       t.metodo_pago != null
         ? String(t.metodo_pago)
         : t.metodoPago != null
-        ? String(t.metodoPago)
-        : null,
+          ? String(t.metodoPago)
+          : null,
 
     proveedor_nombre:
       t.proveedor_nombre != null
         ? String(t.proveedor_nombre)
         : t.proveedorNombre != null
-        ? String(t.proveedorNombre)
-        : null,
+          ? String(t.proveedorNombre)
+          : null,
     proveedor_telefono:
       t.proveedor_telefono != null
         ? String(t.proveedor_telefono)
         : t.proveedorTelefono != null
-        ? String(t.proveedorTelefono)
-        : null,
+          ? String(t.proveedorTelefono)
+          : null,
     proveedor_email:
       t.proveedor_email != null
         ? String(t.proveedor_email)
         : t.proveedorEmail != null
-        ? String(t.proveedorEmail)
-        : null,
+          ? String(t.proveedorEmail)
+          : null,
     proveedor_rfc:
       t.proveedor_rfc != null
         ? String(t.proveedor_rfc)
         : t.proveedorRfc != null
-        ? String(t.proveedorRfc)
-        : null,
+          ? String(t.proveedorRfc)
+          : null,
 
     cantidad: t.cantidad != null ? num(t.cantidad, 0) : null,
     precio_unitario:
       t.precio_unitario != null
         ? num(t.precio_unitario, 0)
         : t.precioUnitario != null
-        ? num(t.precioUnitario, 0)
-        : null,
+          ? num(t.precioUnitario, 0)
+          : null,
 
     created_at: new Date(t.created_at ?? t.createdAt ?? t.fecha ?? new Date()).toISOString(),
     comentarios: t.comentarios != null ? String(t.comentarios) : null,
@@ -99,28 +105,28 @@ function mapEgresoForUI(doc) {
       t.fecha_vencimiento != null
         ? String(t.fecha_vencimiento)
         : t.fechaVencimiento != null
-        ? String(t.fechaVencimiento)
-        : null,
+          ? String(t.fechaVencimiento)
+          : null,
 
     imagen_comprobante:
       t.imagen_comprobante != null
         ? String(t.imagen_comprobante)
         : t.imagenComprobante != null
-        ? String(t.imagenComprobante)
-        : null,
+          ? String(t.imagenComprobante)
+          : null,
 
     cuenta_codigo:
       t.cuenta_codigo != null
         ? String(t.cuenta_codigo)
         : t.cuentaCodigo != null
-        ? String(t.cuentaCodigo)
-        : null,
+          ? String(t.cuentaCodigo)
+          : null,
     subcuenta_id:
       t.subcuenta_id != null
         ? String(t.subcuenta_id)
         : t.subcuentaId != null
-        ? String(t.subcuentaId)
-        : null,
+          ? String(t.subcuentaId)
+          : null,
 
     estado: String(t.estado ?? "activo"),
   };
@@ -141,7 +147,6 @@ function lineAccountCode(l) {
 }
 
 function lineDebit(l) {
-  // soporta: debit / debe / monto+side
   const side = String(l?.side || "").toLowerCase();
   if (side === "debit") return num(l?.monto, 0);
   return num(l?.debit ?? l?.debe ?? 0, 0);
@@ -179,7 +184,6 @@ function extractNameQtyFromText(text) {
   const s = String(text || "").trim();
   if (!s) return { producto_nombre: "", cantidad: 0 };
 
-  // Ej: "Costo de venta - PRODUCTO 1 (6 unidades)"
   const m = s.match(/-\s*(.+?)\s*\((\d+)\s*unidades?\)/i);
   if (m) {
     return {
@@ -188,7 +192,6 @@ function extractNameQtyFromText(text) {
     };
   }
 
-  // Ej: "Salida de inventario - PRODUCTO 1 (6 unidades)"
   const m2 = s.match(/inventario\s*-\s*(.+?)\s*\((\d+)\s*unidades?\)/i);
   if (m2) {
     return {
@@ -201,55 +204,36 @@ function extractNameQtyFromText(text) {
 }
 
 /**
- * ✅ ENDPOINT LEGACY REAL (sin rewrite)
- * Tu UI/bundle viejo pide:
- *   GET /api/egresos?estado=activo&start=YYYY-MM-DD&end=YYYY-MM-DD&limit=...
+ * ✅ COGS desde asientos (cuenta 5002)
+ * GET /api/egresos/costos-venta-inventario?start=YYYY-MM-DD&end=YYYY-MM-DD
+ *
+ * IMPORTANTE: Este endpoint NO crea ExpenseTransaction; solo “expone” el COGS real
+ * generado por JournalEntry (cuenta 5002).
  */
-router.get("/", ensureAuth, async (req, res) => {
-  try {
-    const owner = req.user._id;
-
-    const estado = String(req.query.estado || "activo").trim();
-    const limit = Math.min(Math.max(parseInt(String(req.query.limit || "200"), 10) || 200, 1), 1000);
-
-    const start = parseYMD(req.query.start);
-    const end = parseYMD(req.query.end);
-
-    const q = { owner };
-
-    if (estado) q.estado = estado;
-
-    if (start || end) {
-      const dateFilter = {};
-      if (start) dateFilter.$gte = start;
-      if (end) dateFilter.$lte = endOfDay(end);
-
-      // robusto: algunos guardan fecha, otros createdAt
-      q.$or = [{ fecha: dateFilter }, { createdAt: dateFilter }, { created_at: dateFilter }];
-    }
-
-    const rows = await ExpenseTransaction.find(q)
-      .sort({ fecha: -1, createdAt: -1, created_at: -1 })
-      .limit(limit)
-      .lean();
-
-    const items = rows.map(mapEgresoForUI);
-
-    return res.json({ ok: true, data: items, items });
-  } catch (e) {
-    console.error("GET /api/egresos error:", e);
-    return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
-  }
-});
-
-// ✅ COGS desde asientos (cuenta 5002)
-// GET /api/egresos/costos-venta-inventario?start=YYYY-MM-DD&end=YYYY-MM-DD
 router.get("/costos-venta-inventario", ensureAuth, async (req, res) => {
   try {
     const owner = req.user._id;
 
-    const start = parseYMD(req.query.start);
-    const end = parseYMD(req.query.end);
+    const startRaw = req.query.start ?? null;
+    const endRaw = req.query.end ?? null;
+
+    const start = startRaw ? parseYMD(startRaw) : null;
+    const end = endRaw ? parseYMD(endRaw) : null;
+
+    if (startRaw && !start) {
+      return res.status(400).json({
+        ok: false,
+        error: "VALIDATION",
+        message: "start inválido. Usa YYYY-MM-DD",
+      });
+    }
+    if (endRaw && !end) {
+      return res.status(400).json({
+        ok: false,
+        error: "VALIDATION",
+        message: "end inválido. Usa YYYY-MM-DD",
+      });
+    }
 
     // Campo fecha real en JournalEntry (igual filosofía que asientos.js)
     const p = JournalEntry?.schema?.paths || {};
@@ -264,13 +248,15 @@ router.get("/costos-venta-inventario", ensureAuth, async (req, res) => {
 
     // Traer asientos candidatos
     const docs = await JournalEntry.find(match)
-      .select(`${dateField} concept concepto descripcion memo numeroAsiento numero_asiento numero folio lines detalle_asientos detalles_asiento`)
+      .select(
+        `${dateField} concept concepto descripcion memo numeroAsiento numero_asiento numero folio lines detalle_asientos detalles_asiento`
+      )
       .sort({ [dateField]: -1, createdAt: -1 })
       .lean();
 
     if (!docs?.length) return res.json({ ok: true, data: [], items: [] });
 
-    // Helper robusto para detectar codigo y debe/haber (similar a asientos.js)
+    // Helper robusto para detectar codigo y debe/haber
     const n = (v) => {
       if (v == null) return 0;
       if (typeof v === "number") return Number.isFinite(v) ? v : 0;
@@ -312,8 +298,9 @@ router.get("/costos-venta-inventario", ensureAuth, async (req, res) => {
       if (Array.isArray(lines)) allLines.push(...lines);
     }
 
-    // Resolver nombres desde Accounts
     const codes = Array.from(new Set(allLines.map(pickCode).filter(Boolean)));
+
+    // ✅ FIX: Account ya existe/importado, esto ya NO truena
     const accRows = await Account.find({
       owner,
       $or: [{ code: { $in: codes } }, { codigo: { $in: codes } }],
@@ -350,10 +337,8 @@ router.get("/costos-venta-inventario", ensureAuth, async (req, res) => {
       if (!(debe5002 > 0)) continue;
 
       const fecha = e?.[dateField] ?? e?.createdAt ?? e?.created_at ?? new Date();
-      const numero =
-        e.numeroAsiento ?? e.numero_asiento ?? e.numero ?? e.folio ?? String(e._id);
-
-      const concepto = (e.concept ?? e.concepto ?? e.descripcion ?? e.memo ?? "").trim();
+      const numero = e.numeroAsiento ?? e.numero_asiento ?? e.numero ?? e.folio ?? String(e._id);
+      const concepto = String(e.concept ?? e.concepto ?? e.descripcion ?? e.memo ?? "").trim();
 
       const detalles_asiento = lines.map((l) => {
         const code = pickCode(l) || null;
@@ -362,7 +347,8 @@ router.get("/costos-venta-inventario", ensureAuth, async (req, res) => {
           cuenta_nombre: code ? nameMap.get(code) || null : null,
           debe: pickDebe(l),
           haber: pickHaber(l),
-          descripcion: String(l?.memo ?? l?.descripcion ?? l?.concepto ?? l?.description ?? "").trim() || null,
+          descripcion:
+            String(l?.memo ?? l?.descripcion ?? l?.concepto ?? l?.description ?? "").trim() || null,
         };
       });
 
@@ -372,21 +358,73 @@ router.get("/costos-venta-inventario", ensureAuth, async (req, res) => {
         descripcion: concepto || "Costo de venta inventario",
         monto: Math.round(debe5002 * 100) / 100,
         numero_asiento: String(numero),
+
+        // extras (compat)
         producto_nombre: "Inventario",
         producto_imagen: null,
         cantidad: null,
         costo_unitario: null,
+
+        // ✅ compat: algunas UIs esperan detalles_asiento / detalle_asientos
         detalles_asiento,
+        detalle_asientos: detalles_asiento,
       });
     }
+
+    // Orden descendente por fecha
+    out.sort((a, b) => (String(a.fecha || "") < String(b.fecha || "") ? 1 : -1));
 
     return res.json({ ok: true, data: out, items: out });
   } catch (e) {
     console.error("GET /api/egresos/costos-venta-inventario error:", e);
-    return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
+    return res.status(500).json({
+      ok: false,
+      error: "SERVER_ERROR",
+      message: e?.message || "Error generando costos-venta-inventario",
+    });
   }
 });
 
+/**
+ * ✅ ENDPOINT LEGACY REAL (sin rewrite)
+ * Tu UI/bundle viejo pide:
+ *   GET /api/egresos?estado=activo&start=YYYY-MM-DD&end=YYYY-MM-DD&limit=...
+ */
+router.get("/", ensureAuth, async (req, res) => {
+  try {
+    const owner = req.user._id;
+
+    const estado = String(req.query.estado || "activo").trim();
+    const limit = Math.min(Math.max(parseInt(String(req.query.limit || "200"), 10) || 200, 1), 1000);
+
+    const start = parseYMD(req.query.start);
+    const end = parseYMD(req.query.end);
+
+    const q = { owner };
+    if (estado) q.estado = estado;
+
+    if (start || end) {
+      const dateFilter = {};
+      if (start) dateFilter.$gte = start;
+      if (end) dateFilter.$lte = endOfDay(end);
+
+      // robusto: algunos guardan fecha, otros createdAt
+      q.$or = [{ fecha: dateFilter }, { createdAt: dateFilter }, { created_at: dateFilter }];
+    }
+
+    const rows = await ExpenseTransaction.find(q)
+      .sort({ fecha: -1, createdAt: -1, created_at: -1 })
+      .limit(limit)
+      .lean();
+
+    const items = rows.map(mapEgresoForUI);
+
+    return res.json({ ok: true, data: items, items });
+  } catch (e) {
+    console.error("GET /api/egresos error:", e);
+    return res.status(500).json({ ok: false, error: "SERVER_ERROR", message: e?.message || "Error listando egresos" });
+  }
+});
 
 /**
  * ✅ Guardar URL del comprobante (la UI lo llama tras el upload)
@@ -420,7 +458,7 @@ router.patch("/:id/comprobante", ensureAuth, async (req, res) => {
     return res.json({ ok: true, data: mapEgresoForUI(tx) });
   } catch (e) {
     console.error("PATCH /api/egresos/:id/comprobante error:", e);
-    return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
+    return res.status(500).json({ ok: false, error: "SERVER_ERROR", message: e?.message || "Error guardando comprobante" });
   }
 });
 
@@ -471,6 +509,7 @@ router.post("/:id/cancel", ensureAuth, async (req, res) => {
     if (originalNumero) {
       originalEntry =
         (await JournalEntry.findOne({ owner, numeroAsiento: String(originalNumero) }).sort({ createdAt: -1 }).lean()) ||
+        (await JournalEntry.findOne({ owner, numero: String(originalNumero) }).sort({ createdAt: -1 }).lean()) ||
         (await JournalEntry.findOne({ owner, numero_asiento: String(originalNumero) }).sort({ createdAt: -1 }).lean());
     }
 
@@ -491,27 +530,40 @@ router.post("/:id/cancel", ensureAuth, async (req, res) => {
         (await JournalEntry.findOne({
           owner,
           source: { $in: sourceAliases },
-          transaccionId: id,
+          transaccionId: { $in: idCandidates },
         })
           .sort({ createdAt: -1 })
           .lean()) ||
         (await JournalEntry.findOne({
           owner,
           source: { $in: sourceAliases },
-          transaccion_id: id,
+          source_id: { $in: idCandidates },
+        })
+          .sort({ createdAt: -1 })
+          .lean()) ||
+        (await JournalEntry.findOne({
+          owner,
+          source: { $in: sourceAliases },
+          transaccion_id: { $in: idCandidates },
         })
           .sort({ createdAt: -1 })
           .lean());
     }
 
-    // 2) Crear reversión solo si existe asiento original con líneas
+    // 2) Crear reversión solo si existe asiento original con líneas (robusto)
     let asientoReversion = null;
 
-    if (originalEntry && Array.isArray(originalEntry.lines) && originalEntry.lines.length) {
-      const origLines = originalEntry.lines;
+    const origLines =
+      (originalEntry?.lines && Array.isArray(originalEntry.lines) && originalEntry.lines) ||
+      (originalEntry?.detalle_asientos && Array.isArray(originalEntry.detalle_asientos) && originalEntry.detalle_asientos) ||
+      (originalEntry?.detalles_asiento && Array.isArray(originalEntry.detalles_asiento) && originalEntry.detalles_asiento) ||
+      [];
 
+    if (originalEntry && origLines.length) {
       const reversedLines = origLines.map((l) => {
-        const code = String(l.accountCodigo || l.accountCode || l.cuenta_codigo || l.code || "").trim();
+        const code = String(
+          l.accountCodigo || l.accountCode || l.cuenta_codigo || l.cuentaCodigo || l.code || ""
+        ).trim();
 
         return {
           accountCodigo: code,
@@ -524,12 +576,14 @@ router.post("/:id/cancel", ensureAuth, async (req, res) => {
           debe: num(l.haber ?? l.credit ?? 0, 0),
           haber: num(l.debe ?? l.debit ?? 0, 0),
 
-          memo: `Reversión: ${String(l.memo || l.descripcion || "").trim()}`.trim(),
-          descripcion: `Reversión: ${String(l.memo || l.descripcion || "").trim()}`.trim(),
+          memo: `Reversión: ${String(l.memo || l.descripcion || l.concepto || "").trim()}`.trim(),
+          descripcion: `Reversión: ${String(l.memo || l.descripcion || l.concepto || "").trim()}`.trim(),
         };
       });
 
-      const revNumero = `EGR-REV-${String(originalEntry.numeroAsiento || originalEntry.numero_asiento || originalEntry._id)}-${Date.now()}`;
+      const revNumero = `EGR-REV-${String(
+        originalEntry.numeroAsiento || originalEntry.numero_asiento || originalEntry.numero || originalEntry._id
+      )}-${Date.now()}`;
 
       const revEntry = await JournalEntry.create({
         owner,
@@ -537,9 +591,12 @@ router.post("/:id/cancel", ensureAuth, async (req, res) => {
         concept: `Reversión egreso: ${tx.descripcion || ""} | Motivo: ${motivoCancelacion}`.trim(),
         numeroAsiento: revNumero,
         numero_asiento: revNumero,
+        numero: revNumero,
         source: "egreso_cancel",
         sourceId: tx._id,
         transaccionId: String(tx._id),
+        source_id: String(tx._id),
+        transaccion_id: String(tx._id),
         lines: reversedLines,
       });
 
@@ -559,14 +616,14 @@ router.post("/:id/cancel", ensureAuth, async (req, res) => {
         transaccionId: String(tx._id),
         transaccion: mapEgresoForUI(tx),
         asiento_original: originalEntry
-          ? originalEntry.numeroAsiento || originalEntry.numero_asiento || String(originalEntry._id)
+          ? originalEntry.numeroAsiento || originalEntry.numero_asiento || originalEntry.numero || String(originalEntry._id)
           : null,
         asiento_reversion: asientoReversion,
       },
     });
   } catch (e) {
     console.error("POST /api/egresos/:id/cancel error:", e);
-    return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
+    return res.status(500).json({ ok: false, error: "SERVER_ERROR", message: e?.message || "Error cancelando egreso" });
   }
 });
 
