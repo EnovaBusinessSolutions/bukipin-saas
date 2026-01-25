@@ -259,55 +259,79 @@ function buildJournalDateOrFilter(start, end) {
 }
 
 async function buildCogsItemsFromJournal({ owner, start, end, limit = 500 }) {
-  const and = [{ owner }];
+  const match = { owner };
 
-  // ✅ filtro de fechas (OR entre campos posibles)
   const orDates = buildJournalDateOrFilter(start, end);
-  if (orDates) and.push({ $or: orDates });
-
-  // ✅ filtro REAL: solo asientos que tengan 5002 en cualquier arreglo de líneas
-  const elem5002 = buildLineElemMatch5002();
-  and.push({
-    $or: [
-      { lines: { $elemMatch: elem5002 } },
-      { detalle_asientos: { $elemMatch: elem5002 } },
-      { detalles_asiento: { $elemMatch: elem5002 } },
-    ],
-  });
-
-  const match = and.length > 1 ? { $and: and } : and[0];
+  if (orDates) match.$or = orDates;
 
   const docs = await JournalEntry.find(match)
     .select(
       "date fecha entryDate createdAt created_at concept concepto descripcion memo numeroAsiento numero_asiento numero folio lines detalle_asientos detalles_asiento"
     )
-    .sort({ date: -1, fecha: -1, createdAt: -1, created_at: -1 })
+    .sort({ createdAt: -1 })
     .limit(Math.min(Math.max(limit, 1), 2000))
     .lean();
 
   if (!docs?.length) return [];
 
-
-  // Resolver nombres de cuentas (opcional)
+  // 1) juntar todas las líneas para resolver códigos/nombres
   const allLines = [];
   for (const e of docs) {
     const lines = pickLines(e);
     if (Array.isArray(lines)) allLines.push(...lines);
   }
-  const codes = Array.from(new Set(allLines.map(pickCode).filter(Boolean)));
 
-  let nameMap = new Map();
-  if (codes.length) {
-    const accRows = await Account.find({
-      owner,
-      $or: [{ code: { $in: codes } }, { codigo: { $in: codes } }],
-    })
-      .select("code codigo name nombre")
-      .lean();
+  // 2) extraer códigos directos + accountIds
+  const codesDirect = Array.from(new Set(allLines.map(pickCode).filter(Boolean)));
 
-    nameMap = new Map(
-      (accRows || []).map((a) => [String(a.code ?? a.codigo).trim(), a.name ?? a.nombre ?? ""])
+  const accountIds = Array.from(
+    new Set(allLines.map(pickAccountId).filter(Boolean))
+  );
+
+  // 3) traer cuentas por code/codigo y por _id
+  const accQuery = {
+    owner,
+    $or: [],
+  };
+
+  if (codesDirect.length) {
+    accQuery.$or.push({ code: { $in: codesDirect } });
+    accQuery.$or.push({ codigo: { $in: codesDirect } });
+  }
+
+  if (accountIds.length) {
+    const ids = accountIds
+      .map((s) => (mongoose.Types.ObjectId.isValid(s) ? new mongoose.Types.ObjectId(s) : null))
+      .filter(Boolean);
+    if (ids.length) accQuery.$or.push({ _id: { $in: ids } });
+  }
+
+  let idToCode = new Map();
+  let codeToName = new Map();
+
+  if (accQuery.$or.length) {
+    const accRows = await Account.find(accQuery).select("_id code codigo name nombre").lean();
+
+    idToCode = new Map(
+      (accRows || []).map((a) => [String(a._id), String(a.code ?? a.codigo ?? "").trim()])
     );
+
+    codeToName = new Map(
+      (accRows || []).map((a) => {
+        const code = String(a.code ?? a.codigo ?? "").trim();
+        const name = a.name ?? a.nombre ?? "";
+        return [code, name];
+      })
+    );
+  }
+
+  // helper local: code final por línea (directo o via accountId)
+  function finalCode(line) {
+    const direct = pickCode(line);
+    if (direct) return direct;
+    const id = pickAccountId(line);
+    if (!id) return "";
+    return String(idToCode.get(id) || "").trim();
   }
 
   const out = [];
@@ -319,14 +343,15 @@ async function buildCogsItemsFromJournal({ owner, start, end, limit = 500 }) {
     // suma debe de 5002
     let debe5002 = 0;
     let refText = "";
+
     for (const l of lines) {
-  const code = pickCode(l);
-  if (matchCode5002Value(code)) {
-    const d = pickDebe(l);
-    debe5002 += d;
-    if (!refText) refText = pickMemo(l);
-  }
-}
+      if (finalCode(l) === "5002") {
+        const d = pickDebe(l);
+        debe5002 += d;
+        if (!refText) refText = pickMemo(l);
+      }
+    }
+
     if (!(debe5002 > 0)) continue;
 
     const fecha = pickEntryDate(e);
@@ -336,10 +361,10 @@ async function buildCogsItemsFromJournal({ owner, start, end, limit = 500 }) {
     const { producto_nombre, cantidad } = extractNameQtyFromText(refText || concepto);
 
     const detalles_asiento = lines.map((l) => {
-      const code = pickCode(l) || null;
+      const code = finalCode(l) || null;
       return {
         cuenta_codigo: code,
-        cuenta_nombre: code ? nameMap.get(code) || null : null,
+        cuenta_nombre: code ? codeToName.get(code) || null : null,
         debe: pickDebe(l),
         haber: pickHaber(l),
         descripcion: pickMemo(l) || null,
@@ -370,7 +395,6 @@ async function buildCogsItemsFromJournal({ owner, start, end, limit = 500 }) {
         cantidad: cantidad ?? null,
         precio_unitario: null,
 
-        // ✅ importante: usar fecha del asiento, no “now”
         created_at: new Date(fecha).toISOString(),
 
         cuenta_codigo: "5002",
@@ -388,6 +412,26 @@ async function buildCogsItemsFromJournal({ owner, start, end, limit = 500 }) {
 
   return out;
 }
+
+
+function pickAccountId(l) {
+  const v =
+    l?.accountId ??
+    l?.account_id ??
+    l?.cuentaId ??
+    l?.cuenta_id ??
+    l?.account?._id ??
+    l?.cuenta?._id ??
+    null;
+
+  if (!v) return null;
+  try {
+    return String(v);
+  } catch {
+    return null;
+  }
+}
+
 
 /**
  * ✅ ENDPOINT LEGACY REAL (sin rewrite)
