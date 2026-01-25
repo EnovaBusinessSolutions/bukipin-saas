@@ -150,6 +150,40 @@ function mapEgresoForUI(doc) {
 /** -----------------------------
  * Helpers: JournalEntry lines
  * ----------------------------- */
+
+function isCode5002(code) {
+  const c = String(code || "").trim();
+  return c === "5002" || c.startsWith("5002 ");
+}
+
+function matchCode5002Value(v) {
+  // acepta "5002", 5002, "5002 - algo", etc.
+  const s = String(v ?? "").trim();
+  return s === "5002" || s.startsWith("5002");
+}
+
+function buildLineElemMatch5002() {
+  // regex para atrapar "5002", "5002 -", "5002 ", etc.
+  const rx = /^5002\b/;
+
+  return {
+    $or: [
+      { accountCodigo: { $regex: rx } },
+      { accountCode: { $regex: rx } },
+      { cuentaCodigo: { $regex: rx } },
+      { cuenta_codigo: { $regex: rx } },
+      { code: { $regex: rx } },
+
+      // por si guardaste números
+      { accountCodigo: 5002 },
+      { accountCode: 5002 },
+      { cuentaCodigo: 5002 },
+      { cuenta_codigo: 5002 },
+      { code: 5002 },
+    ],
+  };
+}
+
 function pickLines(e) {
   return e?.lines || e?.detalle_asientos || e?.detalles_asiento || [];
 }
@@ -225,20 +259,34 @@ function buildJournalDateOrFilter(start, end) {
 }
 
 async function buildCogsItemsFromJournal({ owner, start, end, limit = 500 }) {
-  const match = { owner };
+  const and = [{ owner }];
 
+  // ✅ filtro de fechas (OR entre campos posibles)
   const orDates = buildJournalDateOrFilter(start, end);
-  if (orDates) match.$or = orDates;
+  if (orDates) and.push({ $or: orDates });
+
+  // ✅ filtro REAL: solo asientos que tengan 5002 en cualquier arreglo de líneas
+  const elem5002 = buildLineElemMatch5002();
+  and.push({
+    $or: [
+      { lines: { $elemMatch: elem5002 } },
+      { detalle_asientos: { $elemMatch: elem5002 } },
+      { detalles_asiento: { $elemMatch: elem5002 } },
+    ],
+  });
+
+  const match = and.length > 1 ? { $and: and } : and[0];
 
   const docs = await JournalEntry.find(match)
     .select(
       "date fecha entryDate createdAt created_at concept concepto descripcion memo numeroAsiento numero_asiento numero folio lines detalle_asientos detalles_asiento"
     )
-    .sort({ createdAt: -1 })
+    .sort({ date: -1, fecha: -1, createdAt: -1, created_at: -1 })
     .limit(Math.min(Math.max(limit, 1), 2000))
     .lean();
 
   if (!docs?.length) return [];
+
 
   // Resolver nombres de cuentas (opcional)
   const allLines = [];
@@ -272,12 +320,13 @@ async function buildCogsItemsFromJournal({ owner, start, end, limit = 500 }) {
     let debe5002 = 0;
     let refText = "";
     for (const l of lines) {
-      if (pickCode(l) === "5002") {
-        const d = pickDebe(l);
-        debe5002 += d;
-        if (!refText) refText = pickMemo(l);
-      }
-    }
+  const code = pickCode(l);
+  if (matchCode5002Value(code)) {
+    const d = pickDebe(l);
+    debe5002 += d;
+    if (!refText) refText = pickMemo(l);
+  }
+}
     if (!(debe5002 > 0)) continue;
 
     const fecha = pickEntryDate(e);
