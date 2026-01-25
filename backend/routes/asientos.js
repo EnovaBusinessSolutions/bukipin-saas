@@ -96,6 +96,34 @@ function pickEntryConcept(entry) {
 }
 
 /**
+ * ✅ NUEVO: detecta si un path del schema es ObjectId
+ * (para evitar CastError metiendo strings en $in)
+ */
+function pathIsObjectId(model, path) {
+  try {
+    const p = model?.schema?.paths?.[path];
+    if (!p) return false;
+    const inst = String(p.instance || "").toLowerCase();
+    if (inst === "objectid" || inst === "objectid") return true;
+    // fallback por si instance viene raro
+    const optType = p.options?.type;
+    return optType === mongoose.Schema.Types.ObjectId;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * ✅ NUEVO: normaliza ids cogs_*
+ * cogs_<journalEntryId> => <journalEntryId>
+ */
+function normalizeCogsId(raw) {
+  const s = String(raw || "").trim();
+  if (s.toLowerCase().startsWith("cogs_")) return s.slice(5).trim();
+  return s;
+}
+
+/**
  * ✅ Genera folio tipo YYYY-0001 si falta numeroAsiento (y lo persiste)
  * Solo aplica si existe Counter.
  */
@@ -675,11 +703,57 @@ router.get("/by-transaccion", ensureAuth, async (req, res) => {
     }
 
     const owner = req.user._id;
-    const sourceIdCandidates = [id];
 
-    if (mongoose.Types.ObjectId.isValid(id)) {
-      sourceIdCandidates.push(new mongoose.Types.ObjectId(id));
+    // ✅ 0) SOPORTE COGS:
+    // si viene cogs_<journalEntryId>, resolvemos directo por _id del JournalEntry
+    if (String(id).toLowerCase().startsWith("cogs_")) {
+      const jeId = normalizeCogsId(id);
+      if (!isObjectId(jeId)) {
+        return res.status(400).json({ ok: false, error: "VALIDATION", message: "id cogs_ inválido" });
+      }
+
+      let asiento = await JournalEntry.findOne({ owner, _id: new mongoose.Types.ObjectId(jeId) }).lean();
+      if (!asiento) return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+
+      asiento = ensureConceptFallback(asiento);
+      asiento = await ensureNumeroAsiento(owner, asiento);
+
+      const rawLines = asiento.lines || asiento.detalle_asientos || asiento.detalles_asiento || [];
+      const accountMaps = await getAccountMaps(owner, rawLines);
+      const asientoUI = mapEntryForUI(asiento, accountMaps);
+
+      const numeroAsiento = asientoUI.numeroAsiento || asientoUI.numero_asiento || pickEntryNumero(asiento) || null;
+
+      return res.json({
+        ok: true,
+        data: asientoUI,
+        asiento: asientoUI,
+        item: asientoUI,
+        numeroAsiento,
+        asientos: [asientoUI],
+        ...asientoUI,
+      });
     }
+
+    // ✅ 1) Candidatos seguros (evitar CastError)
+    const oid = isObjectId(id) ? new mongoose.Types.ObjectId(id) : null;
+    const idStr = id;
+
+    const sourceIdIsObj = pathIsObjectId(JournalEntry, "sourceId");
+    const transaccionIdIsObj = pathIsObjectId(JournalEntry, "transaccionId");
+    const source_idIsObj = pathIsObjectId(JournalEntry, "source_id");
+    const transaccion_idIsObj = pathIsObjectId(JournalEntry, "transaccion_id");
+
+    // Para campos ObjectId SOLO usamos ObjectId; para otros, usamos string y opcional ObjectId
+    const inFor = (isObjPath) => {
+      if (isObjPath) return oid ? [oid] : [];
+      return oid ? [idStr, oid] : [idStr];
+    };
+
+    const sourceIdCandidates = inFor(sourceIdIsObj);
+    const transaccionIdCandidates = inFor(transaccionIdIsObj);
+    const source_idCandidates = inFor(source_idIsObj);
+    const transaccion_idCandidates = inFor(transaccion_idIsObj);
 
     const sourceAliases = new Set();
     if (source) {
@@ -702,26 +776,45 @@ router.get("/by-transaccion", ensureAuth, async (req, res) => {
 
     let asiento = null;
 
-    // 1) Buscar por source + sourceId
+    // 2) Buscar por source + ids (solo si hay candidatos válidos)
     if (sourceAliases.size) {
       const srcList = Array.from(sourceAliases);
-      asiento =
-        (await findBy({ owner, source: { $in: srcList }, sourceId: { $in: sourceIdCandidates } })) ||
-        (await findBy({ owner, source: { $in: srcList }, transaccionId: { $in: sourceIdCandidates } })) ||
-        (await findBy({ owner, source: { $in: srcList }, source_id: { $in: sourceIdCandidates } })) ||
-        (await findBy({ owner, "references.source": { $in: srcList }, "references.id": id }));
+
+      if (sourceIdCandidates.length) {
+        asiento = (await findBy({ owner, source: { $in: srcList }, sourceId: { $in: sourceIdCandidates } })) || asiento;
+      }
+      if (!asiento && transaccionIdCandidates.length) {
+        asiento = (await findBy({ owner, source: { $in: srcList }, transaccionId: { $in: transaccionIdCandidates } })) || asiento;
+      }
+      if (!asiento && source_idCandidates.length) {
+        asiento = (await findBy({ owner, source: { $in: srcList }, source_id: { $in: source_idCandidates } })) || asiento;
+      }
+
+      if (!asiento) {
+        asiento = await findBy({ owner, "references.source": { $in: srcList }, "references.id": idStr });
+      }
     }
 
-    // 2) Fallback: solo por id
+    // 3) Fallback: solo por id
     if (!asiento) {
-      asiento =
-        (await findBy({ owner, sourceId: { $in: sourceIdCandidates } })) ||
-        (await findBy({ owner, transaccionId: { $in: sourceIdCandidates } })) ||
-        (await findBy({ owner, source_id: { $in: sourceIdCandidates } })) ||
-        (await findBy({ owner, "references.id": id }));
+      if (sourceIdCandidates.length) {
+        asiento = (await findBy({ owner, sourceId: { $in: sourceIdCandidates } })) || asiento;
+      }
+      if (!asiento && transaccionIdCandidates.length) {
+        asiento = (await findBy({ owner, transaccionId: { $in: transaccionIdCandidates } })) || asiento;
+      }
+      if (!asiento && source_idCandidates.length) {
+        asiento = (await findBy({ owner, source_id: { $in: source_idCandidates } })) || asiento;
+      }
+      if (!asiento && transaccion_idCandidates.length) {
+        asiento = (await findBy({ owner, transaccion_id: { $in: transaccion_idCandidates } })) || asiento;
+      }
+      if (!asiento) {
+        asiento = await findBy({ owner, "references.id": idStr });
+      }
     }
 
-    // 3) ✅ ESPECIAL INVENTARIO: si no encontró asiento, resolver desde InventoryMovement -> journalEntryId/asientoId
+    // 4) ✅ ESPECIAL INVENTARIO: si no encontró asiento, resolver desde InventoryMovement -> journalEntryId/asientoId
     if (!asiento && InventoryMovement && isObjectId(id)) {
       const mov = await InventoryMovement.findOne({ owner, _id: new mongoose.Types.ObjectId(id) }).lean().catch(() => null);
 
@@ -745,11 +838,11 @@ router.get("/by-transaccion", ensureAuth, async (req, res) => {
           const movSid = mov.sourceId ?? mov.source_id ?? mov.transaccionId ?? mov.transaccion_id ?? null;
 
           if (movSrc && movSid) {
-            const cand = [movSid];
-            if (isObjectId(movSid)) cand.push(new mongoose.Types.ObjectId(String(movSid)));
+            const candOid = isObjectId(movSid) ? new mongoose.Types.ObjectId(String(movSid)) : null;
+            const cand = candOid ? [String(movSid), candOid] : [String(movSid)];
 
             asiento =
-              (await findBy({ owner, source: movSrc, sourceId: { $in: cand } })) ||
+              (await findBy({ owner, source: movSrc, sourceId: { $in: candOid ? [candOid] : [] } }).catch(() => null)) ||
               (await findBy({ owner, source: movSrc, source_id: { $in: cand } })) ||
               (await findBy({ owner, source: movSrc, transaccionId: { $in: cand } }));
           }
