@@ -16,6 +16,15 @@ try {
   JournalEntry = null;
 }
 
+// ✅ Opcional: para nombre de cuenta en detalles (NO rompe si no existe)
+let Account = null;
+try {
+  // eslint-disable-next-line global-require
+  Account = require("../models/Account");
+} catch (e) {
+  Account = null;
+}
+
 function toNum(v, def = 0) {
   const n = Number(String(v ?? "").replace(/,/g, ""));
   return Number.isFinite(n) ? n : def;
@@ -272,6 +281,266 @@ function isOtrosGastos(tipoEgresoRaw, subtipoEgreso) {
   const t = String(tipoEgresoRaw || "").toLowerCase().trim();
   const s = String(subtipoEgreso || "").toLowerCase().trim();
   return t === "otro" || s === "otros_gastos";
+}
+
+/* =========================================================
+   ✅ COGS (Costo de Venta Inventario) desde JournalEntry (5002)
+   La tabla "Resumen de Egresos" pega a /api/egresos/transacciones,
+   por eso lo inyectamos AQUÍ (no solo en /api/egresos legacy).
+========================================================= */
+
+function parseYMD(s) {
+  const str = String(s || "").trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(str)) return null;
+  const d = new Date(`${str}T00:00:00`);
+  if (Number.isNaN(d.getTime())) return null;
+  return d;
+}
+
+function endOfDay(d) {
+  const x = new Date(d);
+  x.setHours(23, 59, 59, 999);
+  return x;
+}
+
+function buildJournalDateOrFilter(start, end) {
+  if (!start && !end) return null;
+
+  const dateFilter = {};
+  if (start) dateFilter.$gte = start;
+  if (end) dateFilter.$lte = endOfDay(end);
+
+  return [
+    { date: dateFilter },
+    { fecha: dateFilter },
+    { entryDate: dateFilter },
+    { createdAt: dateFilter },
+    { created_at: dateFilter },
+  ];
+}
+
+function pickLines(e) {
+  return e?.lines || e?.detalle_asientos || e?.detalles_asiento || [];
+}
+
+function pickCode(l) {
+  return String(
+    l?.accountCodigo ??
+      l?.accountCode ??
+      l?.cuentaCodigo ??
+      l?.cuenta_codigo ??
+      l?.code ??
+      l?.cuenta?.code ??
+      l?.cuenta?.codigo ??
+      l?.account?.code ??
+      l?.account?.codigo ??
+      ""
+  ).trim();
+}
+
+function pickDebe(l) {
+  const side = String(l?.side || "").toLowerCase().trim();
+  const monto = toNum(l?.monto ?? l?.amount ?? l?.importe ?? l?.valor ?? 0, 0);
+  return toNum(l?.debit ?? l?.debe ?? 0, 0) || (side === "debit" ? monto : 0);
+}
+
+function pickHaber(l) {
+  const side = String(l?.side || "").toLowerCase().trim();
+  const monto = toNum(l?.monto ?? l?.amount ?? l?.importe ?? l?.valor ?? 0, 0);
+  return toNum(l?.credit ?? l?.haber ?? 0, 0) || (side === "credit" ? monto : 0);
+}
+
+function pickMemo(l) {
+  return String(l?.memo ?? l?.descripcion ?? l?.concepto ?? l?.description ?? "").trim();
+}
+
+function pickEntryDate(e) {
+  return e?.date || e?.fecha || e?.entryDate || e?.createdAt || e?.created_at || new Date();
+}
+
+function pickEntryNumero(e) {
+  return e?.numeroAsiento ?? e?.numero_asiento ?? e?.numero ?? e?.folio ?? String(e?._id || "");
+}
+
+function extractNameQtyFromText(text) {
+  const s = String(text || "").trim();
+  if (!s) return { producto_nombre: "", cantidad: null };
+
+  // "Costo de venta - jabones (3 unidades)"
+  const m = s.match(/costo\s+de\s+venta\s*-\s*(.+?)\s*\((\d+)\s*unidades?\)/i);
+  if (m) return { producto_nombre: String(m[1] || "").trim(), cantidad: toNum(m[2], 0) };
+
+  // "... - PRODUCTO (15 unidades)"
+  const m2 = s.match(/-\s*(.+?)\s*\((\d+)\s*unidades?\)/i);
+  if (m2) return { producto_nombre: String(m2[1] || "").trim(), cantidad: toNum(m2[2], 0) };
+
+  return { producto_nombre: "", cantidad: null };
+}
+
+function mirrorCamel(item) {
+  const x = { ...item };
+
+  x.tipoEgreso = x.tipo_egreso;
+  x.subtipoEgreso = x.subtipo_egreso;
+  x.cuentaCodigo = x.cuenta_codigo;
+  x.subcuentaId = x.subcuenta_id;
+  x.montoTotal = x.monto_total;
+  x.precioUnitario = x.precio_unitario;
+  x.tipoPago = x.tipo_pago;
+  x.metodoPago = x.metodo_pago;
+  x.montoPagado = x.monto_pagado;
+  x.montoPendiente = x.monto_pendiente;
+  x.fechaVencimiento = x.fecha_vencimiento;
+  x.proveedorId = x.proveedor_id;
+  x.productoId = x.producto_egreso_id;
+
+  x.asientoId = x.asiento_id;
+
+  x.motivoCancelacion = x.motivo_cancelacion;
+  x.canceladoAt = x.cancelado_at;
+  x.numeroAsientoReversion = x.numero_asiento_reversion;
+
+  return x;
+}
+
+async function buildCogsTxItemsFromJournal({ owner, start, end, limit = 2000 }) {
+  if (!JournalEntry) return [];
+
+  const match = { owner };
+  const orDates = buildJournalDateOrFilter(start, end);
+  if (orDates) match.$or = orDates;
+
+  const docs = await JournalEntry.find(match)
+    .select(
+      "date fecha entryDate createdAt created_at concept concepto descripcion memo numeroAsiento numero_asiento numero folio lines detalle_asientos detalles_asiento"
+    )
+    .sort({ createdAt: -1 })
+    .limit(Math.min(Math.max(limit, 1), 5000))
+    .lean();
+
+  if (!docs?.length) return [];
+
+  // (Opcional) code->name
+  let nameMap = new Map();
+  if (Account) {
+    try {
+      const allLines = [];
+      for (const e of docs) {
+        const lines = pickLines(e);
+        if (Array.isArray(lines)) allLines.push(...lines);
+      }
+      const codes = Array.from(new Set(allLines.map(pickCode).filter(Boolean)));
+      if (codes.length) {
+        const accRows = await Account.find({
+          owner,
+          $or: [{ code: { $in: codes } }, { codigo: { $in: codes } }],
+        })
+          .select("code codigo name nombre")
+          .lean();
+
+        nameMap = new Map(
+          (accRows || []).map((a) => [String(a.code ?? a.codigo).trim(), a.name ?? a.nombre ?? ""])
+        );
+      }
+    } catch (_) {
+      // noop
+    }
+  }
+
+  const out = [];
+
+  for (const e of docs) {
+    const lines = pickLines(e);
+    if (!Array.isArray(lines) || !lines.length) continue;
+
+    let debe5002 = 0;
+    let refText = "";
+
+    for (const l of lines) {
+      if (pickCode(l) === "5002") {
+        const d = pickDebe(l);
+        debe5002 += d;
+        if (!refText) refText = pickMemo(l);
+      }
+    }
+
+    if (!(debe5002 > 0)) continue;
+
+    const fecha = pickEntryDate(e);
+    const numero = pickEntryNumero(e);
+    const concepto = String(e.concept ?? e.concepto ?? e.descripcion ?? e.memo ?? "").trim();
+
+    const { producto_nombre, cantidad } = extractNameQtyFromText(refText || concepto);
+    const montoTotal = Math.round(debe5002 * 100) / 100;
+    const precioUnit = cantidad && cantidad > 0 ? Math.round((montoTotal / cantidad) * 100) / 100 : 0;
+
+    const detalles_asiento = lines.map((l) => {
+      const code = pickCode(l) || null;
+      return {
+        cuenta_codigo: code,
+        cuenta_nombre: code ? nameMap.get(code) || null : null,
+        debe: pickDebe(l),
+        haber: pickHaber(l),
+        descripcion: pickMemo(l) || null,
+      };
+    });
+
+    const base = {
+      id: `cogs_${String(e._id)}`,
+      _id: `cogs_${String(e._id)}`,
+
+      tipo_egreso: "costo",
+      subtipo_egreso: "costo_venta_inventario",
+
+      descripcion: concepto || `Costo de venta inventario${producto_nombre ? ` - ${producto_nombre}` : ""}`,
+
+      cuenta_codigo: "5002",
+      subcuenta_id: null,
+
+      monto_total: montoTotal,
+      cantidad: cantidad ?? 1,
+      precio_unitario: precioUnit,
+
+      tipo_pago: "contado",
+      metodo_pago: "cogs",
+
+      monto_pagado: montoTotal,
+      monto_pendiente: 0,
+
+      fecha: new Date(fecha).toISOString(),
+      fecha_vencimiento: null,
+
+      proveedor_id: null,
+      proveedor_nombre: null,
+      proveedor_telefono: null,
+      proveedor_email: null,
+      proveedor_rfc: null,
+
+      producto_egreso_id: null,
+      comentarios: null,
+
+      numero_asiento: String(numero),
+
+      // para que puedas jalar detalle si lo ocupas
+      asiento_id: String(e._id),
+
+      estado: "activo",
+
+      motivo_cancelacion: null,
+      cancelado_at: null,
+      numero_asiento_reversion: null,
+
+      created_at: new Date(fecha).toISOString(),
+      updated_at: null,
+
+      source: "cogs_journal",
+      detalles_asiento,
+    };
+
+    out.push(mirrorCamel(base));
+  }
+
+  return out;
 }
 
 /**
@@ -586,6 +855,7 @@ router.post("/", ensureAuth, async (req, res) => {
 
 /**
  * GET /?estado=activo|cancelado&start=YYYY-MM-DD&end=YYYY-MM-DD&tipo=costo|gasto&limit=200
+ * ✅ FIX: incluir COGS (5002) en ESTA ruta porque la tabla Resumen la consume.
  */
 router.get("/", ensureAuth, async (req, res) => {
   try {
@@ -628,10 +898,36 @@ router.get("/", ensureAuth, async (req, res) => {
 
     const docs = await ExpenseTransaction.find(filter).sort({ fecha: -1, createdAt: -1 }).limit(limit).lean();
 
-    const items = docs.map(mapTxForUI);
+    let items = docs.map(mapTxForUI);
+
+    // ✅ incluir COGS (5002) desde JournalEntry
+    const includeCogs = String(req.query.include_cogs ?? req.query.includeCogs ?? "1").trim() !== "0";
+    if (includeCogs && JournalEntry) {
+      const startYmd = parseYMD(req.query.start) || start;
+      const endYmd = parseYMD(req.query.end) || end;
+
+      const cogsItems = await buildCogsTxItemsFromJournal({
+        owner,
+        start: startYmd,
+        end: endYmd,
+        limit: 5000,
+      });
+
+      items = items.concat(cogsItems);
+
+      // ordenar por fecha desc
+      items.sort((a, b) => {
+        const da = new Date(a.fecha || a.created_at || 0).getTime();
+        const db = new Date(b.fecha || b.created_at || 0).getTime();
+        return db - da;
+      });
+
+      // respetar limit
+      items = items.slice(0, limit);
+    }
 
     if (!wrap) return res.json(items);
-    return res.json({ ok: true, data: items, items, meta: { limit } });
+    return res.json({ ok: true, data: items, items, meta: { limit, includeCogs } });
   } catch (err) {
     console.error("GET /api/egresos/transacciones error:", err);
     return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
