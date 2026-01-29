@@ -27,7 +27,8 @@ function parseEndDate(s) {
 }
 
 function num(v, def = 0) {
-  const n = Number(v);
+  if (v == null) return def;
+  const n = Number(String(v).replace(/,/g, ""));
   return Number.isFinite(n) ? n : def;
 }
 
@@ -47,24 +48,74 @@ function lineCode(line) {
   );
 }
 
+function lineName(line) {
+  return (
+    (line &&
+      (line.accountNombre ||
+        line.accountName ||
+        line.account_nombre ||
+        line.cuenta_nombre)) ??
+    null
+  );
+}
+
+function entryNumber(entry) {
+  return (
+    entry.number ??
+    entry.numero_asiento ??
+    entry.numeroAsiento ??
+    entry.folio ??
+    entry.no ??
+    ""
+  );
+}
+
+function entryConcept(entry) {
+  return (
+    entry.memo ??
+    entry.concepto ??
+    entry.concept ??
+    entry.descripcion ??
+    entry.description ??
+    ""
+  );
+}
+
+function sumEntry(entry) {
+  const lines = Array.isArray(entry.lines) ? entry.lines : [];
+  const debe = lines.reduce((acc, l) => acc + num(l.debit, 0), 0);
+  const haber = lines.reduce((acc, l) => acc + num(l.credit, 0), 0);
+  return { debe, haber };
+}
+
 function mapEntryForUI(entry) {
-  const detalle_asientos = (entry.lines || []).map((l) => ({
+  const lines = Array.isArray(entry.lines) ? entry.lines : [];
+
+  const detalle_asientos = lines.map((l) => ({
     cuenta_codigo: lineCode(l),
+    cuenta_nombre: lineName(l),
     debe: num(l.debit, 0),
     haber: num(l.credit, 0),
     memo: l.memo ?? "",
   }));
 
+  const { debe, haber } = sumEntry(entry);
+
   return {
     id: String(entry._id),
     _id: entry._id,
 
+    numero_asiento: entryNumber(entry),
     asiento_fecha: toYMD(entry.date),
     fecha: entry.date,
 
-    concepto: entry.concept ?? "",
+    concepto: entryConcept(entry),
     source: entry.source ?? "",
     source_id: entry.sourceId ? String(entry.sourceId) : null,
+
+    // Totales por asiento (útil para UI de balanza)
+    debe_total: debe,
+    haber_total: haber,
 
     detalle_asientos,
 
@@ -82,18 +133,23 @@ function flattenDetalles(entries, { cuentaPrefix, cuentaCodigo } = {}) {
     for (const l of e.lines || []) {
       const codigo = lineCode(l);
 
-      if (cuentaPrefix && (!codigo || !String(codigo).startsWith(String(cuentaPrefix)))) continue;
+      if (
+        cuentaPrefix &&
+        (!codigo || !String(codigo).startsWith(String(cuentaPrefix)))
+      )
+        continue;
       if (cuentaCodigo && String(codigo) !== String(cuentaCodigo)) continue;
 
       out.push({
         cuenta_codigo: codigo,
+        cuenta_nombre: lineName(l),
         debe: num(l.debit, 0),
         haber: num(l.credit, 0),
 
         asiento_fecha: asientoFecha,
         asiento_id: String(e._id),
 
-        concepto: e.concept ?? "",
+        concepto: entryConcept(e),
         source: e.source ?? "",
         source_id: e.sourceId ? String(e.sourceId) : null,
 
@@ -104,6 +160,14 @@ function flattenDetalles(entries, { cuentaPrefix, cuentaCodigo } = {}) {
 
   return out;
 }
+
+/**
+ * ✅ (debug) GET /api/contabilidad/ping
+ * Sirve para confirmar que esta ruta está montada en producción.
+ */
+router.get("/ping", ensureAuth, (req, res) => {
+  res.json({ ok: true, route: "contabilidad", user: String(req.user?._id) });
+});
 
 /**
  * ✅ GET /api/contabilidad/detalle-asientos?from=YYYY-MM-DD&to=YYYY-MM-DD
@@ -132,8 +196,12 @@ router.get("/detalle-asientos", ensureAuth, async (req, res) => {
       });
     }
 
-    const cuentaPrefix = req.query.cuenta_prefix ? String(req.query.cuenta_prefix) : null;
-    const cuentaCodigo = req.query.cuenta_codigo ? String(req.query.cuenta_codigo) : null;
+    const cuentaPrefix = req.query.cuenta_prefix
+      ? String(req.query.cuenta_prefix)
+      : null;
+    const cuentaCodigo = req.query.cuenta_codigo
+      ? String(req.query.cuenta_codigo)
+      : null;
 
     const entries = await JournalEntry.find({
       owner,
@@ -162,15 +230,22 @@ router.get("/detalle-asientos", ensureAuth, async (req, res) => {
     });
   } catch (err) {
     console.error("GET /api/contabilidad/detalle-asientos error:", err);
-    return res.status(500).json({ ok: false, message: "Error cargando detalle de asientos" });
+    return res
+      .status(500)
+      .json({ ok: false, message: "Error cargando detalle de asientos" });
   }
 });
 
 /**
  * ✅ GET /api/contabilidad/asientos?from=YYYY-MM-DD&to=YYYY-MM-DD
- * (Útil si después quieres listar pólizas/asientos completos)
+ * Soporta también start/end.
+ *
+ * 🔥 IMPORTANTE: agregamos ALIASES para cubrir naming del prototipo y evitar 404:
+ * - /asientos-balanza
+ * - /asientos_balanza
+ * - /balanza/asientos
  */
-router.get("/asientos", ensureAuth, async (req, res) => {
+async function handleGetAsientos(req, res) {
   try {
     const owner = req.user._id;
 
@@ -193,15 +268,40 @@ router.get("/asientos", ensureAuth, async (req, res) => {
 
     const asientos = entries.map(mapEntryForUI);
 
+    const totalDebe = asientos.reduce((acc, a) => acc + num(a.debe_total, 0), 0);
+    const totalHaber = asientos.reduce(
+      (acc, a) => acc + num(a.haber_total, 0),
+      0
+    );
+    const cuadrado = Math.abs(totalDebe - totalHaber) < 0.01;
+
     return res.json({
       ok: true,
-      data: { asientos },
+      data: {
+        asientos,
+        items: asientos, // alias útil para UIs distintas
+        totalDebe,
+        totalHaber,
+        cuadrado,
+        count: asientos.length,
+      },
       asientos, // compat legacy
+      items: asientos, // compat
+      totalDebe, // compat
+      totalHaber, // compat
+      cuadrado, // compat
+      count: asientos.length, // compat
     });
   } catch (err) {
     console.error("GET /api/contabilidad/asientos error:", err);
     return res.status(500).json({ ok: false, message: "Error cargando asientos" });
   }
-});
+}
+
+router.get(
+  ["/asientos", "/asientos-balanza", "/asientos_balanza", "/balanza/asientos"],
+  ensureAuth,
+  handleGetAsientos
+);
 
 module.exports = router;
