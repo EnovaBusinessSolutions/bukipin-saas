@@ -170,19 +170,10 @@ router.get("/ping", ensureAuth, (req, res) => {
 });
 
 /**
- * ✅ GET /api/contabilidad/detalle-asientos?from=YYYY-MM-DD&to=YYYY-MM-DD
- * Soporta también start/end.
- *
- * Filtros opcionales:
- * - cuenta_prefix=4     -> sólo cuentas que comiencen con "4"
- * - cuenta_codigo=4001  -> sólo una cuenta exacta
- *
- * Devuelve:
- * - resp.data.detalles
- * - resp.detalles
- * - resp.detalle_asientos   (alias legacy)
+ * ✅ Handler reutilizable para detalle-asientos
+ * Necesario porque el frontend está llamando /asientos/detalle (y antes era /detalle-asientos).
  */
-router.get("/detalle-asientos", ensureAuth, async (req, res) => {
+async function handleDetalleAsientos(req, res) {
   try {
     const owner = req.user._id;
 
@@ -229,12 +220,19 @@ router.get("/detalle-asientos", ensureAuth, async (req, res) => {
       detalle_asientos: detalles, // compat legacy
     });
   } catch (err) {
-    console.error("GET /api/contabilidad/detalle-asientos error:", err);
+    console.error("GET /api/contabilidad/*detalle* error:", err);
     return res
       .status(500)
       .json({ ok: false, message: "Error cargando detalle de asientos" });
   }
-});
+}
+
+/**
+ * ✅ GET /api/contabilidad/detalle-asientos?from=YYYY-MM-DD&to=YYYY-MM-DD
+ * ✅ GET /api/contabilidad/asientos/detalle?start=YYYY-MM-DD&end=YYYY-MM-DD   <-- ALIAS NUEVO (para tu frontend)
+ */
+router.get("/detalle-asientos", ensureAuth, handleDetalleAsientos);
+router.get("/asientos/detalle", ensureAuth, handleDetalleAsientos);
 
 /**
  * ✅ GET /api/contabilidad/asientos?from=YYYY-MM-DD&to=YYYY-MM-DD
@@ -294,7 +292,9 @@ async function handleGetAsientos(req, res) {
     });
   } catch (err) {
     console.error("GET /api/contabilidad/asientos error:", err);
-    return res.status(500).json({ ok: false, message: "Error cargando asientos" });
+    return res
+      .status(500)
+      .json({ ok: false, message: "Error cargando asientos" });
   }
 }
 
