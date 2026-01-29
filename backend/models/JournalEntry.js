@@ -54,7 +54,7 @@ const journalLineSchema = new mongoose.Schema(
 
 // =============================
 // ✅ Virtuals de línea para compat UI
-// (la UI suele leer cuenta_codigo / debe / haber)
+// (NO crear virtuals que se llamen igual que paths reales: cuenta_codigo, cuentaCodigo)
 // =============================
 journalLineSchema.virtual("debe").get(function () {
   return Number(this.debit || 0) || 0;
@@ -68,12 +68,6 @@ journalLineSchema.virtual("cuenta").get(function () {
       .toString()
       .trim();
   return c || null;
-});
-journalLineSchema.virtual("cuenta_codigo").get(function () {
-  return this.cuenta || null;
-});
-journalLineSchema.virtual("cuentaCodigo").get(function () {
-  return this.cuenta || null;
 });
 
 const journalEntrySchema = new mongoose.Schema(
@@ -128,9 +122,6 @@ const journalEntrySchema = new mongoose.Schema(
 
         ret.user_id = ret.owner ? String(ret.owner) : null;
 
-        // mantenemos compat (muchas pantallas usan esto)
-        // detalle_asientos y detalles se generan como virtuals abajo
-
         delete ret._id;
         delete ret.__v;
         delete ret.createdAt;
@@ -145,18 +136,6 @@ const journalEntrySchema = new mongoose.Schema(
 // =============================
 // ✅ Virtuals útiles para UI
 // =============================
-journalEntrySchema.virtual("fecha").get(function () {
-  return this.date;
-});
-
-journalEntrySchema.virtual("descripcion").get(function () {
-  return this.concept;
-});
-
-journalEntrySchema.virtual("numero_asiento").get(function () {
-  return this.numeroAsiento;
-});
-
 journalEntrySchema.virtual("total_debe").get(function () {
   const lines = Array.isArray(this.lines) ? this.lines : [];
   return lines.reduce((acc, l) => acc + (Number(l?.debit || 0) || 0), 0);
@@ -171,10 +150,6 @@ journalEntrySchema.virtual("total_haber").get(function () {
  * ✅ CRÍTICO: Virtuals que tu UI espera:
  * - detalle_asientos: [{ cuenta_codigo, cuenta_nombre, debe, haber, memo }]
  * - detalles: [{ cuenta_codigo, cuenta_nombre, descripcion, debe, haber }]
- *
- * OJO: cuenta_nombre aquí va null (porque resolverlo requiere lookup).
- * Tus rutas (como /api/contabilidad/asientos) pueden enriquecerlo con Account,
- * pero este virtual evita que el panel se “rompa” si no lo enriquecen.
  */
 journalEntrySchema.virtual("detalle_asientos").get(function () {
   const lines = Array.isArray(this.lines) ? this.lines : [];
@@ -249,7 +224,7 @@ journalEntrySchema.pre("validate", function (next) {
           line.accountCodigo || line.accountCode || line.cuentaCodigo || line.cuenta_codigo || ""
         ).trim();
 
-        // si no hay code y tampoco accountId -> esto es basura (evitamos guardar y luego “se rompe” UI)
+        // si no hay code y tampoco accountId -> esto es basura
         if (!codeCandidate && !line.accountId) {
           const err = new Error("JournalEntry.lines: cada línea debe tener accountCodigo (o accountId).");
           err.statusCode = 400;
@@ -263,14 +238,13 @@ journalEntrySchema.pre("validate", function (next) {
           if (!line.cuentaCodigo) line.cuentaCodigo = codeCandidate;
           if (!line.cuenta_codigo) line.cuenta_codigo = codeCandidate;
         } else {
-          // si no hay codeCandidate pero sí accountId, al menos limpiamos strings
           if (line.accountCodigo) line.accountCodigo = String(line.accountCodigo || "").trim();
           if (line.accountCode) line.accountCode = String(line.accountCode || "").trim();
           if (line.cuentaCodigo) line.cuentaCodigo = String(line.cuentaCodigo || "").trim();
           if (line.cuenta_codigo) line.cuenta_codigo = String(line.cuenta_codigo || "").trim();
         }
 
-        // 4) normalizar montos (acepta variantes "debe/haber" aunque no estén en schema)
+        // 4) normalizar montos (acepta variantes debe/haber aunque no estén en schema)
         const debit = num(line.debit ?? line.debe, 0);
         const credit = num(line.credit ?? line.haber, 0);
 
