@@ -657,28 +657,46 @@ async function accountIdByCode(owner, code) {
 }
 
 async function buildLine(owner, { code, debit = 0, credit = 0, memo = "" }) {
-  const mode = journalLineMode();
+  const c = String(code ?? "").trim();
+  if (!c) {
+    const err = new Error("buildLine requiere code/codigo válido.");
+    err.statusCode = 400;
+    throw err;
+  }
 
   const base = {
     debit: num(debit, 0),
     credit: num(credit, 0),
     memo: memo || "",
+    // ✅ SIEMPRE escribimos el code en TODAS las variantes comunes
+    accountCodigo: c,
+    accountCode: c,
+    cuenta_codigo: c,
+    cuentaCodigo: c,
   };
 
-  if (mode === "id") {
-    const id = await accountIdByCode(owner, code);
-    if (!id) {
-      const err = new Error(
-        `No existe la cuenta contable con code/codigo="${String(code).trim()}" para este usuario. Asegúrate de que el seed la haya creado.`
-      );
-      err.statusCode = 400;
-      throw err;
-    }
-    return { ...base, accountId: id };
+  // ✅ Si existe la cuenta, guardamos también el ID en variantes comunes
+  const acc = await Account.findOne({
+    owner,
+    $or: [{ code: c }, { codigo: c }],
+  })
+    .select("_id code codigo name nombre")
+    .lean();
+
+  if (acc?._id) {
+    const id = acc._id;
+    return {
+      ...base,
+      accountId: id,
+      cuenta_id: id,
+      account: id,
+    };
   }
 
-  return { ...base, accountCodigo: String(code).trim() };
+  // Si no existe la cuenta, dejamos al menos el código (para que NO quede null)
+  return base;
 }
+
 
 /**
  * ✅ Mapper JournalEntry → UI (soporta líneas por code o por accountId)
@@ -1939,14 +1957,19 @@ router.post("/", ensureAuth, async (req, res) => {
     const numeroAsiento = await nextJournalNumber(owner, tx.fecha);
 
     const entry = await JournalEntry.create({
-      owner,
-      date: tx.fecha,
-      concept: `Ingreso: ${tx.descripcion}`,
-      source: "ingreso",
-      sourceId: tx._id,
-      lines,
-      numeroAsiento,
-    });
+  owner,
+  date: tx.fecha,
+  concept: `Ingreso: ${tx.descripcion}`,
+  source: "ingreso",
+  sourceId: tx._id,
+
+  // ✅ guardamos en ambos nombres (según el schema real)
+  lines,
+  detalle_asientos: lines,
+
+  numeroAsiento,
+});
+
 
     // espejo en la tx
     try {
