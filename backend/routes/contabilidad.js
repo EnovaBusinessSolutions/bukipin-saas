@@ -161,6 +161,16 @@ function flattenDetalles(entries, { cuentaPrefix, cuentaCodigo } = {}) {
   return out;
 }
 
+// Naturaleza contable para saldos (mismo criterio que el frontend)
+function saldoPorNaturaleza(codigo, debe, haber) {
+  const d = String(codigo || "").charAt(0);
+  // Deudora: Activos(1), Costos(5), Gastos(6)
+  if (["1", "5", "6"].includes(d)) return debe - haber;
+  // Acreedora: Pasivos(2), Capital(3), Ingresos(4)
+  if (["2", "3", "4"].includes(d)) return haber - debe;
+  return debe - haber;
+}
+
 /**
  * ✅ (debug) GET /api/contabilidad/ping
  * Sirve para confirmar que esta ruta está montada en producción.
@@ -257,6 +267,10 @@ async function handleGetAsientos(req, res) {
       });
     }
 
+    // Día anterior al inicio (para saldo inicial real)
+    const prevEnd = new Date(start.getTime() - 1);
+
+    // 1) Asientos del periodo (para UI actual: lista + modal)
     const entries = await JournalEntry.find({
       owner,
       date: { $gte: start, $lte: end },
@@ -273,6 +287,113 @@ async function handleGetAsientos(req, res) {
     );
     const cuadrado = Math.abs(totalDebe - totalHaber) < 0.01;
 
+    // =========================
+    // 2) SALDOS POR CUENTA (E2E)
+    // saldo_inicial: acumulado hasta prevEnd
+    // debe_total/haber_total: del periodo
+    // saldo_final: saldo_inicial + neto del periodo (por naturaleza)
+    // =========================
+
+    // Código de cuenta robusto dentro de aggregate
+    const accountCodeExpr = {
+      $ifNull: [
+        "$lines.accountCodigo",
+        { $ifNull: ["$lines.accountCode", "$lines.account_codigo"] },
+      ],
+    };
+
+    // HISTÓRICO: <= prevEnd
+    const histAgg = await JournalEntry.aggregate([
+      { $match: { owner, date: { $lte: prevEnd } } },
+      { $unwind: "$lines" },
+      {
+        $project: {
+          cuenta_codigo: accountCodeExpr,
+          debit: { $toDouble: { $ifNull: ["$lines.debit", 0] } },
+          credit: { $toDouble: { $ifNull: ["$lines.credit", 0] } },
+        },
+      },
+      { $match: { cuenta_codigo: { $ne: null, $ne: "" } } },
+      {
+        $group: {
+          _id: "$cuenta_codigo",
+          debe: { $sum: "$debit" },
+          haber: { $sum: "$credit" },
+        },
+      },
+    ]);
+
+    // PERIODO: start..end
+    const perAgg = await JournalEntry.aggregate([
+      { $match: { owner, date: { $gte: start, $lte: end } } },
+      { $unwind: "$lines" },
+      {
+        $project: {
+          cuenta_codigo: accountCodeExpr,
+          debit: { $toDouble: { $ifNull: ["$lines.debit", 0] } },
+          credit: { $toDouble: { $ifNull: ["$lines.credit", 0] } },
+        },
+      },
+      { $match: { cuenta_codigo: { $ne: null, $ne: "" } } },
+      {
+        $group: {
+          _id: "$cuenta_codigo",
+          debe_total: { $sum: "$debit" },
+          haber_total: { $sum: "$credit" },
+        },
+      },
+    ]);
+
+    const histMap = new Map();
+    for (const r of histAgg || []) {
+      const codigo = String(r._id || "").trim();
+      if (!codigo) continue;
+      histMap.set(codigo, { debe: num(r.debe, 0), haber: num(r.haber, 0) });
+    }
+
+    const perMap = new Map();
+    for (const r of perAgg || []) {
+      const codigo = String(r._id || "").trim();
+      if (!codigo) continue;
+      perMap.set(codigo, {
+        debe_total: num(r.debe_total, 0),
+        haber_total: num(r.haber_total, 0),
+      });
+    }
+
+    const allCodes = new Set([
+      ...Array.from(histMap.keys()),
+      ...Array.from(perMap.keys()),
+    ]);
+
+    const saldosPorCuenta = {};
+    let saldoInicialTotal = 0;
+    let saldoFinalTotal = 0;
+
+    for (const codigo of allCodes) {
+      const h = histMap.get(codigo) || { debe: 0, haber: 0 };
+      const p = perMap.get(codigo) || { debe_total: 0, haber_total: 0 };
+
+      const saldo_inicial = saldoPorNaturaleza(codigo, h.debe, h.haber);
+      const neto_periodo = saldoPorNaturaleza(
+        codigo,
+        p.debe_total,
+        p.haber_total
+      );
+      const saldo_final = saldo_inicial + neto_periodo;
+
+      saldosPorCuenta[codigo] = {
+        cuenta_codigo: codigo,
+        saldo_inicial,
+        debe_total: p.debe_total,
+        haber_total: p.haber_total,
+        saldo_final,
+      };
+
+      saldoInicialTotal += saldo_inicial;
+      saldoFinalTotal += saldo_final;
+    }
+
     return res.json({
       ok: true,
       data: {
@@ -282,13 +403,25 @@ async function handleGetAsientos(req, res) {
         totalHaber,
         cuadrado,
         count: asientos.length,
+
+        // ✅ NUEVO E2E (NO rompe lo existente)
+        saldosPorCuenta,
+        saldoInicialTotal,
+        saldoFinalTotal,
       },
-      asientos, // compat legacy
-      items: asientos, // compat
-      totalDebe, // compat
-      totalHaber, // compat
-      cuadrado, // compat
-      count: asientos.length, // compat
+
+      // compat legacy
+      asientos,
+      items: asientos,
+      totalDebe,
+      totalHaber,
+      cuadrado,
+      count: asientos.length,
+
+      // compat extra
+      saldosPorCuenta,
+      saldoInicialTotal,
+      saldoFinalTotal,
     });
   } catch (err) {
     console.error("GET /api/contabilidad/asientos error:", err);
