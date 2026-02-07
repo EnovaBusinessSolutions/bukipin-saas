@@ -32,32 +32,10 @@ function pickDateField() {
   if (p.date) return "date";
   if (p.fecha) return "fecha";
   if (p.entryDate) return "entryDate";
+  if (p.asiento_fecha) return "asiento_fecha";
+  if (p.asientoFecha) return "asientoFecha";
+  if (p.asientos_fecha) return "asientos_fecha";
   return "createdAt";
-}
-
-async function resolveLineAccountCode(line) {
-  const code =
-    line?.accountCodigo ??
-    line?.account_code ??
-    line?.cuenta_codigo ??
-    line?.cuentaCodigo ??
-    line?.codigo ??
-    null;
-
-  if (code) return String(code).trim();
-
-  const accountId =
-    line?.accountId ??
-    line?.account_id ??
-    line?.account ??
-    line?.cuentaId ??
-    line?.cuenta_id ??
-    null;
-
-  if (!accountId) return null;
-
-  const acc = await Account.findById(accountId).lean();
-  return acc?.code ? String(acc.code).trim() : null;
 }
 
 function lineDebit(line) {
@@ -73,7 +51,9 @@ function entryLines(entry) {
 
 /**
  * GET /api/flujo-efectivo?start=YYYY-MM-DD&end=YYYY-MM-DD
- * También soporta /api/flujo-efectivo/operativo?start=...&end=...
+ * GET /api/flujo-efectivo/operativo?start=...&end=...
+ * GET /api/flujo-efectivo/ejecutivo?start=...&end=...
+ * GET /api/flujo-efectivo/analitico?start=...&end=...
  *
  * Calcula:
  * - saldo inicial efectivo/bancos (movimientos antes de start)
@@ -119,16 +99,41 @@ async function handle(req, res) {
       JournalEntry.find(periodFilter).lean(),
     ]);
 
-    // Códigos “caja/bancos” (según tu memoria del proyecto)
+    // Códigos “caja/bancos” (según el proyecto bukipin)
     const COD_EFECTIVO = "1001";
     const COD_BANCOS = "1002";
 
-    async function sumFor(entries) {
-      let iniE = 0, iniB = 0;
-      let entE = 0, salE = 0;
-      let entB = 0, salB = 0;
+    // Cache para no pegarle a Mongo por cada línea
+    const accountCodeById = new Map(); // accountId -> code (string|null)
 
-      return { iniE, iniB, entE, salE, entB, salB };
+    async function resolveLineAccountCode(line) {
+      const code =
+        line?.accountCodigo ??
+        line?.account_code ??
+        line?.cuenta_codigo ??
+        line?.cuentaCodigo ??
+        line?.codigo ??
+        null;
+
+      if (code) return String(code).trim();
+
+      const accountId =
+        line?.accountId ??
+        line?.account_id ??
+        line?.account ??
+        line?.cuentaId ??
+        line?.cuenta_id ??
+        null;
+
+      if (!accountId) return null;
+
+      const key = String(accountId);
+      if (accountCodeById.has(key)) return accountCodeById.get(key);
+
+      const acc = await Account.findById(accountId).lean();
+      const resolved = acc?.code ? String(acc.code).trim() : null;
+      accountCodeById.set(key, resolved);
+      return resolved;
     }
 
     // Saldo inicial
@@ -150,14 +155,20 @@ async function handle(req, res) {
     }
 
     // Periodo: entradas/salidas + lista de movimientos
-    let entradasE = 0, salidasE = 0;
-    let entradasB = 0, salidasB = 0;
+    let entradasE = 0,
+      salidasE = 0;
+    let entradasB = 0,
+      salidasB = 0;
 
-    const movimientos = []; // para “Resumen Transacciones” si lo ocupas
+    const movimientos = []; // “Resumen Transacciones”
 
     for (const e of periodEntries) {
-      const eDate = e?.[dateField] ? new Date(e[dateField]) : null;
-      const fecha = eDate && !Number.isNaN(eDate.getTime()) ? eDate.toISOString().slice(0, 10) : null;
+      const rawDate = e?.[dateField] ?? e?.fecha ?? e?.asiento_fecha ?? e?.asientoFecha ?? e?.createdAt ?? null;
+      const eDate = rawDate ? new Date(rawDate) : null;
+      const fecha =
+        eDate && !Number.isNaN(eDate.getTime())
+          ? eDate.toISOString().slice(0, 10)
+          : null;
 
       for (const line of entryLines(e)) {
         const code = await resolveLineAccountCode(line);
@@ -203,9 +214,17 @@ async function handle(req, res) {
 
     const consolidadoFinal = saldoFinalE + saldoFinalB;
 
+    // detectamos "view" por path para que el front pueda usarlo si quiere
+    const path = String(req.path || "/");
+    const view =
+      path.includes("ejecutivo") ? "ejecutivo" :
+      path.includes("analitico") ? "analitico" :
+      "operativo";
+
     return res.json({
       ok: true,
       data: {
+        view,
         range: {
           start: req.query.start,
           end: req.query.end,
@@ -224,9 +243,10 @@ async function handle(req, res) {
         },
         consolidado: {
           saldoFinal: consolidadoFinal,
-          verificado: true, // si luego quieres validar vs balanza, aquí se conecta
+          verificado: true, // luego podemos validarlo contra balanza si lo desean
         },
         movimientos,
+        sinDatos: periodEntries.length === 0,
       },
     });
   } catch (err) {
@@ -240,7 +260,12 @@ async function handle(req, res) {
 }
 
 router.get("/", ensureAuth, handle);
-// compat con tu implementación previa
+
+// compat: lo que ya tenías
 router.get("/operativo", ensureAuth, handle);
+
+// FIX DEL 404: rutas que el frontend ya está pidiendo
+router.get("/ejecutivo", ensureAuth, handle);
+router.get("/analitico", ensureAuth, handle);
 
 module.exports = router;
