@@ -387,14 +387,9 @@ function mapTxForUI(tx) {
 }
 
 // =========================
-// Endpoints
+// Handlers compartidos (para aliases limpios)
 // =========================
-
-/**
- * ✅ ESTE es el endpoint que está pidiendo tu frontend en el panel:
- * GET /api/cxc/ingresos?pendientes=1&order=created_at_desc&limit=2000
- */
-router.get("/ingresos", ensureAuth, async (req, res) => {
+async function handleListIngresos(req, res) {
   try {
     const owner = req.user._id;
     const limit = Math.min(5000, Number(req.query.limit || 2000));
@@ -422,13 +417,9 @@ router.get("/ingresos", ensureAuth, async (req, res) => {
     console.error("GET /api/cxc/ingresos error:", err);
     return res.status(500).json({ ok: false, message: "Error cargando CxC (ingresos)" });
   }
-});
+}
 
-/**
- * ✅ Detalle por ID (útil para modal/detalle si el front lo usa)
- * GET /api/cxc/ingresos/:id
- */
-router.get("/ingresos/:id", ensureAuth, async (req, res) => {
+async function handleGetIngresoById(req, res) {
   try {
     const owner = req.user._id;
     const { id } = req.params;
@@ -452,16 +443,42 @@ router.get("/ingresos/:id", ensureAuth, async (req, res) => {
     console.error("GET /api/cxc/ingresos/:id error:", err);
     return res.status(500).json({ ok: false, message: "Error cargando el detalle del ingreso" });
   }
-});
+}
+
+// =========================
+// Endpoints
+// =========================
 
 /**
- * ✅ Compat/debug: antes tenías /detalle. Lo dejamos y lo hacemos alias.
+ * ✅ ESTE es el endpoint que está pidiendo tu frontend en el panel:
+ * GET /api/cxc/ingresos?pendientes=1&order=created_at_desc&limit=2000
+ */
+router.get("/ingresos", ensureAuth, handleListIngresos);
+
+/**
+ * ✅ Detalle por ID (útil para modal/detalle si el front lo usa)
+ * GET /api/cxc/ingresos/:id
+ */
+router.get("/ingresos/:id", ensureAuth, handleGetIngresoById);
+
+/**
+ * ✅ Alias limpio (sin router.handle hacks)
  * GET /api/cxc/detalle?pendientes=1&limit=2000
  */
-router.get("/detalle", ensureAuth, async (req, res) => {
-  // alias directo a /ingresos (misma lógica)
-  req.url = "/ingresos";
-  return router.handle(req, res);
+router.get("/detalle", ensureAuth, handleListIngresos);
+
+/**
+ * ✅ FIX CRÍTICO: este endpoint te estaba dando 404 en el front
+ * GET /api/cxc/ventas-activos?pendientes=1
+ *
+ * Por ahora lo devolvemos vacío (para NO romper el panel).
+ * Cuando tengas el modelo/colección real de "ventas de activos", aquí lo conectamos.
+ */
+router.get("/ventas-activos", ensureAuth, async (req, res) => {
+  // Si en el futuro quieres conectarlo:
+  // - define modelo (ej. AssetSaleTransaction)
+  // - aplica misma lógica de pendientes y mapTxForUI con un mapper similar
+  return res.json({ ok: true, data: [], items: [] });
 });
 
 /**
@@ -663,6 +680,19 @@ router.post("/registrar-pago", ensureAuth, async (req, res) => {
     const status = err?.statusCode || 500;
     return res.status(status).json({ ok: false, message: err?.message || "Error registrando cobro" });
   }
+});
+
+/**
+ * ✅ ALIAS opcional para compat:
+ * POST /api/cxc/cuentas-por-cobrar/registrar-pago
+ *
+ * OJO: esto solo sirve si montas este router en "/api" (no en "/api/cxc").
+ * Si lo montas en "/api/cxc", entonces el path sería "/api/cxc/cuentas-por-cobrar/registrar-pago".
+ */
+router.post("/cuentas-por-cobrar/registrar-pago", ensureAuth, (req, res, next) => {
+  // reusa el handler real
+  req.url = "/registrar-pago";
+  return router.handle(req, res, next);
 });
 
 module.exports = router;
