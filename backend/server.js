@@ -67,7 +67,6 @@ app.use("/api/asientos", require("./routes/asientos"));
 app.use("/api/productos-egresos", require("./routes/productosEgresos"));
 app.use("/api/flujo-efectivo", require("./routes/flujoEfectivo"));
 
-
 // ✅ NUEVO: Proveedores (evita 404 del panel de egresos)
 app.use("/api/proveedores", require("./routes/proveedores"));
 
@@ -76,12 +75,41 @@ app.use("/api/financiamientos", require("./routes/financiamientos"));
 
 app.use("/api/egresos", require("./routes/egresos"));
 
-// ✅ Nota: tu UI está pidiendo /api/asientos/detalle?cuentas=1001,1002
-// Eso se resuelve en backend/routes/asientos.js (agregaremos endpoint "detalle" en el siguiente paso).
+// ==============================
+// ✅ CxC / Cobros-Pagos (montaje real para evitar 404 en el panel)
+// ==============================
 
+// Historial de cobros/pagos (panel CxC suele pedir: /api/cobros-pagos/historial?... )
+app.use("/api/cobros-pagos", require("./routes/cobrosPagos"));
+
+// Endpoints canónicos de CxC (y alias de compat para frontend actual)
+app.use("/api/cxc", require("./routes/cxc"));
+app.use("/api/cuentas-por-cobrar", require("./routes/cxc"));
+
+// ==============================
 // ✅ Placeholders temporales (para que el dashboard no reviente con 404 mientras migras)
 // OJO: deben ir al final de /api para no “pisar” rutas reales.
+// ==============================
 app.use("/api", require("./routes/placeholders"));
+
+// ✅ 404 SOLO para /api (útil para debug rápido)
+app.use("/api", (req, res) => {
+  return res.status(404).json({
+    ok: false,
+    message: "Ruta API no encontrada",
+    path: req.originalUrl,
+  });
+});
+
+// ✅ Handler central de errores (JSON consistente)
+app.use((err, req, res, _next) => {
+  const status = err?.statusCode || err?.status || 500;
+  console.error("🔥 API Error:", err);
+  return res.status(status).json({
+    ok: false,
+    message: err?.message || "Error interno del servidor",
+  });
+});
 
 // ==============================
 // ✅ SPAs
@@ -99,7 +127,7 @@ app.get("/dashboard*", (req, res) => {
   res.sendFile(path.join(publicRoot, "dashboard", "index.html"));
 });
 
-// Catch-all
+// Catch-all (no API)
 app.use((req, res) => res.status(404).send("Ruta no encontrada"));
 
 app.listen(PORT, () => console.log(`🚀 Bukipin backend escuchando en puerto ${PORT}`));

@@ -16,7 +16,12 @@ try {
 const TZ_OFFSET_MINUTES = Number(process.env.APP_TZ_OFFSET_MINUTES ?? -360);
 
 function num(v, def = 0) {
-  const n = Number(v);
+  if (v === null || typeof v === "undefined") return def;
+  if (typeof v === "number") return Number.isFinite(v) ? v : def;
+  const s = String(v).trim();
+  if (!s) return def;
+  const cleaned = s.replace(/[$,\s]/g, "");
+  const n = Number(cleaned);
   return Number.isFinite(n) ? n : def;
 }
 
@@ -67,9 +72,7 @@ function fixFechaWithCreatedAt(tx) {
 }
 
 async function getAccountNameMap(owner, codes) {
-  const unique = Array.from(
-    new Set((codes || []).filter(Boolean).map((c) => String(c).trim()))
-  );
+  const unique = Array.from(new Set((codes || []).filter(Boolean).map((c) => String(c).trim())));
   if (!unique.length) return {};
 
   const rows = await Account.find({
@@ -116,12 +119,7 @@ async function attachAccountInfo(owner, items) {
 
     if (!code) return it;
 
-    const nombre =
-      nameMap[code] ||
-      it.cuenta_nombre ||
-      it.cuenta_principal_nombre ||
-      null;
-
+    const nombre = nameMap[code] || it.cuenta_nombre || it.cuenta_principal_nombre || null;
     const display = nombre ? `${code} - ${nombre}` : code;
 
     return {
@@ -227,6 +225,9 @@ function mapTxCompat(tx) {
 
   const fechaFinal = fechaFixed || tx.fecha || null;
 
+  const metodoPago = tx.metodoPago ?? tx.metodo_pago ?? null;
+  const tipoPago = tx.tipoPago ?? tx.tipo_pago ?? null;
+
   return {
     ...tx,
     id: String(tx._id ?? tx.id),
@@ -250,8 +251,10 @@ function mapTxCompat(tx) {
     saldo_pendiente: saldoPendiente,
     pendiente: saldoPendiente,
 
-    metodo_pago: tx.metodoPago ?? tx.metodo_pago ?? null,
-    tipo_pago: tx.tipoPago ?? tx.tipo_pago ?? null,
+    metodoPago,
+    tipoPago,
+    metodo_pago: metodoPago,
+    tipo_pago: tipoPago,
 
     cuentaCodigo: cuentaCodigo ?? tx.cuentaCodigo ?? null,
     cuenta_codigo: cuentaCodigo ?? tx.cuenta_codigo ?? null,
@@ -261,7 +264,68 @@ function mapTxCompat(tx) {
   };
 }
 
+function parseOrder(order) {
+  const o = String(order || "").trim().toLowerCase();
+
+  // defaults pensados para CxC: último creado primero
+  if (!o) return { createdAt: -1 };
+
+  if (o === "created_at_desc") return { createdAt: -1 };
+  if (o === "created_at_asc") return { createdAt: 1 };
+
+  // fecha + fallback createdAt
+  if (o === "fecha_desc") return { fecha: -1, createdAt: -1 };
+  if (o === "fecha_asc") return { fecha: 1, createdAt: 1 };
+
+  // compat por si llega algo raro
+  return { createdAt: -1 };
+}
+
 /**
+ * GET /api/transacciones/ingresos?include_all=true&order=created_at_desc&limit=2000&pendientes=1
+ */
+router.get("/ingresos", ensureAuth, async (req, res) => {
+  try {
+    const owner = req.user._id;
+
+    const limit = Math.min(5000, Number(req.query.limit || 2000));
+    const order = parseOrder(req.query.order);
+
+    const includeAll =
+      String(req.query.include_all ?? "").toLowerCase() === "true" ||
+      String(req.query.includeAll ?? "").toLowerCase() === "true";
+
+    const pendientesFlag =
+      String(req.query.pendientes ?? "").toLowerCase() === "1" ||
+      String(req.query.pendientes ?? "").toLowerCase() === "true";
+
+    const query = { owner };
+
+    if (!includeAll || pendientesFlag) {
+      query.$or = [
+        { saldoPendiente: { $gt: 0 } },
+        { saldo_pendiente: { $gt: 0 } },
+        { monto_pendiente: { $gt: 0 } },
+      ];
+    }
+
+    const rows = await IncomeTransaction.find(query).sort(order).limit(limit).lean();
+
+    let items = rows.map(mapTxCompat);
+    items = await attachAccountInfo(owner, items);
+    items = await attachClientInfo(owner, items);
+
+    return res.json({ ok: true, data: items, items });
+  } catch (err) {
+    console.error("GET /api/transacciones/ingresos error:", err);
+    return res.status(500).json({ ok: false, message: "Error cargando transacciones de ingresos" });
+  }
+});
+
+/**
+ * ✅ IMPORTANTE: esta ruta DEBE ir ANTES de /ingresos/:id
+ * porque si no, "/ingresos/recientes" se interpreta como id="recientes".
+ *
  * GET /api/transacciones/ingresos/recientes?limit=1000
  */
 router.get("/ingresos/recientes", ensureAuth, async (req, res) => {
@@ -281,10 +345,39 @@ router.get("/ingresos/recientes", ensureAuth, async (req, res) => {
     return res.json({ ok: true, data: items, items });
   } catch (err) {
     console.error("GET /api/transacciones/ingresos/recientes error:", err);
-    return res.status(500).json({
-      ok: false,
-      message: "Error cargando transacciones recientes",
-    });
+    return res.status(500).json({ ok: false, message: "Error cargando transacciones recientes" });
+  }
+});
+
+/**
+ * GET /api/transacciones/ingresos/:id
+ */
+router.get("/ingresos/:id", ensureAuth, async (req, res) => {
+  try {
+    const owner = req.user._id;
+    const { id } = req.params;
+
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({ ok: false, message: "ID inválido" });
+    }
+
+    const row = await IncomeTransaction.findOne({
+      owner,
+      _id: new mongoose.Types.ObjectId(id),
+    }).lean();
+
+    if (!row) {
+      return res.status(404).json({ ok: false, message: "Transacción no encontrada" });
+    }
+
+    let item = mapTxCompat(row);
+    item = (await attachAccountInfo(owner, [item]))[0];
+    item = (await attachClientInfo(owner, [item]))[0];
+
+    return res.json({ ok: true, data: item, item });
+  } catch (err) {
+    console.error("GET /api/transacciones/ingresos/:id error:", err);
+    return res.status(500).json({ ok: false, message: "Error cargando el detalle de la transacción" });
   }
 });
 

@@ -84,7 +84,14 @@ function isObjectId(v) {
 }
 
 function pickEntryDate(entry) {
-  return entry?.date ?? entry?.fecha ?? entry?.entryDate ?? entry?.createdAt ?? entry?.created_at ?? null;
+  return (
+    entry?.date ??
+    entry?.fecha ??
+    entry?.entryDate ??
+    entry?.createdAt ??
+    entry?.created_at ??
+    null
+  );
 }
 
 function pickEntryNumero(entry) {
@@ -96,7 +103,7 @@ function pickEntryConcept(entry) {
 }
 
 /**
- * ✅ NUEVO: detecta si un path del schema es ObjectId
+ * ✅ detecta si un path del schema es ObjectId
  * (para evitar CastError metiendo strings en $in)
  */
 function pathIsObjectId(model, path) {
@@ -104,8 +111,7 @@ function pathIsObjectId(model, path) {
     const p = model?.schema?.paths?.[path];
     if (!p) return false;
     const inst = String(p.instance || "").toLowerCase();
-    if (inst === "objectid" || inst === "objectid") return true;
-    // fallback por si instance viene raro
+    if (inst === "objectid") return true;
     const optType = p.options?.type;
     return optType === mongoose.Schema.Types.ObjectId;
   } catch {
@@ -114,7 +120,7 @@ function pathIsObjectId(model, path) {
 }
 
 /**
- * ✅ NUEVO: normaliza ids cogs_*
+ * ✅ normaliza ids cogs_*
  * cogs_<journalEntryId> => <journalEntryId>
  */
 function normalizeCogsId(raw) {
@@ -138,6 +144,7 @@ async function ensureNumeroAsiento(owner, entry) {
 
     const dateObj = pickEntryDate(entry) ? new Date(pickEntryDate(entry)) : new Date();
     const year = Number.isFinite(dateObj.getTime()) ? dateObj.getFullYear() : new Date().getFullYear();
+
     const key = `journal-${year}`;
 
     const doc = await Counter.findOneAndUpdate(
@@ -177,7 +184,6 @@ async function getAccountNameMap(owner, codes) {
   const unique = Array.from(new Set((codes || []).filter(Boolean).map((c) => String(c).trim())));
   if (!unique.length) return {};
 
-  // ✅ soportar code o codigo
   const rows = await Account.find({
     owner,
     $or: [{ code: { $in: unique } }, { codigo: { $in: unique } }],
@@ -195,7 +201,7 @@ async function getAccountNameMap(owner, codes) {
 }
 
 /**
- * ✅ NUEVO: Mapa por CODE y por ID (soporta code/codigo)
+ * ✅ Mapa por CODE y por ID (soporta code/codigo)
  * ✅ FIX: $or plano (evita $or anidado dentro de $or)
  */
 async function getAccountMaps(owner, rawLines) {
@@ -237,9 +243,7 @@ async function getAccountMaps(owner, rawLines) {
   }
 
   const uniqueCodes = Array.from(new Set(codes.filter(Boolean)));
-  const uniqueIds = Array.from(new Set(ids.map((x) => String(x)))).map(
-    (x) => new mongoose.Types.ObjectId(x)
-  );
+  const uniqueIds = Array.from(new Set(ids.map((x) => String(x)))).map((x) => new mongoose.Types.ObjectId(x));
 
   if (!uniqueCodes.length && !uniqueIds.length) {
     return { byCode, byId };
@@ -271,7 +275,7 @@ async function getAccountMaps(owner, rawLines) {
 }
 
 /**
- * ✅ UI mapper (igual al tuyo, solo con mapas más robustos)
+ * ✅ UI mapper
  */
 function mapEntryForUI(entry, accountMapsOrNameMap = {}) {
   const byCode = accountMapsOrNameMap?.byCode ? accountMapsOrNameMap.byCode : accountMapsOrNameMap;
@@ -446,15 +450,20 @@ router.get("/detalle", ensureAuth, async (req, res) => {
     if (!codes.length) {
       const rows = await Account.find({
         owner,
-        $or: [{ code: /^50/ }, { code: /^51/ }, { code: /^52/ }, { codigo: /^50/ }, { codigo: /^51/ }, { codigo: /^52/ }],
+        $or: [
+          { code: /^50/ },
+          { code: /^51/ },
+          { code: /^52/ },
+          { codigo: /^50/ },
+          { codigo: /^51/ },
+          { codigo: /^52/ },
+        ],
       })
         .select("code codigo")
         .lean();
 
       codes = Array.from(
-        new Set((rows || [])
-          .map((r) => String(r.code ?? r.codigo ?? "").trim())
-          .filter(Boolean))
+        new Set((rows || []).map((r) => String(r.code ?? r.codigo ?? "").trim()).filter(Boolean))
       );
     }
 
@@ -583,7 +592,8 @@ router.get("/", ensureAuth, async (req, res) => {
 
     const start = parseYMD(req.query.start);
     const end = parseYMD(req.query.end);
-    const includeDetalles = String(req.query.include_detalles || req.query.includeDetalles || "0").trim() === "1";
+    const includeDetalles =
+      String(req.query.include_detalles || req.query.includeDetalles || "0").trim() === "1";
     const wrap = String(req.query.wrap || "").trim() === "1";
 
     const limitRaw = Number(req.query.limit ?? 200);
@@ -644,16 +654,24 @@ router.get("/", ensureAuth, async (req, res) => {
 async function handleByNumero(req, res) {
   try {
     const owner = req.user._id;
-    const numero = String(req.query.numero_asiento ?? req.query.numeroAsiento ?? req.query.numero ?? "").trim();
+    const numero = String(
+      req.query.numero_asiento ?? req.query.numeroAsiento ?? req.query.numero ?? ""
+    ).trim();
 
     if (!numero) {
-      return res.status(400).json({ ok: false, error: "VALIDATION", message: "numero_asiento es requerido" });
+      return res
+        .status(400)
+        .json({ ok: false, error: "VALIDATION", message: "numero_asiento es requerido" });
     }
 
     let asiento =
-      (await JournalEntry.findOne({ owner, numeroAsiento: numero }).sort({ createdAt: -1 }).lean()) ||
+      (await JournalEntry.findOne({ owner, numeroAsiento: numero })
+        .sort({ createdAt: -1 })
+        .lean()) ||
       (await JournalEntry.findOne({ owner, numero: numero }).sort({ createdAt: -1 }).lean()) ||
-      (await JournalEntry.findOne({ owner, numero_asiento: numero }).sort({ createdAt: -1 }).lean());
+      (await JournalEntry.findOne({ owner, numero_asiento: numero })
+        .sort({ createdAt: -1 })
+        .lean());
 
     if (!asiento) return res.status(404).json({ ok: false, error: "NOT_FOUND" });
 
@@ -689,10 +707,11 @@ router.get("/by-ref", ensureAuth, async (req, res) => {
 });
 
 /**
- * ✅ CLAVE:
- * GET /api/asientos/by-transaccion?source=ingreso|egreso|inventario|...&id=XXXXXXXX
+ * ✅ Handler central para:
+ * GET /api/asientos/by-transaccion?source=...&id=...
+ * (lo reutilizamos para los aliases de CxC)
  */
-router.get("/by-transaccion", ensureAuth, async (req, res) => {
+async function handleByTransaccion(req, res) {
   try {
     let { source, id } = req.query;
     source = String(source || "").trim();
@@ -704,8 +723,7 @@ router.get("/by-transaccion", ensureAuth, async (req, res) => {
 
     const owner = req.user._id;
 
-    // ✅ 0) SOPORTE COGS:
-    // si viene cogs_<journalEntryId>, resolvemos directo por _id del JournalEntry
+    // ✅ 0) SOPORTE COGS: cogs_<journalEntryId>
     if (String(id).toLowerCase().startsWith("cogs_")) {
       const jeId = normalizeCogsId(id);
       if (!isObjectId(jeId)) {
@@ -722,7 +740,8 @@ router.get("/by-transaccion", ensureAuth, async (req, res) => {
       const accountMaps = await getAccountMaps(owner, rawLines);
       const asientoUI = mapEntryForUI(asiento, accountMaps);
 
-      const numeroAsiento = asientoUI.numeroAsiento || asientoUI.numero_asiento || pickEntryNumero(asiento) || null;
+      const numeroAsiento =
+        asientoUI.numeroAsiento || asientoUI.numero_asiento || pickEntryNumero(asiento) || null;
 
       return res.json({
         ok: true,
@@ -744,7 +763,6 @@ router.get("/by-transaccion", ensureAuth, async (req, res) => {
     const source_idIsObj = pathIsObjectId(JournalEntry, "source_id");
     const transaccion_idIsObj = pathIsObjectId(JournalEntry, "transaccion_id");
 
-    // Para campos ObjectId SOLO usamos ObjectId; para otros, usamos string y opcional ObjectId
     const inFor = (isObjPath) => {
       if (isObjPath) return oid ? [oid] : [];
       return oid ? [idStr, oid] : [idStr];
@@ -776,18 +794,24 @@ router.get("/by-transaccion", ensureAuth, async (req, res) => {
 
     let asiento = null;
 
-    // 2) Buscar por source + ids (solo si hay candidatos válidos)
+    // 2) Buscar por source + ids
     if (sourceAliases.size) {
       const srcList = Array.from(sourceAliases);
 
       if (sourceIdCandidates.length) {
-        asiento = (await findBy({ owner, source: { $in: srcList }, sourceId: { $in: sourceIdCandidates } })) || asiento;
+        asiento =
+          (await findBy({ owner, source: { $in: srcList }, sourceId: { $in: sourceIdCandidates } })) ||
+          asiento;
       }
       if (!asiento && transaccionIdCandidates.length) {
-        asiento = (await findBy({ owner, source: { $in: srcList }, transaccionId: { $in: transaccionIdCandidates } })) || asiento;
+        asiento =
+          (await findBy({ owner, source: { $in: srcList }, transaccionId: { $in: transaccionIdCandidates } })) ||
+          asiento;
       }
       if (!asiento && source_idCandidates.length) {
-        asiento = (await findBy({ owner, source: { $in: srcList }, source_id: { $in: source_idCandidates } })) || asiento;
+        asiento =
+          (await findBy({ owner, source: { $in: srcList }, source_id: { $in: source_idCandidates } })) ||
+          asiento;
       }
 
       if (!asiento) {
@@ -814,9 +838,11 @@ router.get("/by-transaccion", ensureAuth, async (req, res) => {
       }
     }
 
-    // 4) ✅ ESPECIAL INVENTARIO: si no encontró asiento, resolver desde InventoryMovement -> journalEntryId/asientoId
+    // 4) ✅ ESPECIAL INVENTARIO: resolver desde InventoryMovement -> journalEntryId/asientoId
     if (!asiento && InventoryMovement && isObjectId(id)) {
-      const mov = await InventoryMovement.findOne({ owner, _id: new mongoose.Types.ObjectId(id) }).lean().catch(() => null);
+      const mov = await InventoryMovement.findOne({ owner, _id: new mongoose.Types.ObjectId(id) })
+        .lean()
+        .catch(() => null);
 
       if (mov) {
         const jeId =
@@ -832,7 +858,6 @@ router.get("/by-transaccion", ensureAuth, async (req, res) => {
           asiento = await findBy({ owner, _id: new mongoose.Types.ObjectId(String(jeId)) });
         }
 
-        // Si no hay id directo, intentar por source/sourceId del movimiento
         if (!asiento) {
           const movSrc = String(mov.source || "").trim().toLowerCase();
           const movSid = mov.sourceId ?? mov.source_id ?? mov.transaccionId ?? mov.transaccion_id ?? null;
@@ -842,7 +867,9 @@ router.get("/by-transaccion", ensureAuth, async (req, res) => {
             const cand = candOid ? [String(movSid), candOid] : [String(movSid)];
 
             asiento =
-              (await findBy({ owner, source: movSrc, sourceId: { $in: candOid ? [candOid] : [] } }).catch(() => null)) ||
+              (candOid
+                ? await findBy({ owner, source: movSrc, sourceId: { $in: [candOid] } }).catch(() => null)
+                : null) ||
               (await findBy({ owner, source: movSrc, source_id: { $in: cand } })) ||
               (await findBy({ owner, source: movSrc, transaccionId: { $in: cand } }));
           }
@@ -859,7 +886,8 @@ router.get("/by-transaccion", ensureAuth, async (req, res) => {
     const accountMaps = await getAccountMaps(owner, rawLines);
     const asientoUI = mapEntryForUI(asiento, accountMaps);
 
-    const numeroAsiento = asientoUI.numeroAsiento || asientoUI.numero_asiento || pickEntryNumero(asiento) || null;
+    const numeroAsiento =
+      asientoUI.numeroAsiento || asientoUI.numero_asiento || pickEntryNumero(asiento) || null;
 
     return res.json({
       ok: true,
@@ -874,6 +902,29 @@ router.get("/by-transaccion", ensureAuth, async (req, res) => {
     console.error("GET /api/asientos/by-transaccion error:", e);
     return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
   }
+}
+
+/**
+ * ✅ CLAVE:
+ * GET /api/asientos/by-transaccion?source=ingreso|egreso|inventario|...&id=XXXXXXXX
+ */
+router.get("/by-transaccion", ensureAuth, handleByTransaccion);
+
+/**
+ * ✅ ALIAS CxC (compat frontend):
+ * GET /api/asientos/by-transaccion-ingreso/:id
+ * GET /api/asientos/by-transaccion-ingreso?id=...
+ */
+router.get("/by-transaccion-ingreso/:id", ensureAuth, async (req, res) => {
+  req.query.source = req.query.source || "ingreso";
+  req.query.id = req.query.id || req.params.id;
+  return handleByTransaccion(req, res);
+});
+
+router.get("/by-transaccion-ingreso", ensureAuth, async (req, res) => {
+  req.query.source = req.query.source || "ingreso";
+  // req.query.id debe venir en querystring
+  return handleByTransaccion(req, res);
 });
 
 /**
