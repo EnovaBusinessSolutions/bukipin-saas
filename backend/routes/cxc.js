@@ -9,6 +9,12 @@ const IncomeTransaction = require("../models/IncomeTransaction");
 const JournalEntry = require("../models/JournalEntry");
 const Account = require("../models/Account");
 
+// ✅ Client opcional (si existe, enriquecemos cliente_nombre; si no, no rompe)
+let Client = null;
+try {
+  Client = require("../models/Client");
+} catch (_) {}
+
 // ✅ Counter opcional (si no existe, no debe tumbar el server)
 let Counter = null;
 try {
@@ -378,12 +384,50 @@ function mapTxForUI(tx) {
     clienteId: tx.clienteId ?? tx.clientId ?? tx.cliente_id ?? tx.client_id ?? null,
     cliente_id: tx.cliente_id ?? tx.clienteId ?? tx.clientId ?? tx.client_id ?? null,
 
+    // si ya existe en doc, lo respetamos
+    cliente_nombre: tx.cliente_nombre ?? tx.clienteNombre ?? tx.cliente_name ?? null,
+
     metodoPago: tx.metodoPago ?? tx.metodo_pago ?? null,
     tipoPago: tx.tipoPago ?? tx.tipo_pago ?? null,
 
     metodo_pago: tx.metodoPago ?? tx.metodo_pago ?? null,
     tipo_pago: tx.tipoPago ?? tx.tipo_pago ?? null,
   };
+}
+
+// =========================
+// Helpers para /asientos (histórico real CxC)
+// =========================
+function pickEntryDate(entry) {
+  return (
+    entry?.date ??
+    entry?.fecha ??
+    entry?.entryDate ??
+    entry?.asiento_fecha ??
+    entry?.createdAt ??
+    entry?.created_at ??
+    null
+  );
+}
+
+function lineAccountCode(line) {
+  return (
+    line?.accountCodigo ??
+    line?.accountCode ??
+    line?.cuenta_codigo ??
+    line?.cuentaCodigo ??
+    line?.account?.codigo ??
+    line?.cuentas?.codigo ??
+    null
+  );
+}
+
+function lineDebe(line) {
+  return num(line?.debe ?? line?.debit ?? line?.debitAmount ?? line?.debit_amount, 0);
+}
+
+function lineHaber(line) {
+  return num(line?.haber ?? line?.credit ?? line?.creditAmount ?? line?.credit_amount, 0);
 }
 
 // =========================
@@ -410,7 +454,35 @@ async function handleListIngresos(req, res) {
     }
 
     const rows = await IncomeTransaction.find(query).sort(order).limit(limit).lean();
-    const items = (rows || []).map(mapTxForUI);
+    let items = (rows || []).map(mapTxForUI);
+
+    // ✅ Enriquecer cliente_nombre best-effort si existe Client y viene clienteId
+    if (Client) {
+      const ids = [...new Set(items.map((x) => x.clienteId || x.cliente_id).filter(isObjectId).map(String))];
+      if (ids.length) {
+        const clients = await Client.find({
+          owner,
+          _id: { $in: ids.map((x) => new mongoose.Types.ObjectId(x)) },
+        })
+          .select("_id nombre name razonSocial razon_social")
+          .lean();
+
+        const nameById = {};
+        for (const c of clients || []) {
+          const id = String(c._id);
+          const n = c.nombre ?? c.name ?? c.razonSocial ?? c.razon_social ?? null;
+          if (id && n) nameById[id] = n;
+        }
+
+        items = items.map((it) => {
+          const cid = String(it.clienteId || it.cliente_id || "");
+          if (!it.cliente_nombre && cid && nameById[cid]) {
+            return { ...it, cliente_nombre: nameById[cid] };
+          }
+          return it;
+        });
+      }
+    }
 
     return res.json({ ok: true, data: items, items });
   } catch (err) {
@@ -437,7 +509,24 @@ async function handleGetIngresoById(req, res) {
       return res.status(404).json({ ok: false, message: "Ingreso no encontrado." });
     }
 
-    const item = mapTxForUI(row);
+    let item = mapTxForUI(row);
+
+    // ✅ Enriquecer cliente_nombre best-effort
+    if (Client) {
+      const cid = item.clienteId || item.cliente_id;
+      if (cid && isObjectId(cid) && !item.cliente_nombre) {
+        const c = await Client.findOne({
+          owner,
+          _id: new mongoose.Types.ObjectId(String(cid)),
+        })
+          .select("_id nombre name razonSocial razon_social")
+          .lean();
+
+        const n = c?.nombre ?? c?.name ?? c?.razonSocial ?? c?.razon_social ?? null;
+        if (n) item = { ...item, cliente_nombre: n };
+      }
+    }
+
     return res.json({ ok: true, data: item, item });
   } catch (err) {
     console.error("GET /api/cxc/ingresos/:id error:", err);
@@ -446,48 +535,9 @@ async function handleGetIngresoById(req, res) {
 }
 
 // =========================
-// Endpoints
+// Handler real para registrar pago (reusable por alias)
 // =========================
-
-/**
- * ✅ ESTE es el endpoint que está pidiendo tu frontend en el panel:
- * GET /api/cxc/ingresos?pendientes=1&order=created_at_desc&limit=2000
- */
-router.get("/ingresos", ensureAuth, handleListIngresos);
-
-/**
- * ✅ Detalle por ID (útil para modal/detalle si el front lo usa)
- * GET /api/cxc/ingresos/:id
- */
-router.get("/ingresos/:id", ensureAuth, handleGetIngresoById);
-
-/**
- * ✅ Alias limpio (sin router.handle hacks)
- * GET /api/cxc/detalle?pendientes=1&limit=2000
- */
-router.get("/detalle", ensureAuth, handleListIngresos);
-
-/**
- * ✅ FIX CRÍTICO: este endpoint te estaba dando 404 en el front
- * GET /api/cxc/ventas-activos?pendientes=1
- *
- * Por ahora lo devolvemos vacío (para NO romper el panel).
- * Cuando tengas el modelo/colección real de "ventas de activos", aquí lo conectamos.
- */
-router.get("/ventas-activos", ensureAuth, async (req, res) => {
-  // Si en el futuro quieres conectarlo:
-  // - define modelo (ej. AssetSaleTransaction)
-  // - aplica misma lógica de pendientes y mapTxForUI con un mapper similar
-  return res.json({ ok: true, data: [], items: [] });
-});
-
-/**
- * POST /api/cxc/registrar-pago
- * Contabilidad:
- *   Debe 1001/1002
- *   Haber 1003
- */
-router.post("/registrar-pago", ensureAuth, async (req, res) => {
+async function handleRegistrarPago(req, res) {
   let session = null;
 
   try {
@@ -680,19 +730,132 @@ router.post("/registrar-pago", ensureAuth, async (req, res) => {
     const status = err?.statusCode || 500;
     return res.status(status).json({ ok: false, message: err?.message || "Error registrando cobro" });
   }
+}
+
+// =========================
+// Endpoints
+// =========================
+
+/**
+ * ✅ ESTE es el endpoint que está pidiendo tu frontend en el panel:
+ * GET /api/cxc/ingresos?pendientes=1&order=created_at_desc&limit=2000
+ */
+router.get("/ingresos", ensureAuth, handleListIngresos);
+
+/**
+ * ✅ Detalle por ID (útil para modal/detalle si el front lo usa)
+ * GET /api/cxc/ingresos/:id
+ */
+router.get("/ingresos/:id", ensureAuth, handleGetIngresoById);
+
+/**
+ * ✅ Hook: useCuentasPorCobrarDetalle pide esto:
+ * GET /api/cxc/detalle?pendientes=1
+ *
+ * Por ahora devolvemos los ingresos (CxC) tal cual; si luego conectas ventas-activos,
+ * aquí lo combinamos para que sea realmente "detalle combinado".
+ */
+router.get("/detalle", ensureAuth, handleListIngresos);
+
+/**
+ * ✅ FIX CRÍTICO: el hook también pide esto
+ * GET /api/cxc/ventas-activos?pendientes=1
+ *
+ * Por ahora lo devolvemos vacío (para NO romper el panel).
+ * Cuando tengas el modelo/colección real, lo conectamos.
+ */
+router.get("/ventas-activos", ensureAuth, async (req, res) => {
+  return res.json({ ok: true, data: [], items: [] });
 });
 
 /**
- * ✅ ALIAS opcional para compat:
+ * ✅ FIX CRÍTICO: el hook pide esto para histórico real
+ * GET /api/cxc/asientos?cuenta_codigo=1003
+ *
+ * Devuelve rows tipo: { fecha: ISO, debe: number, haber: number }
+ */
+router.get("/asientos", ensureAuth, async (req, res) => {
+  try {
+    const owner = req.user._id;
+
+    const cuentaCodigo = String(req.query.cuenta_codigo || "").trim();
+    if (!cuentaCodigo) {
+      return res.status(400).json({ ok: false, message: "Falta cuenta_codigo" });
+    }
+
+    const start = req.query.start ? asValidDate(String(req.query.start)) : null;
+    const end = req.query.end ? asValidDate(String(req.query.end)) : null;
+
+    if (req.query.start && !start) return res.status(400).json({ ok: false, message: "start inválido" });
+    if (req.query.end && !end) return res.status(400).json({ ok: false, message: "end inválido" });
+
+    const endInclusive = end ? new Date(end.getTime()) : null;
+    if (endInclusive) endInclusive.setHours(23, 59, 59, 999);
+
+    // Traemos asientos del owner (si tu schema tiene date, esto ya te sirve)
+    const entries = await JournalEntry.find({ owner }).sort({ createdAt: 1 }).lean();
+
+    const out = [];
+    for (const e of entries || []) {
+      const fechaRaw = pickEntryDate(e);
+      const fecha = asValidDate(fechaRaw);
+      if (!fecha) continue;
+
+      if (start && fecha < start) continue;
+      if (endInclusive && fecha > endInclusive) continue;
+
+      const lines = Array.isArray(e.lines)
+        ? e.lines
+        : Array.isArray(e.detalle_asientos)
+          ? e.detalle_asientos
+          : Array.isArray(e.detalles_asiento)
+            ? e.detalles_asiento
+            : [];
+
+      if (!lines.length) continue;
+
+      let debe = 0;
+      let haber = 0;
+
+      for (const ln of lines) {
+        const code = String(lineAccountCode(ln) || "").trim();
+        if (code !== cuentaCodigo) continue;
+        debe += lineDebe(ln);
+        haber += lineHaber(ln);
+      }
+
+      if (debe === 0 && haber === 0) continue;
+
+      out.push({
+        fecha: fecha.toISOString(),
+        debe,
+        haber,
+      });
+    }
+
+    return res.json({ ok: true, data: out, items: out });
+  } catch (err) {
+    console.error("GET /api/cxc/asientos error:", err);
+    return res.status(500).json({ ok: false, message: "Error cargando asientos CxC" });
+  }
+});
+
+/**
+ * POST /api/cxc/registrar-pago
+ * Contabilidad:
+ *   Debe 1001/1002
+ *   Haber 1003
+ */
+router.post("/registrar-pago", ensureAuth, handleRegistrarPago);
+
+/**
+ * ✅ Alias interno (MISMO router) sin hacks de req.url:
  * POST /api/cxc/cuentas-por-cobrar/registrar-pago
  *
- * OJO: esto solo sirve si montas este router en "/api" (no en "/api/cxc").
- * Si lo montas en "/api/cxc", entonces el path sería "/api/cxc/cuentas-por-cobrar/registrar-pago".
+ * Esto SOLO sirve si el frontend pega a /api/cxc/...
+ * Si tu frontend usa /api/cuentas-por-cobrar/registrar-pago,
+ * lo correcto es MONTAR el router también en "/api/cuentas-por-cobrar" (ver nota abajo).
  */
-router.post("/cuentas-por-cobrar/registrar-pago", ensureAuth, (req, res, next) => {
-  // reusa el handler real
-  req.url = "/registrar-pago";
-  return router.handle(req, res, next);
-});
+router.post("/cuentas-por-cobrar/registrar-pago", ensureAuth, handleRegistrarPago);
 
 module.exports = router;

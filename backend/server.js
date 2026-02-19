@@ -49,34 +49,57 @@ app.get("/api/health", (req, res) => {
   });
 });
 
+// ------------------------------
 // Auth
+// ------------------------------
 app.use("/api/auth", require("./routes/auth"));
 
+// ------------------------------
+// Rutas más específicas PRIMERO
+// (para evitar que rutas generales las "secuesten")
+// ------------------------------
+
+// ✅ Transacciones Egresos (más específico que /api/transacciones)
+app.use("/api/transacciones/egresos", require("./routes/transaccionesEgresos"));
+
+// ✅ Inventario movimientos (más específico que /api/inventario si algún router comparte paths)
+app.use("/api/movimientos-inventario", require("./routes/movimientosInventario"));
+
+// ------------------------------
 // Registros / Catálogos
+// ------------------------------
 app.use("/api/cuentas", require("./routes/cuentas"));
 app.use("/api/subcuentas", require("./routes/subcuentas"));
 app.use("/api/productos", require("./routes/productos"));
 app.use("/api/clientes", require("./routes/clientes"));
+app.use("/api/proveedores", require("./routes/proveedores"));
+
 app.use("/api/ingresos", require("./routes/ingresos"));
 app.use("/api/transacciones", require("./routes/transacciones"));
-app.use("/api/transacciones/egresos", require("./routes/transaccionesEgresos"));
+
 app.use("/api/inventario", require("./routes/inventario"));
-app.use("/api/contabilidad", require("./routes/contabilidad"));
-app.use("/api/movimientos-inventario", require("./routes/movimientosInventario"));
-app.use("/api/asientos", require("./routes/asientos"));
 app.use("/api/productos-egresos", require("./routes/productosEgresos"));
+
+app.use("/api/asientos", require("./routes/asientos"));
+app.use("/api/contabilidad", require("./routes/contabilidad"));
+
 app.use("/api/flujo-efectivo", require("./routes/flujoEfectivo"));
 
-app.use("/api/proveedores", require("./routes/proveedores"));
 app.use("/api/financiamientos", require("./routes/financiamientos"));
 app.use("/api/egresos", require("./routes/egresos"));
 
 // ==============================
 // ✅ CxC / Cobros-Pagos
 // ==============================
+
+// Cobros / Pagos (historial)
 app.use("/api/cobros-pagos", require("./routes/cobrosPagos"));
 
+// CxC nuevo
 app.use("/api/cxc", require("./routes/cxc"));
+
+// ✅ Alias legacy para compat con frontend viejo:
+// POST /api/cuentas-por-cobrar/registrar-pago
 app.use("/api/cuentas-por-cobrar", require("./routes/cxc"));
 
 // ==============================

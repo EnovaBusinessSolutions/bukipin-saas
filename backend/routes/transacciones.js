@@ -25,9 +25,15 @@ function num(v, def = 0) {
   return Number.isFinite(n) ? n : def;
 }
 
+function asValidDate(v) {
+  if (!v) return null;
+  const d = v instanceof Date ? v : new Date(v);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
 function toYMDLocal(d) {
-  const dt = new Date(d);
-  if (Number.isNaN(dt.getTime())) return null;
+  const dt = asValidDate(d);
+  if (!dt) return null;
   const local = new Date(dt.getTime() + TZ_OFFSET_MINUTES * 60 * 1000);
   const y = local.getUTCFullYear();
   const m = String(local.getUTCMonth() + 1).padStart(2, "0");
@@ -43,8 +49,8 @@ function toYMDLocal(d) {
  * Solución: mantener el día de `fecha` pero tomar la hora real desde `createdAt`.
  */
 function fixFechaWithCreatedAt(tx) {
-  const f = tx?.fecha ? new Date(tx.fecha) : null;
-  const c = tx?.createdAt ? new Date(tx.createdAt) : null;
+  const f = asValidDate(tx?.fecha);
+  const c = asValidDate(tx?.createdAt);
 
   if (!f && c) return c;
   if (!f) return null;
@@ -56,7 +62,7 @@ function fixFechaWithCreatedAt(tx) {
     f.getUTCMilliseconds() === 0;
 
   if (!isMidnightUTC) return f;
-  if (!c || Number.isNaN(c.getTime())) return f;
+  if (!c) return f;
 
   return new Date(
     Date.UTC(
@@ -214,7 +220,7 @@ function mapTxCompat(tx) {
 
   const saldoPendiente = Number.isFinite(saldoPendienteSaved)
     ? saldoPendienteSaved
-    : Math.max(0, montoNeto - montoPagado);
+    : Math.max(0, Number((montoNeto - montoPagado).toFixed(2)));
 
   const cuentaCodigo =
     tx.cuentaCodigo ??
@@ -223,7 +229,8 @@ function mapTxCompat(tx) {
     tx.cuenta_principal_codigo ??
     null;
 
-  const fechaFinal = fechaFixed || tx.fecha || null;
+  // ✅ normaliza fecha FINAL para evitar strings raras / Invalid Date
+  const fechaFinal = asValidDate(fechaFixed) || asValidDate(tx.fecha) || asValidDate(tx.createdAt) || null;
 
   const metodoPago = tx.metodoPago ?? tx.metodo_pago ?? null;
   const tipoPago = tx.tipoPago ?? tx.tipo_pago ?? null;
@@ -281,6 +288,15 @@ function parseOrder(order) {
   return { createdAt: -1 };
 }
 
+// ✅ projection ligera (evita regresar payload enorme)
+const TX_SELECT =
+  "fecha createdAt updatedAt descripcion concept concepto " +
+  "montoTotal monto_total montoDescuento monto_descuento montoNeto monto_neto " +
+  "montoPagado monto_pagado saldoPendiente saldo_pendiente monto_pendiente " +
+  "cuentaCodigo cuenta_codigo cuentaPrincipalCodigo cuenta_principal_codigo " +
+  "clienteId clientId cliente_id client_id clienteID " +
+  "metodoPago metodo_pago tipoPago tipo_pago";
+
 /**
  * GET /api/transacciones/ingresos?include_all=true&order=created_at_desc&limit=2000&pendientes=1
  */
@@ -301,7 +317,10 @@ router.get("/ingresos", ensureAuth, async (req, res) => {
 
     const query = { owner };
 
-    if (!includeAll || pendientesFlag) {
+    // ✅ lógica clara:
+    // - si pendientes=1 => filtra pendientes
+    // - si NO pendientes=1 => solo filtra pendientes cuando include_all NO es true
+    if (pendientesFlag || !includeAll) {
       query.$or = [
         { saldoPendiente: { $gt: 0 } },
         { saldo_pendiente: { $gt: 0 } },
@@ -309,7 +328,7 @@ router.get("/ingresos", ensureAuth, async (req, res) => {
       ];
     }
 
-    const rows = await IncomeTransaction.find(query).sort(order).limit(limit).lean();
+    const rows = await IncomeTransaction.find(query).select(TX_SELECT).sort(order).limit(limit).lean();
 
     let items = rows.map(mapTxCompat);
     items = await attachAccountInfo(owner, items);
@@ -334,6 +353,7 @@ router.get("/ingresos/recientes", ensureAuth, async (req, res) => {
     const limit = Math.min(2000, Number(req.query.limit || 1000));
 
     const rows = await IncomeTransaction.find({ owner })
+      .select(TX_SELECT)
       .sort({ fecha: -1, createdAt: -1 })
       .limit(limit)
       .lean();
@@ -364,7 +384,9 @@ router.get("/ingresos/:id", ensureAuth, async (req, res) => {
     const row = await IncomeTransaction.findOne({
       owner,
       _id: new mongoose.Types.ObjectId(id),
-    }).lean();
+    })
+      .select(TX_SELECT)
+      .lean();
 
     if (!row) {
       return res.status(404).json({ ok: false, message: "Transacción no encontrada" });
