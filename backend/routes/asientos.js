@@ -156,7 +156,6 @@ async function ensureNumeroAsiento(owner, entry) {
     const seq = doc?.seq || 1;
     const numeroAsiento = `${year}-${String(seq).padStart(4, "0")}`;
 
-    // Persistimos para que ya no vuelva a mostrarse el ObjectId en UI
     await JournalEntry.updateOne(
       { owner, _id: entry._id },
       { $set: { numeroAsiento, numero_asiento: numeroAsiento, numero: numeroAsiento } }
@@ -202,7 +201,7 @@ async function getAccountNameMap(owner, codes) {
 
 /**
  * ✅ Mapa por CODE y por ID (soporta code/codigo)
- * ✅ FIX: $or plano (evita $or anidado dentro de $or)
+ * ✅ FIX: $or plano
  */
 async function getAccountMaps(owner, rawLines) {
   const byCode = {};
@@ -773,14 +772,20 @@ async function handleByTransaccion(req, res) {
     const source_idCandidates = inFor(source_idIsObj);
     const transaccion_idCandidates = inFor(transaccion_idIsObj);
 
+    // ✅ 1.1) Source aliases (incluye cobros para CxC)
     const sourceAliases = new Set();
+
     if (source) {
       const s = source.toLowerCase();
       sourceAliases.add(s);
+
+      // plurales
       if (s === "ingresos") sourceAliases.add("ingreso");
       if (s === "ingreso") sourceAliases.add("ingresos");
       if (s === "egresos") sourceAliases.add("egreso");
       if (s === "egreso") sourceAliases.add("egresos");
+
+      // inventario
       if (s === "movimientos_inventario") sourceAliases.add("inventario");
       if (s === "movimiento_inventario") sourceAliases.add("inventario");
       if (s === "inventario") {
@@ -788,9 +793,19 @@ async function handleByTransaccion(req, res) {
         sourceAliases.add("movimientos_inventario");
         sourceAliases.add("inventory");
       }
+
+      // ✅ CxC: si piden asiento "del ingreso", también aceptamos el asiento del cobro ligado a ese ingreso
+      // (porque cobro_cxc guarda sourceId = ingresoId)
+      if (s === "ingreso" || s === "ingresos") {
+        sourceAliases.add("cobro_cxc");
+        sourceAliases.add("cobro");
+        sourceAliases.add("cobro_ingreso");
+        sourceAliases.add("pago_cxc");
+      }
     }
 
     const findBy = async (q) => JournalEntry.findOne(q).sort({ createdAt: -1 }).lean();
+    const findMany = async (q) => JournalEntry.find(q).sort({ createdAt: -1 }).limit(20).lean();
 
     let asiento = null;
 
@@ -819,7 +834,7 @@ async function handleByTransaccion(req, res) {
       }
     }
 
-    // 3) Fallback: solo por id
+    // 3) Fallback: solo por id (sin filtrar source)
     if (!asiento) {
       if (sourceIdCandidates.length) {
         asiento = (await findBy({ owner, sourceId: { $in: sourceIdCandidates } })) || asiento;
@@ -838,7 +853,17 @@ async function handleByTransaccion(req, res) {
       }
     }
 
-    // 4) ✅ ESPECIAL INVENTARIO: resolver desde InventoryMovement -> journalEntryId/asientoId
+    // 3.1) ✅ EXTRA: si source=ingreso y no encontró, intenta directo por cobro_cxc ligado al ingresoId
+    // Esto evita “NOT_FOUND” cuando el panel pide el asiento del cobro desde /by-transaccion-ingreso/:id
+    if (!asiento && (source === "ingreso" || source === "ingresos") && oid) {
+      asiento =
+        (await findBy({ owner, source: "cobro_cxc", sourceId: oid })) ||
+        (await findBy({ owner, source: "cobro_cxc", transaccionId: oid })) ||
+        (await findBy({ owner, source: "cobro_cxc", source_id: oid })) ||
+        null;
+    }
+
+    // 4) ✅ ESPECIAL INVENTARIO
     if (!asiento && InventoryMovement && isObjectId(id)) {
       const mov = await InventoryMovement.findOne({ owner, _id: new mongoose.Types.ObjectId(id) })
         .lean()
@@ -889,14 +914,61 @@ async function handleByTransaccion(req, res) {
     const numeroAsiento =
       asientoUI.numeroAsiento || asientoUI.numero_asiento || pickEntryNumero(asiento) || null;
 
+    // ✅ BONUS: si el caller quiere “todos los asientos relacionados” (útil para CxC)
+    const includeAll =
+      String(req.query.include_all || req.query.includeAll || "0").trim() === "1" ||
+      String(req.query.all || "0").trim() === "1";
+
+    if (!includeAll) {
+      return res.json({
+        ok: true,
+        data: asientoUI,
+        asiento: asientoUI,
+        item: asientoUI,
+        numeroAsiento,
+        asientos: [asientoUI],
+        ...asientoUI,
+      });
+    }
+
+    // Traer hasta 20 asientos relacionados por ingresoId: ingreso + cobro_cxc
+    const relatedSources = ["ingreso", "ingresos", "cobro_cxc", "cobro", "cobro_ingreso", "pago_cxc"];
+    const relQuery = { owner, source: { $in: relatedSources } };
+    if (oid) {
+      relQuery.$or = [
+        { sourceId: oid },
+        { transaccionId: oid },
+        { source_id: oid },
+        { transaccion_id: oid },
+        { "references.id": idStr },
+      ];
+    } else {
+      relQuery.$or = [
+        { sourceId: idStr },
+        { transaccionId: idStr },
+        { source_id: idStr },
+        { transaccion_id: idStr },
+        { "references.id": idStr },
+      ];
+    }
+
+    const relDocs = await findMany(relQuery);
+    const allLines = [];
+    for (const e of relDocs || []) {
+      const ls = e.lines || e.detalle_asientos || e.detalles_asiento || [];
+      if (Array.isArray(ls) && ls.length) allLines.push(...ls);
+    }
+    const maps2 = await getAccountMaps(owner, allLines);
+    const relUI = (relDocs || []).map((e) => mapEntryForUI(e, maps2));
+
     return res.json({
       ok: true,
       data: asientoUI,
       asiento: asientoUI,
       item: asientoUI,
       numeroAsiento,
-      asientos: [asientoUI],
-      ...asientoUI,
+      asientos: relUI,
+      related_count: relUI.length,
     });
   } catch (e) {
     console.error("GET /api/asientos/by-transaccion error:", e);
@@ -906,7 +978,7 @@ async function handleByTransaccion(req, res) {
 
 /**
  * ✅ CLAVE:
- * GET /api/asientos/by-transaccion?source=ingreso|egreso|inventario|...&id=XXXXXXXX
+ * GET /api/asientos/by-transaccion?source=ingreso|egreso|inventario|cobro_cxc|...&id=XXXXXXXX
  */
 router.get("/by-transaccion", ensureAuth, handleByTransaccion);
 
@@ -914,6 +986,8 @@ router.get("/by-transaccion", ensureAuth, handleByTransaccion);
  * ✅ ALIAS CxC (compat frontend):
  * GET /api/asientos/by-transaccion-ingreso/:id
  * GET /api/asientos/by-transaccion-ingreso?id=...
+ *
+ * Internamente reusa handleByTransaccion.
  */
 router.get("/by-transaccion-ingreso/:id", ensureAuth, async (req, res) => {
   req.query.source = req.query.source || "ingreso";
@@ -923,7 +997,6 @@ router.get("/by-transaccion-ingreso/:id", ensureAuth, async (req, res) => {
 
 router.get("/by-transaccion-ingreso", ensureAuth, async (req, res) => {
   req.query.source = req.query.source || "ingreso";
-  // req.query.id debe venir en querystring
   return handleByTransaccion(req, res);
 });
 

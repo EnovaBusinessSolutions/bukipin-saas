@@ -67,32 +67,24 @@ app.use("/api/asientos", require("./routes/asientos"));
 app.use("/api/productos-egresos", require("./routes/productosEgresos"));
 app.use("/api/flujo-efectivo", require("./routes/flujoEfectivo"));
 
-// ✅ NUEVO: Proveedores (evita 404 del panel de egresos)
 app.use("/api/proveedores", require("./routes/proveedores"));
-
-// ✅ NUEVO: Financiamientos (tarjetas de crédito, etc. — evita 404 en egresos)
 app.use("/api/financiamientos", require("./routes/financiamientos"));
-
 app.use("/api/egresos", require("./routes/egresos"));
 
 // ==============================
-// ✅ CxC / Cobros-Pagos (montaje real para evitar 404 en el panel)
+// ✅ CxC / Cobros-Pagos
 // ==============================
-
-// Historial de cobros/pagos (panel CxC suele pedir: /api/cobros-pagos/historial?... )
 app.use("/api/cobros-pagos", require("./routes/cobrosPagos"));
 
-// Endpoints canónicos de CxC (y alias de compat para frontend actual)
 app.use("/api/cxc", require("./routes/cxc"));
 app.use("/api/cuentas-por-cobrar", require("./routes/cxc"));
 
 // ==============================
-// ✅ Placeholders temporales (para que el dashboard no reviente con 404 mientras migras)
-// OJO: deben ir al final de /api para no “pisar” rutas reales.
+// ✅ Placeholders temporales (al final para no pisar rutas reales)
 // ==============================
 app.use("/api", require("./routes/placeholders"));
 
-// ✅ 404 SOLO para /api (útil para debug rápido)
+// 404 SOLO para /api (después de todas las rutas)
 app.use("/api", (req, res) => {
   return res.status(404).json({
     ok: false,
@@ -101,7 +93,7 @@ app.use("/api", (req, res) => {
   });
 });
 
-// ✅ Handler central de errores (JSON consistente)
+// Error handler (después de rutas /api)
 app.use((err, req, res, _next) => {
   const status = err?.statusCode || err?.status || 500;
   console.error("🔥 API Error:", err);
@@ -115,14 +107,12 @@ app.use((err, req, res, _next) => {
 // ✅ SPAs
 // ==============================
 
-// Ruta común al index del SPA de landing + login
 const loginIndexPath = path.join(publicRoot, "login", "index.html");
 
 app.get("/", (req, res) => res.sendFile(loginIndexPath));
 app.get("/login*", (req, res) => res.sendFile(loginIndexPath));
 app.get("/recuperacion*", (req, res) => res.sendFile(loginIndexPath));
 
-// Dashboard SPA
 app.get("/dashboard*", (req, res) => {
   res.sendFile(path.join(publicRoot, "dashboard", "index.html"));
 });

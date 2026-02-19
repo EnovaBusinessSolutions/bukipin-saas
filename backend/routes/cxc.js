@@ -8,7 +8,12 @@ const ensureAuth = require("../middleware/ensureAuth");
 const IncomeTransaction = require("../models/IncomeTransaction");
 const JournalEntry = require("../models/JournalEntry");
 const Account = require("../models/Account");
-const Counter = require("../models/Counter");
+
+// ✅ Counter opcional (si no existe, no debe tumbar el server)
+let Counter = null;
+try {
+  Counter = require("../models/Counter");
+} catch (_) {}
 
 // =========================
 // Helpers
@@ -33,8 +38,58 @@ function isObjectId(v) {
   return !!v && mongoose.Types.ObjectId.isValid(String(v));
 }
 
+function asValidDate(v) {
+  if (!v) return null;
+  const d = v instanceof Date ? v : new Date(v);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
 function isDateOnly(str) {
   return /^\d{4}-\d{2}-\d{2}$/.test(String(str || "").trim());
+}
+
+function toYMDLocal(d) {
+  const dt = new Date(d);
+  if (Number.isNaN(dt.getTime())) return null;
+  const local = new Date(dt.getTime() + TZ_OFFSET_MINUTES * 60 * 1000);
+  const y = local.getUTCFullYear();
+  const m = String(local.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(local.getUTCDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+/**
+ * ✅ FIX TZ (como en transacciones.js):
+ * Si tx.fecha viene en 00:00:00.000Z, el navegador -06 la mueve al día anterior.
+ * Solución: mantenemos el día de fecha, pero usamos la hora real de createdAt.
+ */
+function fixFechaWithCreatedAt(tx) {
+  const f = asValidDate(tx?.fecha);
+  const c = asValidDate(tx?.createdAt);
+
+  if (!f && c) return c;
+  if (!f) return null;
+
+  const isMidnightUTC =
+    f.getUTCHours() === 0 &&
+    f.getUTCMinutes() === 0 &&
+    f.getUTCSeconds() === 0 &&
+    f.getUTCMilliseconds() === 0;
+
+  if (!isMidnightUTC) return f;
+  if (!c) return f;
+
+  return new Date(
+    Date.UTC(
+      f.getUTCFullYear(),
+      f.getUTCMonth(),
+      f.getUTCDate(),
+      c.getUTCHours(),
+      c.getUTCMinutes(),
+      c.getUTCSeconds(),
+      c.getUTCMilliseconds()
+    )
+  );
 }
 
 function dateOnlyToUtc(str, hh = 0, mm = 0, ss = 0, ms = 0) {
@@ -43,6 +98,7 @@ function dateOnlyToUtc(str, hh = 0, mm = 0, ss = 0, ms = 0) {
   const [y, m, d] = s.split("-").map((x) => Number(x));
   if (!y || !m || !d) return null;
   const utcMillis = Date.UTC(y, m - 1, d, hh, mm, ss, ms);
+  // Ajuste por offset para representar "hora local" en UTC
   return new Date(utcMillis - TZ_OFFSET_MINUTES * 60 * 1000);
 }
 
@@ -73,7 +129,23 @@ function normalizeMetodoPago(raw) {
   return v;
 }
 
+function parseOrder(order) {
+  const o = String(order || "").trim().toLowerCase();
+  if (!o) return { createdAt: -1 };
+  if (o === "created_at_desc") return { createdAt: -1 };
+  if (o === "created_at_asc") return { createdAt: 1 };
+  if (o === "fecha_desc") return { fecha: -1, createdAt: -1 };
+  if (o === "fecha_asc") return { fecha: 1, createdAt: 1 };
+  return { createdAt: -1 };
+}
+
 async function nextJournalNumber(owner, dateObj) {
+  // Si no hay Counter, devolvemos algo estable (no romper UI)
+  if (!Counter) {
+    const y = new Date(dateObj || new Date()).getFullYear();
+    return `${y}-0000`;
+  }
+
   const year = new Date(dateObj).getFullYear();
   const key = `journal-${year}`;
   const doc = await Counter.findOneAndUpdate(
@@ -97,7 +169,6 @@ async function buildLine(owner, { code, debit = 0, credit = 0, memo = "" }) {
     debit: num(debit, 0),
     credit: num(credit, 0),
     memo: memo || "",
-    // guardamos code en variantes comunes
     accountCodigo: c,
     accountCode: c,
     cuenta_codigo: c,
@@ -119,14 +190,19 @@ async function buildLine(owner, { code, debit = 0, credit = 0, memo = "" }) {
   return base;
 }
 
+/**
+ * ✅ FIX: query $or plano (sin $or dentro de $or)
+ */
 async function buildAccountMaps(owner, entries) {
   const codes = new Set();
   const ids = new Set();
 
   for (const e of entries || []) {
-    for (const l of e.lines || []) {
+    const lines = e.lines || e.detalle_asientos || e.detalles_asiento || [];
+    for (const l of lines || []) {
       const c = l.accountCodigo ?? l.accountCode ?? l.cuenta_codigo ?? l.cuentaCodigo ?? null;
       if (c) codes.add(String(c).trim());
+
       const aid = l.accountId ?? l.cuenta_id ?? l.account ?? null;
       if (aid && mongoose.Types.ObjectId.isValid(String(aid))) ids.add(String(aid));
     }
@@ -134,11 +210,16 @@ async function buildAccountMaps(owner, entries) {
 
   if (!codes.size && !ids.size) return { nameByCode: {}, codeById: {}, nameById: {} };
 
-  const query = { owner, $or: [] };
-  if (codes.size) query.$or.push({ $or: [{ code: { $in: [...codes] } }, { codigo: { $in: [...codes] } }] });
-  if (ids.size) query.$or.push({ _id: { $in: [...ids].map((x) => new mongoose.Types.ObjectId(x)) } });
+  const or = [];
+  if (codes.size) {
+    or.push({ code: { $in: [...codes] } });
+    or.push({ codigo: { $in: [...codes] } });
+  }
+  if (ids.size) {
+    or.push({ _id: { $in: [...ids].map((x) => new mongoose.Types.ObjectId(x)) } });
+  }
 
-  const rows = await Account.find(query).select("_id code codigo name nombre").lean();
+  const rows = await Account.find({ owner, $or: or }).select("_id code codigo name nombre").lean();
 
   const nameByCode = {};
   const codeById = {};
@@ -159,22 +240,12 @@ async function buildAccountMaps(owner, entries) {
   return { nameByCode, codeById, nameById };
 }
 
-function toYMDLocal(d) {
-  const dt = new Date(d);
-  if (Number.isNaN(dt.getTime())) return null;
-  const local = new Date(dt.getTime() + TZ_OFFSET_MINUTES * 60 * 1000);
-  const y = local.getUTCFullYear();
-  const m = String(local.getUTCMonth() + 1).padStart(2, "0");
-  const day = String(local.getUTCDate()).padStart(2, "0");
-  return `${y}-${m}-${day}`;
-}
-
 function mapEntryForUI(entry, accountMaps = {}) {
   const nameByCode = accountMaps?.nameByCode || {};
   const codeById = accountMaps?.codeById || {};
   const nameById = accountMaps?.nameById || {};
 
-  const rawLines = entry.lines || entry.detalle_asientos || [];
+  const rawLines = entry.lines || entry.detalle_asientos || entry.detalles_asiento || [];
 
   const detalle_asientos = (rawLines || []).map((l) => {
     let cuenta_codigo = String(
@@ -196,7 +267,7 @@ function mapEntryForUI(entry, accountMaps = {}) {
       (cuenta_codigo ? (nameByCode[cuenta_codigo] || null) : null) ||
       (sid2 ? (nameById[sid2] || null) : null);
 
-    const memo = l.memo ?? l.descripcion ?? "";
+    const memo = l.memo ?? l.descripcion ?? l.concepto ?? "";
 
     return {
       cuenta_codigo: cuenta_codigo || null,
@@ -204,20 +275,22 @@ function mapEntryForUI(entry, accountMaps = {}) {
       debe: num(l.debit ?? l.debe, 0),
       haber: num(l.credit ?? l.haber, 0),
       memo,
+      descripcion: memo,
     };
   });
 
   const detalles = detalle_asientos.map((d) => ({
     cuenta_codigo: d.cuenta_codigo,
     cuenta_nombre: d.cuenta_nombre,
-    descripcion: d.memo || "",
+    descripcion: d.descripcion || d.memo || "",
     debe: d.debe,
     haber: d.haber,
   }));
 
-  const concepto = entry.concept ?? entry.concepto ?? "";
-  const numeroAsiento = entry.numeroAsiento ?? entry.numero_asiento ?? null;
-  const fecha = entry.date ?? entry.fecha ?? entry.createdAt ?? null;
+  const concepto = entry.concept ?? entry.concepto ?? entry.descripcion ?? "";
+  const numeroAsiento = entry.numeroAsiento ?? entry.numero_asiento ?? entry.numero ?? entry.folio ?? null;
+
+  const fecha = entry.date ?? entry.fecha ?? entry.entryDate ?? entry.createdAt ?? null;
 
   return {
     id: String(entry._id),
@@ -233,7 +306,7 @@ function mapEntryForUI(entry, accountMaps = {}) {
     concepto,
 
     source: entry.source ?? "",
-    sourceId: entry.sourceId ? String(entry.sourceId) : null,
+    sourceId: entry.sourceId ? String(entry.sourceId) : (entry.transaccionId ? String(entry.transaccionId) : null),
 
     detalle_asientos,
     detalles,
@@ -246,10 +319,15 @@ function mapEntryForUI(entry, accountMaps = {}) {
 function computeMontosTx(tx) {
   const total = num(tx?.montoTotal ?? tx?.monto_total ?? tx?.total, 0);
   const descuento = num(tx?.montoDescuento ?? tx?.monto_descuento ?? tx?.descuento, 0);
-  const neto = num(tx?.montoNeto ?? tx?.monto_neto ?? tx?.neto, Math.max(0, total - Math.max(0, descuento)));
+  const neto = num(
+    tx?.montoNeto ?? tx?.monto_neto ?? tx?.neto,
+    Math.max(0, total - Math.max(0, descuento))
+  );
   const pagado = num(tx?.montoPagado ?? tx?.monto_pagado ?? tx?.pagado, 0);
   const pendienteSaved = num(tx?.saldoPendiente ?? tx?.saldo_pendiente ?? tx?.monto_pendiente, NaN);
-  const pendiente = Number.isFinite(pendienteSaved) ? pendienteSaved : Math.max(0, Number((neto - pagado).toFixed(2)));
+  const pendiente = Number.isFinite(pendienteSaved)
+    ? pendienteSaved
+    : Math.max(0, Number((neto - pagado).toFixed(2)));
   return { total, descuento, neto, pagado, pendiente };
 }
 
@@ -265,12 +343,17 @@ function mapTxForUI(tx) {
 
   const subcuentaId = tx.subcuentaId ?? tx.subcuenta_id ?? null;
 
+  // ✅ FIX FECHA: evita invalid time value en el front
+  const fechaFixed = fixFechaWithCreatedAt(tx);
+  const fechaFinal = fechaFixed || asValidDate(tx.fecha) || asValidDate(tx.createdAt) || null;
+
   return {
     ...tx,
     id: tx._id ? String(tx._id) : tx.id,
 
-    fecha: tx.fecha ?? null,
-    fecha_ymd: tx.fecha ? toYMDLocal(tx.fecha) : null,
+    fecha: fechaFinal, // Date -> JSON la convierte a ISO
+    fecha_fixed: fechaFixed ? fechaFixed.toISOString() : null,
+    fecha_ymd: fechaFinal ? toYMDLocal(fechaFinal) : null,
 
     montoTotal: montos.total,
     montoDescuento: montos.descuento,
@@ -284,6 +367,7 @@ function mapTxForUI(tx) {
     monto_pagado: montos.pagado,
     saldo_pendiente: montos.pendiente,
     monto_pendiente: montos.pendiente,
+    pendiente: montos.pendiente,
 
     cuentaCodigo: cuentaCodigo ?? null,
     cuenta_codigo: cuentaCodigo ?? null,
@@ -307,18 +391,21 @@ function mapTxForUI(tx) {
 // =========================
 
 /**
- * GET /api/cxc/detalle?pendientes=1&limit=2000
- * (útil para debug / y te sirve si después mueves el panel a /api/cxc)
+ * ✅ ESTE es el endpoint que está pidiendo tu frontend en el panel:
+ * GET /api/cxc/ingresos?pendientes=1&order=created_at_desc&limit=2000
  */
-router.get("/detalle", ensureAuth, async (req, res) => {
+router.get("/ingresos", ensureAuth, async (req, res) => {
   try {
     const owner = req.user._id;
     const limit = Math.min(5000, Number(req.query.limit || 2000));
+    const order = parseOrder(req.query.order);
+
     const pendientes =
       String(req.query.pendientes ?? "").toLowerCase() === "1" ||
       String(req.query.pendientes ?? "").toLowerCase() === "true";
 
     const query = { owner };
+
     if (pendientes) {
       query.$or = [
         { saldoPendiente: { $gt: 0 } },
@@ -327,29 +414,58 @@ router.get("/detalle", ensureAuth, async (req, res) => {
       ];
     }
 
-    const rows = await IncomeTransaction.find(query)
-      .sort({ createdAt: -1 })
-      .limit(limit)
-      .lean();
-
-    const items = rows.map(mapTxForUI);
+    const rows = await IncomeTransaction.find(query).sort(order).limit(limit).lean();
+    const items = (rows || []).map(mapTxForUI);
 
     return res.json({ ok: true, data: items, items });
   } catch (err) {
-    console.error("GET /api/cxc/detalle error:", err);
-    return res.status(500).json({ ok: false, message: "Error cargando CxC" });
+    console.error("GET /api/cxc/ingresos error:", err);
+    return res.status(500).json({ ok: false, message: "Error cargando CxC (ingresos)" });
   }
 });
 
 /**
+ * ✅ Detalle por ID (útil para modal/detalle si el front lo usa)
+ * GET /api/cxc/ingresos/:id
+ */
+router.get("/ingresos/:id", ensureAuth, async (req, res) => {
+  try {
+    const owner = req.user._id;
+    const { id } = req.params;
+
+    if (!isObjectId(id)) {
+      return res.status(400).json({ ok: false, message: "ID inválido." });
+    }
+
+    const row = await IncomeTransaction.findOne({
+      owner,
+      _id: new mongoose.Types.ObjectId(String(id)),
+    }).lean();
+
+    if (!row) {
+      return res.status(404).json({ ok: false, message: "Ingreso no encontrado." });
+    }
+
+    const item = mapTxForUI(row);
+    return res.json({ ok: true, data: item, item });
+  } catch (err) {
+    console.error("GET /api/cxc/ingresos/:id error:", err);
+    return res.status(500).json({ ok: false, message: "Error cargando el detalle del ingreso" });
+  }
+});
+
+/**
+ * ✅ Compat/debug: antes tenías /detalle. Lo dejamos y lo hacemos alias.
+ * GET /api/cxc/detalle?pendientes=1&limit=2000
+ */
+router.get("/detalle", ensureAuth, async (req, res) => {
+  // alias directo a /ingresos (misma lógica)
+  req.url = "/ingresos";
+  return router.handle(req, res);
+});
+
+/**
  * POST /api/cxc/registrar-pago
- * Body:
- * - ingresoId | transaccion_id | referencia_id
- * - monto (required)
- * - metodoPago: efectivo|bancos
- * - fecha (opcional)
- * - nota (opcional)
- *
  * Contabilidad:
  *   Debe 1001/1002
  *   Haber 1003
@@ -393,8 +509,7 @@ router.post("/registrar-pago", ensureAuth, async (req, res) => {
 
     const codCobro = metodoPago === "bancos" ? COD_BANCOS : COD_CAJA;
 
-    // ✅ Usamos transacción (Mongo session) si está disponible
-    // Si por tu cluster no soporta transactions, se cae a modo normal sin romper.
+    // ✅ Transacción si está disponible (si no, sigue sin romper)
     try {
       session = await mongoose.startSession();
       session.startTransaction();
@@ -428,7 +543,7 @@ router.post("/registrar-pago", ensureAuth, async (req, res) => {
       });
     }
 
-    // ✅ Actualizar tx (montoPagado + saldoPendiente)
+    // ✅ Actualizar tx
     const neto = num(montos.neto, 0);
     const pagadoPrev = num(tx.montoPagado ?? tx.monto_pagado, 0);
     const pagadoNew = Number((pagadoPrev + monto).toFixed(2));
@@ -442,8 +557,6 @@ router.post("/registrar-pago", ensureAuth, async (req, res) => {
     tx.montoPendiente = saldoNew;
     tx.monto_pendiente = saldoNew;
 
-    // tipoPago: si ya quedó en 0, lo dejamos como contado (para UI)
-    // si no, parcial
     if (saldoNew <= 0) {
       tx.tipoPago = "contado";
       tx.tipo_pago = "contado";
@@ -452,13 +565,12 @@ router.post("/registrar-pago", ensureAuth, async (req, res) => {
       tx.tipo_pago = "parcial";
     }
 
-    // metodoPago del cobro actual (no necesariamente el original)
     tx.metodoPago = tx.metodoPago ?? metodoPago;
     tx.metodo_pago = tx.metodo_pago ?? metodoPago;
 
     await tx.save({ session: session || undefined });
 
-    // ✅ Crear asiento del cobro (reduce CxC)
+    // ✅ Crear asiento del cobro
     const lines = [
       await buildLine(owner, {
         code: codCobro,
@@ -476,7 +588,7 @@ router.post("/registrar-pago", ensureAuth, async (req, res) => {
 
     const numeroAsiento = await nextJournalNumber(owner, fecha);
 
-    const entry = await JournalEntry.create(
+    const created = await JournalEntry.create(
       [
         {
           owner,
@@ -489,16 +601,18 @@ router.post("/registrar-pago", ensureAuth, async (req, res) => {
 
           lines,
           detalle_asientos: lines,
+          detalles_asiento: lines,
 
           numeroAsiento,
+          numero_asiento: numeroAsiento,
         },
       ],
       session ? { session } : undefined
     );
 
-    const entryDoc = Array.isArray(entry) ? entry[0] : entry;
+    const entryDoc = Array.isArray(created) ? created[0] : created;
 
-    // ✅ Guardamos referencia del asiento en la transacción (best-effort)
+    // ✅ Guardar referencia (best-effort)
     try {
       tx.asientoCobroId = tx.asientoCobroId ?? entryDoc._id;
       tx.asiento_cobro_id = tx.asiento_cobro_id ?? entryDoc._id;
@@ -512,11 +626,11 @@ router.post("/registrar-pago", ensureAuth, async (req, res) => {
       session = null;
     }
 
-    // ✅ Respuesta UI
-    const accountMaps = await buildAccountMaps(owner, [entryDoc.toObject ? entryDoc.toObject() : entryDoc]);
-    const asiento = mapEntryForUI(entryDoc.toObject ? entryDoc.toObject() : entryDoc, accountMaps);
+    const entryPlain = entryDoc?.toObject ? entryDoc.toObject() : entryDoc;
+    const accountMaps = await buildAccountMaps(owner, [entryPlain]);
+    const asiento = mapEntryForUI(entryPlain, accountMaps);
 
-    const txUI = mapTxForUI(tx.toObject ? tx.toObject() : tx);
+    const txUI = mapTxForUI(tx?.toObject ? tx.toObject() : tx);
 
     return res.status(201).json({
       ok: true,
