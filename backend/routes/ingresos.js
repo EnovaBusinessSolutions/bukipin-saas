@@ -425,6 +425,16 @@ async function attachSubcuentaFromProduct(owner, items) {
     it.producto_id ??
     it.itemId ??
     it.item_id ??
+
+    // ✅ alias catálogo/precargados
+    it.catalogProductId ??
+    it.catalog_product_id ??
+    it.precargadoId ??
+    it.precargado_id ??
+    it.productoPrecargadoId ??
+    it.producto_precargado_id ??
+    it.selectedProductId ??
+    it.selected_product_id ??
     null;
 
   const need = items
@@ -697,7 +707,6 @@ async function buildLine(owner, { code, debit = 0, credit = 0, memo = "" }) {
   return base;
 }
 
-
 /**
  * ✅ Mapper JournalEntry → UI (soporta líneas por code o por accountId)
  */
@@ -866,6 +875,7 @@ function pickQty(body) {
   return n > 0 ? n : 1;
 }
 
+// ✅ MODIFICADO: soportar IDs de catálogo/precargados
 function pickProductId(body) {
   return (
     body?.productId ??
@@ -874,6 +884,20 @@ function pickProductId(body) {
     body?.producto_id ??
     body?.itemId ??
     body?.item_id ??
+
+    // ✅ alias típicos de catálogo/precargados
+    body?.catalogProductId ??
+    body?.catalog_product_id ??
+    body?.catalogoProductoId ??
+    body?.catalogo_producto_id ??
+    body?.precargadoId ??
+    body?.precargado_id ??
+    body?.productoPrecargadoId ??
+    body?.producto_precargado_id ??
+    body?.selectedProductId ??
+    body?.selected_product_id ??
+    body?.productoSeleccionadoId ??
+    body?.producto_seleccionado_id ??
     null
   );
 }
@@ -913,6 +937,16 @@ function extractSaleItems(body) {
       it.item_id ??
       it._id ??
       it.id ??
+
+      // ✅ alias catálogo/precargados
+      it.catalogProductId ??
+      it.catalog_product_id ??
+      it.precargadoId ??
+      it.precargado_id ??
+      it.productoPrecargadoId ??
+      it.producto_precargado_id ??
+      it.selectedProductId ??
+      it.selected_product_id ??
       null;
 
     const qty = num(
@@ -925,6 +959,8 @@ function extractSaleItems(body) {
         it.cantidadVender ??
         it.cantidad_vender ??
         it.cantidad_producto ??
+        it.cantidadVendida ??
+        it.cantidad_vendida ??
         0,
       0
     );
@@ -1584,7 +1620,7 @@ router.post("/", ensureAuth, async (req, res) => {
       req.body?.cuentaCodigo || req.body?.cuentaPrincipalCodigo || "4001"
     ).trim();
 
-    // ✅ subcuenta puede venir por body (NO la inferimos por producto si hay varios)
+    // ✅ subcuenta puede venir por body
     let subcuentaRef =
       req.body?.subcuentaId ??
       req.body?.subcuenta_id ??
@@ -1631,8 +1667,7 @@ router.post("/", ensureAuth, async (req, res) => {
 
     /**
      * ============================
-     * ✅ FIX PRINCIPAL:
-     * Detectar productos vendidos desde arrays (items/productos/...)
+     * ✅ Detectar productos vendidos
      * ============================
      */
     const saleItems = extractSaleItems(req.body);
@@ -1651,6 +1686,85 @@ router.post("/", ensureAuth, async (req, res) => {
       req.body?.isInventariado === true ||
       req.body?.forceInventario === true ||
       (hasArrayItems && saleItems.some((x) => x.isInventariado === true));
+
+    /**
+     * ==========================================
+     * ✅ FIX SUBCUENTA E2E (PRECARGADOS)
+     * Si el body NO manda subcuenta, la inferimos desde Product:
+     *  - Caso 1: venta de 1 producto (legacyProductId) => tomamos su subcuenta
+     *  - Caso 2: array de items => solo si TODOS comparten la misma subcuenta
+     *    (si hay mezcla, dejamos null para evitar asignación incorrecta)
+     * ==========================================
+     */
+    if (!subcuentaRef && Product) {
+      const readSubRefFromProduct = async (pidRaw) => {
+        if (!pidRaw || !isObjectId(pidRaw)) return null;
+
+        const p = await Product.findOne({
+          owner,
+          _id: new mongoose.Types.ObjectId(String(pidRaw)),
+        })
+          .select("subcuentaId subcuenta_id subcuenta subcuentaCodigo subcuenta_codigo")
+          .lean()
+          .catch(() => null);
+
+        if (!p) return null;
+
+        return (
+          p.subcuentaId ??
+          p.subcuenta_id ??
+          p.subcuenta ??
+          p.subcuentaCodigo ??
+          p.subcuenta_codigo ??
+          null
+        );
+      };
+
+      // Caso 1: 1 solo producto “suelto”
+      if (!hasArrayItems && legacyProductId && isObjectId(legacyProductId)) {
+        const subRef = await readSubRefFromProduct(legacyProductId);
+        if (subRef) subcuentaRef = String(subRef);
+      }
+
+      // Caso 2: array de productos, tomar subcuenta solo si es uniforme
+      if (!subcuentaRef && hasArrayItems) {
+        const ids = Array.from(
+          new Set(
+            saleItems
+              .map((x) => x?.productId)
+              .filter(Boolean)
+              .map((v) => String(v))
+              .filter((v) => isObjectId(v))
+          )
+        );
+
+        if (ids.length) {
+          const prods = await Product.find({
+            owner,
+            _id: { $in: ids.map((x) => new mongoose.Types.ObjectId(x)) },
+          })
+            .select("subcuentaId subcuenta_id subcuenta subcuentaCodigo subcuenta_codigo")
+            .lean()
+            .catch(() => []);
+
+          const refs = prods
+            .map(
+              (p) =>
+                p.subcuentaId ??
+                p.subcuenta_id ??
+                p.subcuenta ??
+                p.subcuentaCodigo ??
+                p.subcuenta_codigo ??
+                null
+            )
+            .filter(Boolean)
+            .map((r) => String(r));
+
+          const unique = Array.from(new Set(refs));
+          if (unique.length === 1) subcuentaRef = unique[0];
+        }
+      }
+    }
 
     // Meta inventario por cada item
     const invItemsMeta = []; // [{ productIdStr, productIdObj, productName, qty, costUnit, costTotal, stockKey, stockBefore, stockAfter, stockSource, raw }]
@@ -1921,8 +2035,6 @@ router.post("/", ensureAuth, async (req, res) => {
      * ✅ INVENTARIO (por producto)
      *   - Debe 5002 (costo de venta)
      *   - Haber 1005 (salida inventario)
-     *
-     * Aquí está la clave: si vendes 15, el costo total será costoUnit * 15.
      */
     if (invItemsMeta.length) {
       for (const meta of invItemsMeta) {
@@ -1957,19 +2069,18 @@ router.post("/", ensureAuth, async (req, res) => {
     const numeroAsiento = await nextJournalNumber(owner, tx.fecha);
 
     const entry = await JournalEntry.create({
-  owner,
-  date: tx.fecha,
-  concept: `Ingreso: ${tx.descripcion}`,
-  source: "ingreso",
-  sourceId: tx._id,
+      owner,
+      date: tx.fecha,
+      concept: `Ingreso: ${tx.descripcion}`,
+      source: "ingreso",
+      sourceId: tx._id,
 
-  // ✅ guardamos en ambos nombres (según el schema real)
-  lines,
-  detalle_asientos: lines,
+      // ✅ guardamos en ambos nombres (según el schema real)
+      lines,
+      detalle_asientos: lines,
 
-  numeroAsiento,
-});
-
+      numeroAsiento,
+    });
 
     // espejo en la tx
     try {
@@ -2048,6 +2159,7 @@ router.post("/", ensureAuth, async (req, res) => {
 
     let txUI = mapTxForUI(tx.toObject ? tx.toObject() : tx);
     txUI = (await attachAccountInfo(owner, [txUI]))[0];
+    txUI = (await attachSubcuentaFromProduct(owner, [txUI]))[0]; // ✅ NUEVO (seguro)
     txUI = (await attachSubcuentaInfo(owner, [txUI]))[0];
     txUI = (await attachClientInfo(owner, [txUI]))[0];
 
