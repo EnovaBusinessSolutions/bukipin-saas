@@ -1656,10 +1656,17 @@ router.post("/", ensureAuth, async (req, res) => {
     const saldoPendiente = tipoPago === "contado" ? 0 : Math.max(0, neto - montoPagado);
 
     const COD_CAJA = "1001";
-    const COD_BANCOS = "1002";
-    const COD_CXC = "1003"; // ✅ SIEMPRE aquí van los saldos pendientes
-    const COD_DESCUENTOS = "4002";
+const COD_BANCOS = "1002";
+const COD_CXC = "1003"; // CxC Clientes
+const COD_DEUDORES = "1009"; // ✅ NUEVO: Deudores Diversos (solo para "Otros ingresos")
+const COD_DESCUENTOS = "4002";
     const codCobro = metodoPago === "bancos" ? COD_BANCOS : COD_CAJA;
+
+    const isOtrosIngreso =
+  lower(tipoIngreso) === "otros" ||
+  String(cuentaCodigo || "").trim() === "4102";
+
+const COD_PENDIENTE = isOtrosIngreso ? COD_DEUDORES : COD_CXC;
 
     // ✅ Inventario
     const COD_COGS = "5002";
@@ -2008,15 +2015,17 @@ router.post("/", ensureAuth, async (req, res) => {
       }
 
       if (saldoPendiente > 0) {
-        lines.push(
-          await buildLine(owner, {
-            code: COD_CXC,
-            debit: saldoPendiente,
-            credit: 0,
-            memo: "Saldo pendiente (Cuentas por Cobrar)",
-          })
-        );
-      }
+  lines.push(
+    await buildLine(owner, {
+      code: COD_PENDIENTE,
+      debit: saldoPendiente,
+      credit: 0,
+      memo: isOtrosIngreso
+        ? "Saldo pendiente (Deudores Diversos)"
+        : "Saldo pendiente (Cuentas por Cobrar)",
+    })
+  );
+}
     }
 
     const haberIngresos = descuento > 0 ? total : neto;
