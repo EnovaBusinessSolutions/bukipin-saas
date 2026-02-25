@@ -8,6 +8,7 @@ const User = require("../models/User");
 const sendEmail = require("../utils/sendEmail");
 const ensureAuth = require("../middleware/ensureAuth"); // ✅
 const { seedDefaultsForUser } = require("../utils/seedDefaults");
+const Account = require("../models/Account");
 
 
 const router = express.Router();
@@ -583,17 +584,40 @@ router.post("/logout", (req, res) => {
 /**
  * ✅ GET /api/auth/me
  * Útil para validar cookie y obtener userId en frontend.
+ * ✅ E2E: asegura seed defaults (idempotente) si faltan cuentas.
  */
-router.get("/me", ensureAuth, (req, res) => {
-  return res.json({
-    ok: true,
-    user: {
-      id: req.user._id,
-      name: req.user.name,
-      email: req.user.email,
-      isVerified: req.user.isVerified,
-    },
-  });
+router.get("/me", ensureAuth, async (req, res) => {
+  try {
+    const owner = req.user._id;
+
+    // ✅ Si el usuario está verificado, aseguramos catálogo base
+    // (idempotente por upsert; NO pisa cambios del usuario)
+    if (req.user.isVerified) {
+      try {
+        // Si quieres hacerlo todavía más eficiente:
+        // solo sembrar si no tiene cuentas aún.
+        const hasAnyAccount = await Account.exists({ owner });
+        if (!hasAnyAccount) {
+          await seedDefaultsForUser(owner);
+        }
+      } catch (e) {
+        console.error("❌ seedDefaultsForUser (me) error:", e);
+      }
+    }
+
+    return res.json({
+      ok: true,
+      user: {
+        id: req.user._id,
+        name: req.user.name,
+        email: req.user.email,
+        isVerified: req.user.isVerified,
+      },
+    });
+  } catch (err) {
+    console.error("❌ Error en GET /api/auth/me:", err);
+    return res.status(500).json({ ok: false, message: "Error cargando usuario." });
+  }
 });
 
 module.exports = router;

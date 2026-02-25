@@ -30,7 +30,7 @@ const DEFAULT_ACCOUNTS = [
   { code: "1006", name: "Inventario de Materias Primas", type: "activo" },
   { code: "1007", name: "IVA Acreditable", type: "activo" },
   { code: "1008", name: "Gastos Pagados por Anticipado", type: "activo" },
-
+  { code: "1009", name: "Deudores Diversos", type: "activo" },
 
   // =======================
   // ACTIVOS (No circulante)
@@ -152,7 +152,6 @@ const DEFAULT_ACCOUNTS = [
   // =======================
   { code: "6001", name: "Impuesto sobre la Renta", type: "gasto" },
   { code: "6002", name: "Participación de Utilidades a Trabajadores", type: "gasto" },
-
 ];
 
 async function seedDefaultsForUser(userId) {
