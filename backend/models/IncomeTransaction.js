@@ -41,6 +41,10 @@ const incomeTransactionSchema = new mongoose.Schema(
 
     fecha: { type: Date, default: Date.now, index: true },
 
+    // ✅ NUEVO (CANÓNICO): fecha límite / vencimiento (para CxC)
+    // - NO adivinar nombres: este es el nombre oficial a usar en backend+frontend
+    fechaLimite: { type: Date, default: null, index: true },
+
     // precargados | inventariados | general | otros
     tipoIngreso: { type: String, default: "general", trim: true, index: true },
 
@@ -119,6 +123,12 @@ const incomeTransactionSchema = new mongoose.Schema(
         ret.tipo_pago = ret.tipoPago;
         ret.monto_pagado = ret.montoPagado;
 
+        // ✅ fecha límite (aliases para UI/legacy)
+        // - canónico: fechaLimite
+        // - compat: fecha_limite / fecha_vencimiento
+        ret.fecha_limite = ret.fechaLimite ? new Date(ret.fechaLimite).toISOString() : null;
+        ret.fecha_vencimiento = ret.fechaLimite ? new Date(ret.fechaLimite).toISOString() : null;
+
         // pendientes (todas las variantes)
         ret.saldo_pendiente = ret.saldoPendiente;
         ret.monto_pendiente = typeof ret.montoPendiente === "number" ? ret.montoPendiente : ret.saldoPendiente;
@@ -191,11 +201,24 @@ incomeTransactionSchema.index({ owner: 1, fecha: -1 });
 incomeTransactionSchema.index({ owner: 1, estado: 1, fecha: -1 });
 incomeTransactionSchema.index({ owner: 1, clienteId: 1, fecha: -1 });
 
+// ✅ NUEVO: index útil para queries por vencimiento
+incomeTransactionSchema.index({ owner: 1, fechaLimite: 1, estado: 1 });
+
 // ✅ Asegurar consistencia: si vienen variantes, las espejeamos
 incomeTransactionSchema.pre("save", function (next) {
   // cuenta principal
   if (!this.cuentaPrincipalCodigo && this.cuentaCodigo) this.cuentaPrincipalCodigo = this.cuentaCodigo;
   if (!this.cuentaCodigo && this.cuentaPrincipalCodigo) this.cuentaCodigo = this.cuentaPrincipalCodigo;
+
+  // ✅ fecha límite: aceptar asignaciones legacy internas si algún flujo las setea
+  // (nota: Mongo SOLO guarda lo que el backend le mande; esto no "inventará" fechas)
+  if (!this.fechaLimite) {
+    const raw = this.fecha_limite || this.fecha_vencimiento || null; // por si algún flujo lo setea así en memoria
+    if (raw) {
+      const d = new Date(raw);
+      if (!Number.isNaN(d.getTime())) this.fechaLimite = d;
+    }
+  }
 
   // pendientes
   if (typeof this.saldoPendiente === "number") {

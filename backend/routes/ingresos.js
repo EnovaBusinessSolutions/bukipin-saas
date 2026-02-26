@@ -131,6 +131,22 @@ function parseTxDateSmart(raw, now = new Date()) {
   return d2 || now;
 }
 
+// ✅ NUEVO: parse robusto de fecha límite / vencimiento
+// - acepta YYYY-MM-DD (date-only) y lo convierte a FIN del día local (23:59:59.999)
+// - acepta ISO/date strings normales
+function parseDueDateSmart(raw) {
+  if (!raw) return null;
+
+  const str = String(raw).trim();
+  if (!str) return null;
+
+  // date-only => fin de día local
+  if (isDateOnly(str)) return dateOnlyToUtc(str, 23, 59, 59, 999);
+
+  const d = new Date(str);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
 function fixFechaWithCreatedAt(tx) {
   const f = tx?.fecha ? new Date(tx.fecha) : null;
   const c = tx?.createdAt ? new Date(tx.createdAt) : null;
@@ -555,6 +571,18 @@ async function attachClientInfo(owner, items) {
 function mapTxForUI(tx) {
   const fechaFixed = fixFechaWithCreatedAt(tx);
   const fecha = fechaFixed ? new Date(fechaFixed) : tx?.fecha ? new Date(tx.fecha) : null;
+    // ✅ NUEVO: fecha límite/vencimiento (normalización)
+  const rawDue =
+    tx.fechaLimite ??
+    tx.fecha_limite ??
+    tx.fechaVencimiento ??
+    tx.fecha_vencimiento ??
+    tx.dueDate ??
+    tx.due_date ??
+    null;
+
+  const fechaVenc = rawDue ? new Date(rawDue) : null;
+  const fechaVencOk = fechaVenc && !Number.isNaN(fechaVenc.getTime()) ? fechaVenc : null;
 
   const montos = computeMontos(tx);
 
@@ -578,6 +606,13 @@ function mapTxForUI(tx) {
     fecha,
     fecha_fixed: fecha ? fecha.toISOString() : null,
     fecha_ymd: fecha ? toYMDLocal(fecha) : null,
+
+        // ✅ NUEVO: vencimiento (lo que ocupa CxC para NO decir "Sin fecha límite")
+    fechaLimite: fechaVencOk,
+    fecha_limite: fechaVencOk ? toYMDLocal(fechaVencOk) : null,
+
+    fechaVencimiento: fechaVencOk,
+    fecha_vencimiento: fechaVencOk ? toYMDLocal(fechaVencOk) : null,
 
     montoTotal: montos.total,
     montoDescuento: montos.descuento,
@@ -1632,6 +1667,30 @@ router.post("/", ensureAuth, async (req, res) => {
     let fecha = parseTxDateSmart(req.body?.fecha, now);
     if (!fecha) return res.status(400).json({ ok: false, message: "fecha inválida." });
 
+    // ✅ NUEVO: fecha límite / vencimiento (CANÓNICA)
+// Aceptamos varias llaves para no depender de “nombres hipotéticos”
+// pero guardamos en un solo campo real (fechaLimite/fechaVencimiento)
+const rawFechaLimite =
+  req.body?.fechaLimite ??
+  req.body?.fecha_limite ??
+  req.body?.fechaVencimiento ??
+  req.body?.fecha_vencimiento ??
+  req.body?.dueDate ??
+  req.body?.due_date ??
+  req.body?.vencimiento ??
+  req.body?.fechaLim ??
+  null;
+
+const fechaLimiteParsed = parseDueDateSmart(rawFechaLimite);
+
+// Si mandaron algo pero no es parseable => error (evita basura)
+if (rawFechaLimite && !fechaLimiteParsed) {
+  return res.status(400).json({
+    ok: false,
+    message: "fechaLimite/fecha_vencimiento inválida. Usa YYYY-MM-DD o una fecha ISO válida.",
+  });
+}
+
     const montoPagadoRaw = num(req.body?.montoPagado ?? req.body?.pagado, 0);
 
     if (!total || total <= 0) {
@@ -1888,6 +1947,8 @@ const COD_PENDIENTE = isOtrosIngreso ? COD_DEUDORES : COD_CXC;
     const txPayload = {
       owner,
       fecha,
+      fechaLimite: fechaLimiteParsed,
+      fechaVencimiento: fechaLimiteParsed,
       tipoIngreso,
       descripcion,
 
