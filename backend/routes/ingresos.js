@@ -1667,13 +1667,10 @@ router.post("/", ensureAuth, async (req, res) => {
     let fecha = parseTxDateSmart(req.body?.fecha, now);
     if (!fecha) return res.status(400).json({ ok: false, message: "fecha inválida." });
 
-    // ✅ NUEVO: fecha límite / vencimiento (CANÓNICA)
-// Aceptamos varias llaves para no depender de “nombres hipotéticos”
-// pero guardamos en un solo campo real (fechaLimite/fechaVencimiento)
-const rawFechaLimite =
+    const rawFechaLimite =
   req.body?.fechaLimite ??
   req.body?.fecha_limite ??
-  req.body?.fechaVencimiento ??
+  req.body?.fechaVencimiento ??     // compat lectura
   req.body?.fecha_vencimiento ??
   req.body?.dueDate ??
   req.body?.due_date ??
@@ -1683,11 +1680,11 @@ const rawFechaLimite =
 
 const fechaLimiteParsed = parseDueDateSmart(rawFechaLimite);
 
-// Si mandaron algo pero no es parseable => error (evita basura)
+// Si mandaron algo pero no es parseable => error
 if (rawFechaLimite && !fechaLimiteParsed) {
   return res.status(400).json({
     ok: false,
-    message: "fechaLimite/fecha_vencimiento inválida. Usa YYYY-MM-DD o una fecha ISO válida.",
+    message: "Fecha límite inválida. Usa YYYY-MM-DD o una fecha ISO válida.",
   });
 }
 
@@ -1713,6 +1710,17 @@ if (rawFechaLimite && !fechaLimiteParsed) {
     const montoPagado =
       tipoPago === "contado" ? neto : Math.min(Math.max(montoPagadoRaw, 0), neto);
     const saldoPendiente = tipoPago === "contado" ? 0 : Math.max(0, neto - montoPagado);
+
+    // ✅ REGLA E2E: si hay saldo pendiente (credito/parcial), debe haber fecha límite
+if (saldoPendiente > 0 && !fechaLimiteParsed) {
+  return res.status(400).json({
+    ok: false,
+    message: "Para pagos a crédito/parcial debes indicar la fecha límite (fechaLimite).",
+  });
+}
+
+// Si NO hay saldo pendiente, la fecha límite no aplica (evita guardar basura)
+const fechaLimiteFinal = saldoPendiente > 0 ? fechaLimiteParsed : null;
 
     const COD_CAJA = "1001";
 const COD_BANCOS = "1002";
@@ -1947,8 +1955,7 @@ const COD_PENDIENTE = isOtrosIngreso ? COD_DEUDORES : COD_CXC;
     const txPayload = {
       owner,
       fecha,
-      fechaLimite: fechaLimiteParsed,
-      fechaVencimiento: fechaLimiteParsed,
+      fechaLimite: fechaLimiteFinal,
       tipoIngreso,
       descripcion,
 

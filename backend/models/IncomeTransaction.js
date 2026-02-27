@@ -41,8 +41,8 @@ const incomeTransactionSchema = new mongoose.Schema(
 
     fecha: { type: Date, default: Date.now, index: true },
 
-    // ✅ NUEVO (CANÓNICO): fecha límite / vencimiento (para CxC)
-    // - NO adivinar nombres: este es el nombre oficial a usar en backend+frontend
+    // ✅ CANÓNICO: fecha límite / vencimiento (CxC)
+    // - Nombre oficial para backend + frontend: fechaLimite
     fechaLimite: { type: Date, default: null, index: true },
 
     // precargados | inventariados | general | otros
@@ -58,7 +58,7 @@ const incomeTransactionSchema = new mongoose.Schema(
     tipoPago: { type: String, default: "contado", trim: true }, // contado | parcial | credito
     montoPagado: { type: Number, default: 0 },
 
-    // ✅ Saldo pendiente (CxC) — regla: siempre a 1003 en asientos cuando aplique
+    // ✅ Saldo pendiente (CxC)
     saldoPendiente: { type: Number, default: 0, index: true },
 
     // Compat extra (a veces UI/legacy usa estos nombres)
@@ -78,7 +78,7 @@ const incomeTransactionSchema = new mongoose.Schema(
     // Cliente
     clienteId: { type: mongoose.Schema.Types.ObjectId, ref: "Client", default: null, index: true },
 
-    // ✅ Link contable (para abrir modal y trazabilidad)
+    // ✅ Link contable
     asientoId: { type: mongoose.Schema.Types.ObjectId, ref: "JournalEntry", default: null, index: true },
     journalEntryId: { type: mongoose.Schema.Types.ObjectId, ref: "JournalEntry", default: null, index: true },
     numeroAsiento: { type: String, default: null, trim: true, index: true },
@@ -123,15 +123,20 @@ const incomeTransactionSchema = new mongoose.Schema(
         ret.tipo_pago = ret.tipoPago;
         ret.monto_pagado = ret.montoPagado;
 
-        // ✅ fecha límite (aliases para UI/legacy)
-        // - canónico: fechaLimite
-        // - compat: fecha_limite / fecha_vencimiento
-        ret.fecha_limite = ret.fechaLimite ? new Date(ret.fechaLimite).toISOString() : null;
-        ret.fecha_vencimiento = ret.fechaLimite ? new Date(ret.fechaLimite).toISOString() : null;
+        // ✅ fecha límite / vencimiento
+        // - canónico: fechaLimite (camel) -> ISO string (o null)
+        // - compat: fecha_limite / fecha_vencimiento (snake) -> ISO string (o null)
+        const fl = ret.fechaLimite ? new Date(ret.fechaLimite) : null;
+        const flIso = fl && !Number.isNaN(fl.getTime()) ? fl.toISOString() : null;
+
+        ret.fechaLimite = flIso;          // ✅ clave canónica para frontend moderno
+        ret.fecha_limite = flIso;         // compat
+        ret.fecha_vencimiento = flIso;    // compat
 
         // pendientes (todas las variantes)
         ret.saldo_pendiente = ret.saldoPendiente;
-        ret.monto_pendiente = typeof ret.montoPendiente === "number" ? ret.montoPendiente : ret.saldoPendiente;
+        ret.monto_pendiente =
+          typeof ret.montoPendiente === "number" ? ret.montoPendiente : ret.saldoPendiente;
         ret.pendiente = typeof ret.pendiente === "number" ? ret.pendiente : ret.saldoPendiente;
 
         // cuenta/subcuenta
@@ -201,19 +206,21 @@ incomeTransactionSchema.index({ owner: 1, fecha: -1 });
 incomeTransactionSchema.index({ owner: 1, estado: 1, fecha: -1 });
 incomeTransactionSchema.index({ owner: 1, clienteId: 1, fecha: -1 });
 
-// ✅ NUEVO: index útil para queries por vencimiento
+// ✅ index útil para queries por vencimiento
 incomeTransactionSchema.index({ owner: 1, fechaLimite: 1, estado: 1 });
 
-// ✅ Asegurar consistencia: si vienen variantes, las espejeamos
+// ✅ Asegurar consistencia
 incomeTransactionSchema.pre("save", function (next) {
   // cuenta principal
   if (!this.cuentaPrincipalCodigo && this.cuentaCodigo) this.cuentaPrincipalCodigo = this.cuentaCodigo;
   if (!this.cuentaCodigo && this.cuentaPrincipalCodigo) this.cuentaCodigo = this.cuentaPrincipalCodigo;
 
-  // ✅ fecha límite: aceptar asignaciones legacy internas si algún flujo las setea
-  // (nota: Mongo SOLO guarda lo que el backend le mande; esto no "inventará" fechas)
+  // ✅ fecha límite: si por alguna razón llega en props "extra", la intentamos leer (best-effort)
   if (!this.fechaLimite) {
-    const raw = this.fecha_limite || this.fecha_vencimiento || null; // por si algún flujo lo setea así en memoria
+    const raw =
+      (typeof this.get === "function" ? (this.get("fecha_limite") || this.get("fecha_vencimiento")) : null) ||
+      (this.fecha_limite || this.fecha_vencimiento || null);
+
     if (raw) {
       const d = new Date(raw);
       if (!Number.isNaN(d.getTime())) this.fechaLimite = d;
@@ -229,26 +236,22 @@ incomeTransactionSchema.pre("save", function (next) {
     this.saldoPendiente = Number.isFinite(p) ? p : 0;
   }
 
-  // items: si qty viene y cantidad no, o viceversa
+  // items espejo
   if (Array.isArray(this.items)) {
     this.items = this.items.map((it) => {
       const cantidad = Number(it.cantidad || it.qty || 0);
       it.cantidad = cantidad;
       it.qty = cantidad;
 
-      // productoId espejo
       if (!it.productoId && it.productId) it.productoId = it.productId;
       if (!it.productId && it.productoId) it.productId = it.productoId;
 
-      // nombre espejo
       if (!it.nombre && it.productName) it.nombre = it.productName;
       if (!it.productName && it.nombre) it.productName = it.nombre;
 
-      // precio espejo
       if (!it.precioUnitario && it.precio_unitario) it.precioUnitario = it.precio_unitario;
       if (!it.precio_unitario && it.precioUnitario) it.precio_unitario = it.precioUnitario;
 
-      // costo espejo
       if (!it.costoUnitario && it.costo_unitario) it.costoUnitario = it.costo_unitario;
       if (!it.costo_unitario && it.costoUnitario) it.costo_unitario = it.costoUnitario;
       if (!it.costoTotal && it.costo_total) it.costoTotal = it.costo_total;
