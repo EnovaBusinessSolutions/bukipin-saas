@@ -61,6 +61,11 @@ function getCobroPagoModel() {
           ret.numero_asiento = ret.numeroAsiento || null;
           ret.metodo_pago = ret.metodoPago || null;
 
+          // ✅ compat adicional (frontend CxC suele leer "descripcion")
+          ret.descripcion = ret.nota || "";
+          ret.concepto = ret.nota || "";
+          ret.tipo_transaccion = ret.tipo || "cobro";
+
           delete ret._id;
           delete ret.__v;
           delete ret.createdAt;
@@ -113,12 +118,22 @@ function mapCobroPagoCompat(doc) {
   const _id = doc?._id ?? doc?.id ?? null;
 
   const referenciaId =
-    doc?.referencia_id ?? doc?.referenciaId ?? doc?.referencia ?? doc?.sourceId ?? doc?.transaccionId ?? null;
+    doc?.referencia_id ??
+    doc?.referenciaId ??
+    doc?.referencia ??
+    doc?.sourceId ??
+    doc?.transaccionId ??
+    null;
 
   const asientoId =
     doc?.asientoId ?? doc?.asiento_id ?? doc?.journalEntryId ?? null;
 
-  const fecha = asValidDate(doc?.fecha) || asValidDate(doc?.date) || asValidDate(doc?.createdAt) || new Date();
+  const fecha =
+    asValidDate(doc?.fecha) ||
+    asValidDate(doc?.date) ||
+    asValidDate(doc?.createdAt) ||
+    (doc?.created_at ? asValidDate(doc.created_at) : null) ||
+    new Date();
 
   const metodoPago = normalizeMetodoPago(doc?.metodoPago ?? doc?.metodo_pago);
 
@@ -131,8 +146,10 @@ function mapCobroPagoCompat(doc) {
     id: _id ? String(_id) : undefined,
 
     tipo: doc?.tipo ?? "cobro",
-    referencia_tipo: doc?.referencia_tipo ?? "ingreso",
+    // ✅ compat para el frontend (pago inicial usa tipo_transaccion)
+    tipo_transaccion: doc?.tipo_transaccion ?? doc?.tipo ?? "cobro",
 
+    referencia_tipo: doc?.referencia_tipo ?? "ingreso",
     referencia_id: referenciaId ? String(referenciaId) : null,
 
     fecha: fecha.toISOString(),
@@ -142,7 +159,10 @@ function mapCobroPagoCompat(doc) {
 
     monto: num(doc?.monto, 0),
 
+    // ✅ compat: el frontend muestra "pago.descripcion"
     nota,
+    descripcion: nota,
+    concepto: nota,
 
     asientoId: asientoId ? String(asientoId) : null,
     asiento_id: asientoId ? String(asientoId) : null,
@@ -164,8 +184,7 @@ async function fallbackHistorialFromJournalEntries(owner, referenciaId, tipo, li
   if (!JournalEntry) return [];
 
   // Para CxC: cobros reales están en JournalEntry con source="cobro_cxc"
-  // y sourceId/transaccionId = id del ingreso
-  // (esto lo estás creando en cxc.js)
+  // y sourceId/transaccionId = id del ingreso (lo crea cxc.js)
   const refObjId = new mongoose.Types.ObjectId(String(referenciaId));
 
   const q = {
@@ -175,20 +194,25 @@ async function fallbackHistorialFromJournalEntries(owner, referenciaId, tipo, li
   };
 
   const rows = await JournalEntry.find(q)
-    .select("date fecha createdAt updatedAt concept concepto descripcion numeroAsiento numero_asiento numero folio source sourceId transaccionId lines detalle_asientos detalles_asiento")
+    .select(
+      "date fecha createdAt updatedAt concept concepto descripcion numeroAsiento numero_asiento numero folio source sourceId transaccionId lines detalle_asientos detalles_asiento"
+    )
     .sort({ date: -1, fecha: -1, createdAt: -1 })
     .limit(limit)
     .lean();
 
-  // Intentamos inferir monto y metodoPago desde lines:
-  // Cobro CxC: Debe 1001/1002, Haber 1003
+  // Inferir monto y metodoPago desde lines:
+  // Cobro CxC: Debe 1001/1002, Haber 1003/1009
   const out = (rows || []).map((e) => {
     const lines = e.lines || e.detalle_asientos || e.detalles_asiento || [];
 
     let debe1001 = 0;
     let debe1002 = 0;
+
     for (const l of lines || []) {
-      const code = String(l.accountCodigo ?? l.accountCode ?? l.cuenta_codigo ?? l.cuentaCodigo ?? "").trim();
+      const code = String(
+        l.accountCodigo ?? l.accountCode ?? l.cuenta_codigo ?? l.cuentaCodigo ?? ""
+      ).trim();
       const debit = num(l.debit ?? l.debe, 0);
 
       if (code === "1001") debe1001 += debit;
@@ -198,9 +222,12 @@ async function fallbackHistorialFromJournalEntries(owner, referenciaId, tipo, li
     const monto = Math.max(0, Number((debe1001 + debe1002).toFixed(2)));
     const metodoPago = debe1002 > 0 ? "bancos" : "efectivo";
 
+    const conceptText = e.concept ?? e.concepto ?? e.descripcion ?? "";
+
     return mapCobroPagoCompat({
       _id: e._id,
       tipo,
+      tipo_transaccion: tipo,
       referencia_tipo: "ingreso",
       referencia_id: referenciaId,
 
@@ -209,7 +236,9 @@ async function fallbackHistorialFromJournalEntries(owner, referenciaId, tipo, li
       metodoPago,
       monto,
 
-      nota: e.concept ?? e.concepto ?? e.descripcion ?? "",
+      nota: conceptText,
+      descripcion: conceptText,
+      concepto: conceptText,
 
       asientoId: e._id,
       numeroAsiento: e.numeroAsiento ?? e.numero_asiento ?? e.numero ?? e.folio ?? null,
@@ -253,7 +282,7 @@ router.get("/historial", ensureAuth, async (req, res) => {
 
     const CobroPago = getCobroPagoModel();
 
-    // ✅ Ojo: NO usamos lean para aprovechar toJSON/transform y evitar basura (_id, __v, etc.)
+    // ✅ NO usamos lean para aprovechar toJSON/transform
     const docs = await CobroPago.find({
       owner,
       tipo,
@@ -280,15 +309,6 @@ router.get("/historial", ensureAuth, async (req, res) => {
 
 /**
  * (Opcional) POST /api/cobros-pagos/registrar
- * Si luego quieres guardar historial formalmente desde el frontend.
- * Body:
- * - tipo: cobro|pago
- * - referencia_id
- * - monto
- * - metodoPago
- * - fecha
- * - nota
- * - asientoId / numeroAsiento (opcionales)
  */
 router.post("/registrar", ensureAuth, async (req, res) => {
   try {
@@ -309,7 +329,7 @@ router.post("/registrar", ensureAuth, async (req, res) => {
 
     const metodoPago = normalizeMetodoPago(req.body?.metodoPago ?? req.body?.metodo_pago ?? "efectivo");
     const fecha = asValidDate(req.body?.fecha) || new Date();
-    const nota = String(req.body?.nota ?? "").trim();
+    const nota = String(req.body?.nota ?? req.body?.descripcion ?? req.body?.concepto ?? "").trim();
 
     const asientoIdRaw = req.body?.asientoId ?? req.body?.asiento_id ?? null;
     const asientoId =

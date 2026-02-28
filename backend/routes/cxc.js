@@ -65,9 +65,7 @@ function toYMDLocal(d) {
 }
 
 /**
- * ✅ FIX TZ (como en transacciones.js):
- * Si tx.fecha viene en 00:00:00.000Z, el navegador -06 la mueve al día anterior.
- * Solución: mantenemos el día de fecha, pero usamos la hora real de createdAt.
+ * ✅ FIX TZ (como en transacciones.js)
  */
 function fixFechaWithCreatedAt(tx) {
   const f = asValidDate(tx?.fecha);
@@ -80,6 +78,7 @@ function fixFechaWithCreatedAt(tx) {
     f.getUTCHours() === 0 &&
     f.getUTCMinutes() === 0 &&
     f.getUTCSeconds() === 0 &&
+    f.getUTCHours() === 0 &&
     f.getUTCMilliseconds() === 0;
 
   if (!isMidnightUTC) return f;
@@ -104,7 +103,6 @@ function dateOnlyToUtc(str, hh = 0, mm = 0, ss = 0, ms = 0) {
   const [y, m, d] = s.split("-").map((x) => Number(x));
   if (!y || !m || !d) return null;
   const utcMillis = Date.UTC(y, m - 1, d, hh, mm, ss, ms);
-  // Ajuste por offset para representar "hora local" en UTC
   return new Date(utcMillis - TZ_OFFSET_MINUTES * 60 * 1000);
 }
 
@@ -118,7 +116,6 @@ function parseTxDateSmart(raw, now = new Date()) {
     return Number.isNaN(d.getTime()) ? now : d;
   }
 
-  // date-only: tomamos hora actual local (CDMX) y la convertimos a UTC
   const partsLocal = new Date(now.getTime() + TZ_OFFSET_MINUTES * 60 * 1000);
   const hh = partsLocal.getUTCHours();
   const mm = partsLocal.getUTCMinutes();
@@ -146,7 +143,6 @@ function parseOrder(order) {
 }
 
 async function nextJournalNumber(owner, dateObj) {
-  // Si no hay Counter, devolvemos algo estable (no romper UI)
   if (!Counter) {
     const y = new Date(dateObj || new Date()).getFullYear();
     return `${y}-0000`;
@@ -196,9 +192,6 @@ async function buildLine(owner, { code, debit = 0, credit = 0, memo = "" }) {
   return base;
 }
 
-/**
- * ✅ FIX: query $or plano (sin $or dentro de $or)
- */
 async function buildAccountMaps(owner, entries) {
   const codes = new Set();
   const ids = new Set();
@@ -349,17 +342,30 @@ function mapTxForUI(tx) {
 
   const subcuentaId = tx.subcuentaId ?? tx.subcuenta_id ?? null;
 
-  // ✅ FIX FECHA: evita invalid time value en el front
   const fechaFixed = fixFechaWithCreatedAt(tx);
   const fechaFinal = fechaFixed || asValidDate(tx.fecha) || asValidDate(tx.createdAt) || null;
+
+  // ✅ incluir fechaLimite / fecha_vencimiento para que CxC no dependa de otros endpoints
+  const fechaLimiteFinal =
+    asValidDate(tx.fechaLimite) ||
+    asValidDate(tx.fecha_limite) ||
+    asValidDate(tx.fecha_vencimiento) ||
+    asValidDate(tx.fechaVencimiento) ||
+    null;
 
   return {
     ...tx,
     id: tx._id ? String(tx._id) : tx.id,
 
-    fecha: fechaFinal, // Date -> JSON la convierte a ISO
+    fecha: fechaFinal,
     fecha_fixed: fechaFixed ? fechaFixed.toISOString() : null,
     fecha_ymd: fechaFinal ? toYMDLocal(fechaFinal) : null,
+
+    // ✅ vencimiento
+    fechaLimite: fechaLimiteFinal ? fechaLimiteFinal.toISOString() : null,
+    fecha_limite: fechaLimiteFinal ? fechaLimiteFinal.toISOString() : null,
+    fecha_vencimiento: fechaLimiteFinal ? toYMDLocal(fechaLimiteFinal) : null,
+    fechaVencimiento: fechaLimiteFinal ? toYMDLocal(fechaLimiteFinal) : null,
 
     montoTotal: montos.total,
     montoDescuento: montos.descuento,
@@ -384,7 +390,6 @@ function mapTxForUI(tx) {
     clienteId: tx.clienteId ?? tx.clientId ?? tx.cliente_id ?? tx.client_id ?? null,
     cliente_id: tx.cliente_id ?? tx.clienteId ?? tx.clientId ?? tx.client_id ?? null,
 
-    // si ya existe en doc, lo respetamos
     cliente_nombre: tx.cliente_nombre ?? tx.clienteNombre ?? tx.cliente_name ?? null,
 
     metodoPago: tx.metodoPago ?? tx.metodo_pago ?? null,
@@ -392,46 +397,16 @@ function mapTxForUI(tx) {
 
     metodo_pago: tx.metodoPago ?? tx.metodo_pago ?? null,
     tipo_pago: tx.tipoPago ?? tx.tipo_pago ?? null,
+
+    // para bucket 1009 (otros ingresos)
+    tipo_ingreso: tx.tipoIngreso ?? tx.tipo_ingreso ?? null,
+    tipoIngreso: tx.tipoIngreso ?? tx.tipo_ingreso ?? null,
+    cuenta_principal_codigo: cuentaCodigo ?? null,
   };
 }
 
 // =========================
-// Helpers para /asientos (histórico real CxC)
-// =========================
-function pickEntryDate(entry) {
-  return (
-    entry?.date ??
-    entry?.fecha ??
-    entry?.entryDate ??
-    entry?.asiento_fecha ??
-    entry?.createdAt ??
-    entry?.created_at ??
-    null
-  );
-}
-
-function lineAccountCode(line) {
-  return (
-    line?.accountCodigo ??
-    line?.accountCode ??
-    line?.cuenta_codigo ??
-    line?.cuentaCodigo ??
-    line?.account?.codigo ??
-    line?.cuentas?.codigo ??
-    null
-  );
-}
-
-function lineDebe(line) {
-  return num(line?.debe ?? line?.debit ?? line?.debitAmount ?? line?.debit_amount, 0);
-}
-
-function lineHaber(line) {
-  return num(line?.haber ?? line?.credit ?? line?.creditAmount ?? line?.credit_amount, 0);
-}
-
-// =========================
-// Handlers compartidos (para aliases limpios)
+// Handlers compartidos
 // =========================
 async function handleListIngresos(req, res) {
   try {
@@ -456,7 +431,6 @@ async function handleListIngresos(req, res) {
     const rows = await IncomeTransaction.find(query).sort(order).limit(limit).lean();
     let items = (rows || []).map(mapTxForUI);
 
-    // ✅ Enriquecer cliente_nombre best-effort si existe Client y viene clienteId
     if (Client) {
       const ids = [...new Set(items.map((x) => x.clienteId || x.cliente_id).filter(isObjectId).map(String))];
       if (ids.length) {
@@ -511,7 +485,6 @@ async function handleGetIngresoById(req, res) {
 
     let item = mapTxForUI(row);
 
-    // ✅ Enriquecer cliente_nombre best-effort
     if (Client) {
       const cid = item.clienteId || item.cliente_id;
       if (cid && isObjectId(cid) && !item.cliente_nombre) {
@@ -535,7 +508,7 @@ async function handleGetIngresoById(req, res) {
 }
 
 // =========================
-// Handler real para registrar pago (reusable por alias)
+// Handler real para registrar pago
 // =========================
 async function handleRegistrarPago(req, res) {
   let session = null;
@@ -543,9 +516,12 @@ async function handleRegistrarPago(req, res) {
   try {
     const owner = req.user._id;
 
+    // ✅ FIX: aceptar "cuentaId" (frontend) + aliases comunes
     const ingresoIdRaw =
       req.body?.ingresoId ??
       req.body?.ingreso_id ??
+      req.body?.cuentaId ??            // ✅ NUEVO
+      req.body?.cuenta_id ??           // ✅ NUEVO
       req.body?.transaccion_id ??
       req.body?.transaccionId ??
       req.body?.referencia_id ??
@@ -570,13 +546,16 @@ async function handleRegistrarPago(req, res) {
     const fecha = parseTxDateSmart(req.body?.fecha, new Date());
     const nota = String(req.body?.nota ?? req.body?.concepto ?? req.body?.descripcion ?? "").trim();
 
+    // ✅ soporte para 1003 vs 1009 (si viene del front / o inferimos)
+    const tipoRegistro = lower(req.body?.tipoRegistro ?? req.body?.referencia_tipo ?? req.body?.tipo ?? "ingreso");
+
     const COD_CAJA = "1001";
     const COD_BANCOS = "1002";
-    const COD_CXC = "1003";
+    const COD_CXC_CLIENTES = "1003";
+    const COD_DEUDORES = "1009";
 
     const codCobro = metodoPago === "bancos" ? COD_BANCOS : COD_CAJA;
 
-    // ✅ Transacción si está disponible (si no, sigue sin romper)
     try {
       session = await mongoose.startSession();
       session.startTransaction();
@@ -632,25 +611,24 @@ async function handleRegistrarPago(req, res) {
       tx.tipo_pago = "parcial";
     }
 
-    tx.metodoPago = tx.metodoPago ?? metodoPago;
-    tx.metodo_pago = tx.metodo_pago ?? metodoPago;
+    // ✅ siempre reflejar método del cobro
+    tx.metodoPago = metodoPago;
+    tx.metodo_pago = metodoPago;
 
     await tx.save({ session: session || undefined });
 
-    // ✅ Crear asiento del cobro
+    // ✅ decidir cuenta CxC a acreditar (1003 o 1009)
+    let codCxC = COD_CXC_CLIENTES;
+
+    // inferencia pro: si es "otros" o cuenta principal 4102 -> 1009
+    const tipoIng = lower(tx.tipoIngreso ?? tx.tipo_ingreso);
+    const cuentaPrincipal = String(tx.cuentaPrincipalCodigo ?? tx.cuenta_principal_codigo ?? tx.cuentaCodigo ?? tx.cuenta_codigo ?? "").trim();
+    const is1009 = tipoRegistro === "venta_activo" ? false : (tipoIng === "otros" || cuentaPrincipal === "4102");
+    if (is1009) codCxC = COD_DEUDORES;
+
     const lines = [
-      await buildLine(owner, {
-        code: codCobro,
-        debit: monto,
-        credit: 0,
-        memo: "Cobro de cliente",
-      }),
-      await buildLine(owner, {
-        code: COD_CXC,
-        debit: 0,
-        credit: monto,
-        memo: "Aplicación a Cuentas por Cobrar",
-      }),
+      await buildLine(owner, { code: codCobro, debit: monto, credit: 0, memo: "Cobro de cliente" }),
+      await buildLine(owner, { code: codCxC, debit: 0, credit: monto, memo: "Aplicación a Cuentas por Cobrar" }),
     ];
 
     const numeroAsiento = await nextJournalNumber(owner, fecha);
@@ -679,7 +657,6 @@ async function handleRegistrarPago(req, res) {
 
     const entryDoc = Array.isArray(created) ? created[0] : created;
 
-    // ✅ Guardar referencia (best-effort)
     try {
       tx.asientoCobroId = tx.asientoCobroId ?? entryDoc._id;
       tx.asiento_cobro_id = tx.asiento_cobro_id ?? entryDoc._id;
@@ -707,11 +684,13 @@ async function handleRegistrarPago(req, res) {
         numeroAsiento,
         cobro: {
           referencia_id: String(tx._id),
+          ingresoId: String(tx._id),
           tipo: "cobro",
           monto,
           metodoPago,
           fecha,
           nota: nota || "",
+          cuenta_abonada: codCxC,
         },
       },
       transaction: txUI,
@@ -735,45 +714,11 @@ async function handleRegistrarPago(req, res) {
 // =========================
 // Endpoints
 // =========================
-
-/**
- * ✅ ESTE es el endpoint que está pidiendo tu frontend en el panel:
- * GET /api/cxc/ingresos?pendientes=1&order=created_at_desc&limit=2000
- */
 router.get("/ingresos", ensureAuth, handleListIngresos);
-
-/**
- * ✅ Detalle por ID (útil para modal/detalle si el front lo usa)
- * GET /api/cxc/ingresos/:id
- */
 router.get("/ingresos/:id", ensureAuth, handleGetIngresoById);
-
-/**
- * ✅ Hook: useCuentasPorCobrarDetalle pide esto:
- * GET /api/cxc/detalle?pendientes=1
- *
- * Por ahora devolvemos los ingresos (CxC) tal cual; si luego conectas ventas-activos,
- * aquí lo combinamos para que sea realmente "detalle combinado".
- */
 router.get("/detalle", ensureAuth, handleListIngresos);
+router.get("/ventas-activos", ensureAuth, async (req, res) => res.json({ ok: true, data: [], items: [] }));
 
-/**
- * ✅ FIX CRÍTICO: el hook también pide esto
- * GET /api/cxc/ventas-activos?pendientes=1
- *
- * Por ahora lo devolvemos vacío (para NO romper el panel).
- * Cuando tengas el modelo/colección real, lo conectamos.
- */
-router.get("/ventas-activos", ensureAuth, async (req, res) => {
-  return res.json({ ok: true, data: [], items: [] });
-});
-
-/**
- * ✅ FIX CRÍTICO: el hook pide esto para histórico real
- * GET /api/cxc/asientos?cuenta_codigo=1003
- *
- * Devuelve rows tipo: { fecha: ISO, debe: number, haber: number }
- */
 router.get("/asientos", ensureAuth, async (req, res) => {
   try {
     const owner = req.user._id;
@@ -792,12 +737,11 @@ router.get("/asientos", ensureAuth, async (req, res) => {
     const endInclusive = end ? new Date(end.getTime()) : null;
     if (endInclusive) endInclusive.setHours(23, 59, 59, 999);
 
-    // Traemos asientos del owner (si tu schema tiene date, esto ya te sirve)
     const entries = await JournalEntry.find({ owner }).sort({ createdAt: 1 }).lean();
 
     const out = [];
     for (const e of entries || []) {
-      const fechaRaw = pickEntryDate(e);
+      const fechaRaw = e?.date ?? e?.fecha ?? e?.entryDate ?? e?.asiento_fecha ?? e?.createdAt ?? e?.created_at ?? null;
       const fecha = asValidDate(fechaRaw);
       if (!fecha) continue;
 
@@ -818,19 +762,24 @@ router.get("/asientos", ensureAuth, async (req, res) => {
       let haber = 0;
 
       for (const ln of lines) {
-        const code = String(lineAccountCode(ln) || "").trim();
+        const code = String(
+          ln?.accountCodigo ??
+          ln?.accountCode ??
+          ln?.cuenta_codigo ??
+          ln?.cuentaCodigo ??
+          ln?.account?.codigo ??
+          ln?.cuentas?.codigo ??
+          ""
+        ).trim();
         if (code !== cuentaCodigo) continue;
-        debe += lineDebe(ln);
-        haber += lineHaber(ln);
+
+        debe += num(ln?.debe ?? ln?.debit ?? ln?.debitAmount ?? ln?.debit_amount, 0);
+        haber += num(ln?.haber ?? ln?.credit ?? ln?.creditAmount ?? ln?.credit_amount, 0);
       }
 
       if (debe === 0 && haber === 0) continue;
 
-      out.push({
-        fecha: fecha.toISOString(),
-        debe,
-        haber,
-      });
+      out.push({ fecha: fecha.toISOString(), debe, haber });
     }
 
     return res.json({ ok: true, data: out, items: out });
@@ -840,22 +789,7 @@ router.get("/asientos", ensureAuth, async (req, res) => {
   }
 });
 
-/**
- * POST /api/cxc/registrar-pago
- * Contabilidad:
- *   Debe 1001/1002
- *   Haber 1003
- */
 router.post("/registrar-pago", ensureAuth, handleRegistrarPago);
-
-/**
- * ✅ Alias interno (MISMO router) sin hacks de req.url:
- * POST /api/cxc/cuentas-por-cobrar/registrar-pago
- *
- * Esto SOLO sirve si el frontend pega a /api/cxc/...
- * Si tu frontend usa /api/cuentas-por-cobrar/registrar-pago,
- * lo correcto es MONTAR el router también en "/api/cuentas-por-cobrar" (ver nota abajo).
- */
 router.post("/cuentas-por-cobrar/registrar-pago", ensureAuth, handleRegistrarPago);
 
 module.exports = router;
