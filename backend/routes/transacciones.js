@@ -230,7 +230,8 @@ function mapTxCompat(tx) {
     null;
 
   // ✅ normaliza fecha FINAL para evitar strings raras / Invalid Date
-  const fechaFinal = asValidDate(fechaFixed) || asValidDate(tx.fecha) || asValidDate(tx.createdAt) || null;
+  const fechaFinal =
+    asValidDate(fechaFixed) || asValidDate(tx.fecha) || asValidDate(tx.createdAt) || null;
 
   // ✅ Fecha límite / vencimiento (CxC)
   const fechaLimiteFinal =
@@ -265,6 +266,14 @@ function mapTxCompat(tx) {
     tx.sub_cuenta_nombre ??
     null;
 
+  // ✅ Tipo de ingreso (E2E)
+  const tipoIngresoAny =
+    tx.tipoIngreso ??
+    tx.tipo_ingreso ??
+    tx.incomeType ??
+    tx.income_type ??
+    "";
+
   const metodoPago = tx.metodoPago ?? tx.metodo_pago ?? null;
   const tipoPago = tx.tipoPago ?? tx.tipo_pago ?? null;
 
@@ -289,6 +298,10 @@ function mapTxCompat(tx) {
     subcuenta_codigo: subcuentaCodigoAny ? String(subcuentaCodigoAny) : null,
     subcuentaNombre: subcuentaNombreAny ? String(subcuentaNombreAny) : null,
     subcuenta_nombre: subcuentaNombreAny ? String(subcuentaNombreAny) : null,
+
+    // ✅ E2E: tipo (para que el modal no quede vacío)
+    tipoIngreso: tipoIngresoAny || null,
+    tipo_ingreso: tipoIngresoAny || null,
 
     montoTotal,
     montoDescuento,
@@ -336,9 +349,10 @@ function parseOrder(order) {
 }
 
 // ✅ projection ligera (evita regresar payload enorme)
-// 👇 IMPORTANTE: incluir fechaLimite + subcuenta* para que se devuelva en /recientes y /ingresos
+// 👇 IMPORTANTE: incluir fechaLimite + subcuenta* + tipoIngreso para que se devuelva en /recientes y /ingresos
 const TX_SELECT =
   "fecha fechaLimite createdAt updatedAt descripcion concept concepto " +
+  "tipoIngreso tipo_ingreso " +
   "montoTotal monto_total montoDescuento monto_descuento montoNeto monto_neto " +
   "montoPagado monto_pagado saldoPendiente saldo_pendiente monto_pendiente " +
   "cuentaCodigo cuenta_codigo cuentaPrincipalCodigo cuenta_principal_codigo " +
@@ -377,7 +391,11 @@ router.get("/ingresos", ensureAuth, async (req, res) => {
       ];
     }
 
-    const rows = await IncomeTransaction.find(query).select(TX_SELECT).sort(order).limit(limit).lean();
+    const rows = await IncomeTransaction.find(query)
+      .select(TX_SELECT)
+      .sort(order)
+      .limit(limit)
+      .lean();
 
     let items = rows.map(mapTxCompat);
     items = await attachAccountInfo(owner, items);
