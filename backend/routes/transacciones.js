@@ -232,6 +232,17 @@ function mapTxCompat(tx) {
   // ✅ normaliza fecha FINAL para evitar strings raras / Invalid Date
   const fechaFinal = asValidDate(fechaFixed) || asValidDate(tx.fecha) || asValidDate(tx.createdAt) || null;
 
+  // ✅ Fecha límite / vencimiento (CxC)
+  const fechaLimiteFinal =
+    asValidDate(tx.fechaLimite) ||
+    asValidDate(tx.fecha_limite) ||
+    asValidDate(tx.fecha_vencimiento) ||
+    asValidDate(tx.fechaVencimiento) ||
+    null;
+
+  const fechaLimiteISO = fechaLimiteFinal ? fechaLimiteFinal.toISOString() : null;
+  const fechaLimiteYMD = fechaLimiteFinal ? toYMDLocal(fechaLimiteFinal) : null;
+
   const metodoPago = tx.metodoPago ?? tx.metodo_pago ?? null;
   const tipoPago = tx.tipoPago ?? tx.tipo_pago ?? null;
 
@@ -242,6 +253,12 @@ function mapTxCompat(tx) {
     fecha: fechaFinal,
     fecha_fixed: fechaFixed ? fechaFixed.toISOString() : null,
     fecha_ymd: fechaFinal ? toYMDLocal(fechaFinal) : null,
+
+    // ✅ E2E: fecha límite/vencimiento
+    fechaLimite: fechaLimiteISO,
+    fecha_limite: fechaLimiteISO,
+    fecha_vencimiento: fechaLimiteYMD,
+    fechaVencimiento: fechaLimiteYMD,
 
     montoTotal,
     montoDescuento,
@@ -289,8 +306,9 @@ function parseOrder(order) {
 }
 
 // ✅ projection ligera (evita regresar payload enorme)
+// 👇 IMPORTANTE: incluir fechaLimite para que se devuelva en /recientes y /ingresos
 const TX_SELECT =
-  "fecha createdAt updatedAt descripcion concept concepto " +
+  "fecha fechaLimite createdAt updatedAt descripcion concept concepto " +
   "montoTotal monto_total montoDescuento monto_descuento montoNeto monto_neto " +
   "montoPagado monto_pagado saldoPendiente saldo_pendiente monto_pendiente " +
   "cuentaCodigo cuenta_codigo cuentaPrincipalCodigo cuenta_principal_codigo " +
