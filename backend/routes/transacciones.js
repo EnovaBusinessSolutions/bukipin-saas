@@ -243,6 +243,28 @@ function mapTxCompat(tx) {
   const fechaLimiteISO = fechaLimiteFinal ? fechaLimiteFinal.toISOString() : null;
   const fechaLimiteYMD = fechaLimiteFinal ? toYMDLocal(fechaLimiteFinal) : null;
 
+  // ✅ Subcuenta (E2E)
+  const subcuentaIdAny =
+    tx.subcuentaId ??
+    tx.subcuenta_id ??
+    tx.subCuentaId ??
+    tx.sub_cuenta_id ??
+    null;
+
+  const subcuentaCodigoAny =
+    tx.subcuentaCodigo ??
+    tx.subcuenta_codigo ??
+    tx.subCuentaCodigo ??
+    tx.sub_cuenta_codigo ??
+    null;
+
+  const subcuentaNombreAny =
+    tx.subcuentaNombre ??
+    tx.subcuenta_nombre ??
+    tx.subCuentaNombre ??
+    tx.sub_cuenta_nombre ??
+    null;
+
   const metodoPago = tx.metodoPago ?? tx.metodo_pago ?? null;
   const tipoPago = tx.tipoPago ?? tx.tipo_pago ?? null;
 
@@ -259,6 +281,14 @@ function mapTxCompat(tx) {
     fecha_limite: fechaLimiteISO,
     fecha_vencimiento: fechaLimiteYMD,
     fechaVencimiento: fechaLimiteYMD,
+
+    // ✅ E2E: subcuenta
+    subcuentaId: subcuentaIdAny ? String(subcuentaIdAny) : null,
+    subcuenta_id: subcuentaIdAny ? String(subcuentaIdAny) : null,
+    subcuentaCodigo: subcuentaCodigoAny ? String(subcuentaCodigoAny) : null,
+    subcuenta_codigo: subcuentaCodigoAny ? String(subcuentaCodigoAny) : null,
+    subcuentaNombre: subcuentaNombreAny ? String(subcuentaNombreAny) : null,
+    subcuenta_nombre: subcuentaNombreAny ? String(subcuentaNombreAny) : null,
 
     montoTotal,
     montoDescuento,
@@ -306,12 +336,13 @@ function parseOrder(order) {
 }
 
 // ✅ projection ligera (evita regresar payload enorme)
-// 👇 IMPORTANTE: incluir fechaLimite para que se devuelva en /recientes y /ingresos
+// 👇 IMPORTANTE: incluir fechaLimite + subcuenta* para que se devuelva en /recientes y /ingresos
 const TX_SELECT =
   "fecha fechaLimite createdAt updatedAt descripcion concept concepto " +
   "montoTotal monto_total montoDescuento monto_descuento montoNeto monto_neto " +
   "montoPagado monto_pagado saldoPendiente saldo_pendiente monto_pendiente " +
   "cuentaCodigo cuenta_codigo cuentaPrincipalCodigo cuenta_principal_codigo " +
+  "subcuentaId subcuenta_id subcuentaCodigo subcuenta_codigo subcuentaNombre subcuenta_nombre " +
   "clienteId clientId cliente_id client_id clienteID " +
   "metodoPago metodo_pago tipoPago tipo_pago";
 
