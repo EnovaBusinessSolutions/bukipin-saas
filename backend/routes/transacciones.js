@@ -7,6 +7,12 @@ const ensureAuth = require("../middleware/ensureAuth");
 const IncomeTransaction = require("../models/IncomeTransaction");
 const Account = require("../models/Account");
 
+// ✅ JournalEntry (para filtrar por cuentas contables reales del asiento: 1003 / 1009)
+let JournalEntry = null;
+try {
+  JournalEntry = require("../models/JournalEntry");
+} catch (_) {}
+
 // Opcional: Client (si existe en tu proyecto)
 let Client = null;
 try {
@@ -200,6 +206,90 @@ async function attachClientInfo(owner, items) {
   });
 }
 
+/* ---------------------------------------------
+   ✅ Helpers: filtrar por cuentas del asiento
+   Queremos SOLO transacciones cuyos asientos
+   incluyan líneas con accountCodigo 1003 o 1009
+----------------------------------------------*/
+
+function extractJournalLines(je) {
+  const candidates =
+    je?.detalle_asientos ??
+    je?.detalles ??
+    je?.entries ??
+    je?.lines ??
+    je?.movimientos ??
+    je?.asientos ??
+    [];
+
+  return Array.isArray(candidates) ? candidates : [];
+}
+
+function getLineAccountCode(line) {
+  const code =
+    line?.accountCodigo ??
+    line?.account_code ??
+    line?.accountCode ??
+    line?.codigo ??
+    line?.cuentaCodigo ??
+    line?.cuenta_codigo ??
+    line?.account ??
+    line?.code ??
+    null;
+
+  return code ? String(code).trim() : "";
+}
+
+async function filterTxIdsByJournalAccountCodes(owner, txIds, allowedCodes) {
+  // Si no existe el modelo, no filtramos (evita romper en repos legacy)
+  if (!JournalEntry) return null;
+  if (!txIds?.length) return new Set();
+
+  const allowed = new Set((allowedCodes || []).map((c) => String(c).trim()));
+
+  const rows = await JournalEntry.find({
+    owner,
+    $or: [
+      { sourceId: { $in: txIds } },
+      { source_id: { $in: txIds } },
+      // fallback ultra-compat
+      { transaccionId: { $in: txIds } },
+      { transaccion_id: { $in: txIds } },
+    ],
+  })
+    .select(
+      "source sourceId source_id transaccionId transaccion_id detalle_asientos detalles entries lines movimientos asientos"
+    )
+    .lean();
+
+  const okIds = new Set();
+
+  for (const je of rows) {
+    const sid =
+      je?.sourceId ??
+      je?.source_id ??
+      je?.transaccionId ??
+      je?.transaccion_id ??
+      null;
+
+    const txId = sid ? String(sid) : "";
+    if (!txId) continue;
+
+    const lines = extractJournalLines(je);
+    const hasAllowed = lines.some((ln) => allowed.has(getLineAccountCode(ln)));
+
+    if (hasAllowed) okIds.add(txId);
+  }
+
+  return okIds;
+}
+
+function isOnlyARRequested(req) {
+  const v = req.query.only_ar ?? req.query.only_cxc ?? req.query.cxc_only ?? "";
+  const s = String(v).trim().toLowerCase();
+  return s === "1" || s === "true" || s === "yes";
+}
+
 function mapTxCompat(tx) {
   const fechaFixed = fixFechaWithCreatedAt(tx);
 
@@ -361,7 +451,7 @@ const TX_SELECT =
   "metodoPago metodo_pago tipoPago tipo_pago";
 
 /**
- * GET /api/transacciones/ingresos?include_all=true&order=created_at_desc&limit=2000&pendientes=1
+ * GET /api/transacciones/ingresos?include_all=true&order=created_at_desc&limit=2000&pendientes=1&only_ar=1
  */
 router.get("/ingresos", ensureAuth, async (req, res) => {
   try {
@@ -391,11 +481,23 @@ router.get("/ingresos", ensureAuth, async (req, res) => {
       ];
     }
 
-    const rows = await IncomeTransaction.find(query)
+    const rowsRaw = await IncomeTransaction.find(query)
       .select(TX_SELECT)
       .sort(order)
       .limit(limit)
       .lean();
+
+    // ✅ Solo CxC real: filtra por asientos con 1003 ó 1009 (cuando se solicite)
+    let rows = rowsRaw;
+    if (isOnlyARRequested(req)) {
+      const txIds = rowsRaw.map((r) => String(r._id));
+      const okIds = await filterTxIdsByJournalAccountCodes(owner, txIds, ["1003", "1009"]);
+
+      // Si okIds === null, es que no existe JournalEntry y no debemos romper: regresamos sin filtrar.
+      if (okIds && okIds.size >= 0) {
+        rows = rowsRaw.filter((r) => okIds.has(String(r._id)));
+      }
+    }
 
     let items = rows.map(mapTxCompat);
     items = await attachAccountInfo(owner, items);
@@ -412,18 +514,30 @@ router.get("/ingresos", ensureAuth, async (req, res) => {
  * ✅ IMPORTANTE: esta ruta DEBE ir ANTES de /ingresos/:id
  * porque si no, "/ingresos/recientes" se interpreta como id="recientes".
  *
- * GET /api/transacciones/ingresos/recientes?limit=1000
+ * GET /api/transacciones/ingresos/recientes?limit=1000&only_ar=1
  */
 router.get("/ingresos/recientes", ensureAuth, async (req, res) => {
   try {
     const owner = req.user._id;
     const limit = Math.min(2000, Number(req.query.limit || 1000));
 
-    const rows = await IncomeTransaction.find({ owner })
+    const rowsRaw = await IncomeTransaction.find({ owner })
       .select(TX_SELECT)
       .sort({ fecha: -1, createdAt: -1 })
       .limit(limit)
       .lean();
+
+    // ✅ Solo CxC real: filtra por asientos con 1003 ó 1009 (cuando se solicite)
+    let rows = rowsRaw;
+    if (isOnlyARRequested(req)) {
+      const txIds = rowsRaw.map((r) => String(r._id));
+      const okIds = await filterTxIdsByJournalAccountCodes(owner, txIds, ["1003", "1009"]);
+
+      // Si okIds === null, es que no existe JournalEntry y no debemos romper: regresamos sin filtrar.
+      if (okIds && okIds.size >= 0) {
+        rows = rowsRaw.filter((r) => okIds.has(String(r._id)));
+      }
+    }
 
     let items = rows.map(mapTxCompat);
     items = await attachAccountInfo(owner, items);
