@@ -102,6 +102,8 @@ app.use("/api/cxc", require("./routes/cxc"));
 // POST /api/cuentas-por-cobrar/registrar-pago
 app.use("/api/cuentas-por-cobrar", require("./routes/cxc"));
 
+app.use("/api/cxp", require("./routes/cxp"));
+
 // ==============================
 // ✅ Placeholders temporales (al final para no pisar rutas reales)
 // ==============================
