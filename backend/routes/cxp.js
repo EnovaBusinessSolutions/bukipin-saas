@@ -6,6 +6,15 @@ const ensureAuth = require("../middleware/ensureAuth");
 
 const ExpenseTransaction = require("../models/ExpenseTransaction");
 
+// ✅ Opcional: asientos contables (para /api/cxp/asientos)
+let JournalEntry = null;
+try {
+  // eslint-disable-next-line global-require
+  JournalEntry = require("../models/JournalEntry");
+} catch (e) {
+  JournalEntry = null;
+}
+
 // Helpers
 function toNum(v, def = 0) {
   const n = Number(String(v ?? "").replace(/,/g, ""));
@@ -34,6 +43,43 @@ function endOfDay(d) {
   const x = new Date(d);
   x.setHours(23, 59, 59, 999);
   return x;
+}
+
+function pickLines(entry) {
+  return entry?.lines || entry?.detalle_asientos || entry?.detalles_asiento || [];
+}
+function pickCode(line) {
+  return String(
+    line?.accountCodigo ??
+      line?.accountCode ??
+      line?.cuentaCodigo ??
+      line?.cuenta_codigo ??
+      line?.code ??
+      line?.cuenta?.code ??
+      line?.cuenta?.codigo ??
+      line?.account?.code ??
+      line?.account?.codigo ??
+      ""
+  ).trim();
+}
+function pickDebe(line) {
+  const side = String(line?.side || "").toLowerCase().trim();
+  const monto = toNum(line?.monto ?? line?.amount ?? line?.importe ?? line?.valor ?? 0, 0);
+  return toNum(line?.debit ?? line?.debe ?? 0, 0) || (side === "debit" ? monto : 0);
+}
+function pickHaber(line) {
+  const side = String(line?.side || "").toLowerCase().trim();
+  const monto = toNum(line?.monto ?? line?.amount ?? line?.importe ?? line?.valor ?? 0, 0);
+  return toNum(line?.credit ?? line?.haber ?? 0, 0) || (side === "credit" ? monto : 0);
+}
+function pickMemo(line) {
+  return String(line?.memo ?? line?.descripcion ?? line?.concepto ?? line?.description ?? "").trim();
+}
+function pickEntryDate(entry) {
+  return entry?.date || entry?.fecha || entry?.entryDate || entry?.createdAt || entry?.created_at || null;
+}
+function pickEntryNumero(entry) {
+  return entry?.numeroAsiento ?? entry?.numero_asiento ?? entry?.numero ?? entry?.folio ?? String(entry?._id || "");
 }
 
 /**
@@ -164,7 +210,6 @@ async function listEgresosCxP({ owner, pendientesOnly, start, end, limit }) {
 /**
  * ✅ COMPAT: el FE está pegando a /api/cxp/inversiones?pendientes=1
  * Por ahora devolvemos vacío para eliminar 404s y dejar panel E2E estable.
- * (Luego lo conectamos a tu modelo real de inversiones/capex si aplica)
  */
 router.get("/inversiones", ensureAuth, async (req, res) => {
   try {
@@ -185,8 +230,107 @@ router.get("/inversiones", ensureAuth, async (req, res) => {
 });
 
 /**
+ * ✅ NUEVO: GET /api/cxp/asientos?cuentas=2001,2002&start&end&limit=500
+ * - Si existe JournalEntry, devuelve asientos filtrados por cuentas (por líneas).
+ * - Si NO existe, devuelve [] para evitar 404.
+ */
+router.get("/asientos", ensureAuth, async (req, res) => {
+  try {
+    const owner = req.user._id;
+
+    if (!JournalEntry) {
+      return res.json({ ok: true, data: [], items: [], meta: { reason: "JournalEntry model not found" } });
+    }
+
+    const cuentasParam = String(req.query.cuentas ?? "").trim();
+    const cuentas = cuentasParam
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    const start = isoDateOrNull(req.query.start);
+    const end = isoDateOrNull(req.query.end);
+
+    const limitRaw = Number(req.query.limit ?? 500);
+    const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), 2000) : 500;
+
+    if (!cuentas.length) {
+      return res.json({ ok: true, data: [], items: [], meta: { cuentas: [], limit } });
+    }
+
+    const match = { owner };
+    if (start || end) {
+      const dateFilter = {};
+      if (start) dateFilter.$gte = start;
+      if (end) dateFilter.$lte = endOfDay(end);
+
+      match.$or = [
+        { date: dateFilter },
+        { fecha: dateFilter },
+        { entryDate: dateFilter },
+        { createdAt: dateFilter },
+        { created_at: dateFilter },
+      ];
+    }
+
+    // Query por líneas (soporta distintas llaves)
+    const docs = await JournalEntry.find({
+      ...match,
+      $or: [
+        { "lines.accountCodigo": { $in: cuentas } },
+        { "lines.cuentaCodigo": { $in: cuentas } },
+        { "detalle_asientos.accountCodigo": { $in: cuentas } },
+        { "detalle_asientos.cuentaCodigo": { $in: cuentas } },
+        { "detalles_asiento.accountCodigo": { $in: cuentas } },
+        { "detalles_asiento.cuentaCodigo": { $in: cuentas } },
+      ],
+    })
+      .select(
+        "date fecha entryDate createdAt created_at concept concepto descripcion memo numeroAsiento numero_asiento numero folio source fuente sourceId source_id transaccionId transaccion_id lines detalle_asientos detalles_asiento"
+      )
+      .sort({ createdAt: -1 })
+      .limit(limit)
+      .lean();
+
+    const items = (docs || []).map((e) => {
+      const fecha = pickEntryDate(e);
+      const numero = pickEntryNumero(e);
+      const concept = String(e.concept ?? e.concepto ?? e.descripcion ?? e.memo ?? "").trim();
+
+      const lines = pickLines(e)
+        .map((l) => {
+          const code = pickCode(l) || null;
+          return {
+            cuenta_codigo: code,
+            debe: pickDebe(l),
+            haber: pickHaber(l),
+            descripcion: pickMemo(l) || null,
+          };
+        })
+        // (opcional) filtrar solo líneas de las cuentas pedidas
+        .filter((l) => (l.cuenta_codigo ? cuentas.includes(l.cuenta_codigo) : false));
+
+      return {
+        id: String(e._id),
+        _id: e._id,
+        numero_asiento: String(numero || ""),
+        concept: concept || null,
+        fecha: fecha ? new Date(fecha).toISOString() : null,
+        source: e.source ?? e.fuente ?? null,
+        source_id: e.sourceId ?? e.source_id ?? e.transaccionId ?? e.transaccion_id ?? null,
+        lines,
+      };
+    });
+
+    return res.json({ ok: true, data: items, items, meta: { cuentas, limit } });
+  } catch (err) {
+    console.error("GET /api/cxp/asientos error:", err);
+    return res.status(500).json({ ok: false, error: "SERVER_ERROR", message: err?.message || "SERVER_ERROR" });
+  }
+});
+
+/**
  * GET /api/cxp/egresos?pendientes=1&start&end&limit=200
- * Lista de egresos, filtrable a pendientes.
  */
 router.get("/egresos", ensureAuth, async (req, res) => {
   try {
@@ -210,8 +354,7 @@ router.get("/egresos", ensureAuth, async (req, res) => {
 
 /**
  * GET /api/cxp/transacciones
- * ✅ Alias compatible (tu FE está llamando esto).
- * ✅ FIX: ya NO usamos router.handle (era frágil); usamos la misma lógica que /egresos.
+ * Alias compatible (tu FE está llamando esto).
  */
 router.get("/transacciones", ensureAuth, async (req, res) => {
   try {
@@ -235,7 +378,7 @@ router.get("/transacciones", ensureAuth, async (req, res) => {
 
 /**
  * GET /api/cxp/detalle?pendientes=1&start&end
- * Regresa “cuentas” listas para la UI (con status vencida/por_vencer/etc.)
+ * Regresa “cuentas” listas para la UI.
  */
 router.get("/detalle", ensureAuth, async (req, res) => {
   try {
@@ -260,7 +403,6 @@ router.get("/detalle", ensureAuth, async (req, res) => {
       const due = computeDueMeta(tx, now);
 
       return {
-        // shape “cuenta”
         cuenta_id: tx.id,
         egreso_id: tx.id,
         transaccion_id: tx.id,
@@ -293,7 +435,6 @@ router.get("/detalle", ensureAuth, async (req, res) => {
       };
     });
 
-    // KPIs rápidos
     const totalPorPagar = cuentas.reduce((acc, c) => acc + toNum(c.saldo_pendiente, 0), 0);
     const vencidas = cuentas.filter((c) => c.vencimiento_status === "vencida");
     const porVencer = cuentas.filter(
