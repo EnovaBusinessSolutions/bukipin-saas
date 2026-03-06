@@ -6,7 +6,7 @@ const ensureAuth = require("../middleware/ensureAuth");
 
 const ExpenseTransaction = require("../models/ExpenseTransaction");
 
-// ✅ Opcional: asientos contables (para /api/cxp/asientos)
+// ✅ Opcional: asientos contables (para /api/cxp/asientos y para pagos)
 let JournalEntry = null;
 try {
   // eslint-disable-next-line global-require
@@ -43,6 +43,36 @@ function endOfDay(d) {
   const x = new Date(d);
   x.setHours(23, 59, 59, 999);
   return x;
+}
+
+function normalizeMetodoPago(v) {
+  const s = asTrim(v).toLowerCase();
+  if (!s) return "";
+  // compat FE
+  if (s === "transferencia" || s === "tarjeta-transferencia") return "bancos";
+  return s; // efectivo | bancos | tarjeta_credito_*
+}
+
+function resolveCreditAccountByMetodoPago(metodoPago) {
+  const CASH = process.env.CTA_EFECTIVO || "1001";
+  const BANK = process.env.CTA_BANCOS || "1002";
+
+  if (!metodoPago) return { tipo: "unknown", cuentaCodigo: BANK, meta: {} };
+  if (metodoPago === "efectivo") return { tipo: "cash", cuentaCodigo: CASH, meta: {} };
+  if (metodoPago === "bancos") return { tipo: "bank", cuentaCodigo: BANK, meta: {} };
+
+  if (metodoPago.startsWith("tarjeta_credito_")) {
+    const CC = process.env.CTA_TARJETAS_CREDITO || "2101";
+    return { tipo: "credit_card", cuentaCodigo: CC, meta: { tarjetaId: metodoPago.replace("tarjeta_credito_", "") } };
+  }
+
+  return { tipo: "other", cuentaCodigo: BANK, meta: {} };
+}
+
+function isOtrosGastosFromTx(tx) {
+  const s = String(tx?.subtipoEgreso ?? tx?.subtipo_egreso ?? "").toLowerCase().trim();
+  const t = String(tx?.tipoEgreso ?? tx?.tipo_egreso ?? tx?.tipo ?? "").toLowerCase().trim();
+  return s === "otros_gastos" || t === "otro";
 }
 
 function pickLines(entry) {
@@ -121,6 +151,9 @@ function mapTxForCxP(doc) {
 
     estado: d.estado ?? d.status ?? "activo",
 
+    // para lógica de CxP
+    subtipo_egreso: d.subtipoEgreso ?? d.subtipo_egreso ?? null,
+
     created_at: d.createdAt ?? d.created_at ?? null,
     updated_at: d.updatedAt ?? d.updated_at ?? null,
   };
@@ -150,14 +183,12 @@ function mapTxForCxP(doc) {
 function buildPendientesFilter({ owner, start, end, pendientesOnly }) {
   const filter = { owner };
 
-  // rango por fecha del egreso
   if (start || end) {
     filter.fecha = {};
     if (start) filter.fecha.$gte = start;
     if (end) filter.fecha.$lte = endOfDay(end);
   }
 
-  // estado
   filter.estado = { $ne: "cancelado" };
 
   if (pendientesOnly) {
@@ -184,32 +215,28 @@ function computeDueMeta(tx, now = new Date()) {
   if (!(saldo > 0)) return { status: "pagada", dias: 0 };
   if (!fv || Number.isNaN(fv.getTime())) return { status: "sin_fecha", dias: 0 };
 
-  // comparar solo por día
   const a = new Date(now);
   a.setHours(0, 0, 0, 0);
   const b = new Date(fv);
   b.setHours(0, 0, 0, 0);
 
-  const diffDays = Math.round((a.getTime() - b.getTime()) / (1000 * 60 * 60 * 24)); // >0 = vencida
+  const diffDays = Math.round((a.getTime() - b.getTime()) / (1000 * 60 * 60 * 24));
   if (diffDays > 0) return { status: "vencida", dias: diffDays };
   if (diffDays === 0) return { status: "vence_hoy", dias: 0 };
   return { status: "por_vencer", dias: Math.abs(diffDays) };
 }
 
 /**
- * Helper central para listar egresos CxP (evita duplicar lógica)
+ * Helper central para listar egresos CxP
  */
 async function listEgresosCxP({ owner, pendientesOnly, start, end, limit }) {
   const filter = buildPendientesFilter({ owner, start, end, pendientesOnly });
-
   const docs = await ExpenseTransaction.find(filter).sort({ fecha: -1, createdAt: -1 }).limit(limit).lean();
-
   return docs.map(mapTxForCxP);
 }
 
 /**
- * ✅ COMPAT: el FE está pegando a /api/cxp/inversiones?pendientes=1
- * Por ahora devolvemos vacío para eliminar 404s y dejar panel E2E estable.
+ * ✅ COMPAT: /api/cxp/inversiones
  */
 router.get("/inversiones", ensureAuth, async (req, res) => {
   try {
@@ -230,9 +257,210 @@ router.get("/inversiones", ensureAuth, async (req, res) => {
 });
 
 /**
- * ✅ NUEVO: GET /api/cxp/asientos?cuentas=2001,2002&start&end&limit=500
- * - Si existe JournalEntry, devuelve asientos filtrados por cuentas (por líneas).
- * - Si NO existe, devuelve [] para evitar 404.
+ * ✅ GET /api/cxp/facturas/:id/pagos?source=egreso|capex
+ * Por ahora: implementado SOLO para source=egreso usando JournalEntry source="pago_cxp" y sourceId=facturaId
+ */
+router.get("/facturas/:id/pagos", ensureAuth, async (req, res) => {
+  try {
+    const owner = req.user._id;
+    const facturaId = String(req.params.id || "").trim();
+    const source = String(req.query.source || "egreso").trim().toLowerCase();
+
+    if (!JournalEntry) {
+      return res.json({ ok: true, data: [], items: [], meta: { reason: "JournalEntry model not found" } });
+    }
+    if (!mongoose.Types.ObjectId.isValid(facturaId)) {
+      return res.status(400).json({ ok: false, error: "VALIDATION", message: "facturaId inválido" });
+    }
+    if (source !== "egreso") {
+      return res.status(400).json({ ok: false, error: "NOT_SUPPORTED", message: "Solo soporta source=egreso por ahora." });
+    }
+
+    const oid = new mongoose.Types.ObjectId(facturaId);
+
+    const pagos = await JournalEntry.find({
+      owner,
+      source: { $in: ["pago_cxp", "pagos_cxp", "pago"] },
+      $or: [{ sourceId: oid }, { transaccionId: oid }, { source_id: oid }],
+    })
+      .sort({ createdAt: -1 })
+      .limit(200)
+      .lean();
+
+    const items = (pagos || []).map((e) => {
+      const fecha = pickEntryDate(e) ? new Date(pickEntryDate(e)).toISOString() : new Date().toISOString();
+      const numero = pickEntryNumero(e);
+
+      const lines = pickLines(e);
+      // monto: tomar el HABER (caja/bancos) si existe, si no el DEBE
+      let monto = 0;
+      let metodo = "";
+
+      for (const l of lines) {
+        const code = pickCode(l);
+        const haber = pickHaber(l);
+        const debe = pickDebe(l);
+
+        if (haber > 0 && (code === "1001" || code === "1002" || code === "2101" || String(code).startsWith("10"))) {
+          monto = haber;
+        }
+        if (!monto && debe > 0 && (code === "2001" || code === "2003" || String(code).startsWith("20"))) {
+          monto = debe;
+        }
+      }
+
+      // inferir método por la cuenta de salida
+      for (const l of lines) {
+        const code = pickCode(l);
+        const haber = pickHaber(l);
+        if (haber > 0 && code === (process.env.CTA_EFECTIVO || "1001")) metodo = "efectivo";
+        if (haber > 0 && code === (process.env.CTA_BANCOS || "1002")) metodo = "bancos";
+      }
+
+      return {
+        id: String(e._id),
+        fecha,
+        monto: Math.round(toNum(monto, 0) * 100) / 100,
+        metodo_pago: metodo || null,
+        descripcion: String(e.concept ?? e.concepto ?? e.descripcion ?? e.memo ?? "").trim() || `Pago CxP ${numero || ""}`,
+        es_pago_inicial: false,
+      };
+    });
+
+    return res.json({ ok: true, data: items, items, meta: { count: items.length } });
+  } catch (err) {
+    console.error("GET /api/cxp/facturas/:id/pagos error:", err);
+    return res.status(500).json({ ok: false, error: "SERVER_ERROR", message: err?.message || "SERVER_ERROR" });
+  }
+});
+
+/**
+ * ✅ POST /api/cxp/pagos
+ * body: { facturaId, source:"egreso"|"capex", monto, metodo }
+ *
+ * Por ahora: SOLO source="egreso"
+ * - crea JournalEntry source="pago_cxp" con sourceId=facturaId
+ * - Debe: 2001 (Proveedores) o 2003 (Acreedores) según subtipoEgreso
+ * - Haber: 1001/1002 según método
+ * - actualiza montoPagado/montoPendiente en ExpenseTransaction
+ */
+router.post("/pagos", ensureAuth, async (req, res) => {
+  try {
+    const owner = req.user._id;
+
+    if (!JournalEntry) {
+      return res.status(500).json({ ok: false, error: "MISSING_MODEL", message: "JournalEntry model not found" });
+    }
+
+    const facturaId = String(req.body?.facturaId || "").trim();
+    const source = String(req.body?.source || "egreso").trim().toLowerCase();
+    const monto = toNum(req.body?.monto, 0);
+    const metodoPagoRaw = String(req.body?.metodo || req.body?.metodo_pago || req.body?.metodoPago || "").trim();
+
+    if (!mongoose.Types.ObjectId.isValid(facturaId)) {
+      return res.status(400).json({ ok: false, error: "VALIDATION", message: "facturaId inválido" });
+    }
+    if (source !== "egreso") {
+      return res.status(400).json({ ok: false, error: "NOT_SUPPORTED", message: "Solo soporta source=egreso por ahora." });
+    }
+    if (!(monto > 0)) {
+      return res.status(400).json({ ok: false, error: "VALIDATION", message: "monto debe ser > 0" });
+    }
+
+    const metodoPago = normalizeMetodoPago(metodoPagoRaw);
+    if (!metodoPago) {
+      return res.status(400).json({ ok: false, error: "VALIDATION", message: "metodo es requerido" });
+    }
+
+    const tx = await ExpenseTransaction.findOne({ owner, _id: new mongoose.Types.ObjectId(facturaId) });
+    if (!tx) return res.status(404).json({ ok: false, error: "NOT_FOUND", message: "Factura (egreso) no encontrada" });
+
+    if (String(tx.estado || "").toLowerCase() === "cancelado") {
+      return res.status(400).json({ ok: false, error: "VALIDATION", message: "No se puede pagar un egreso cancelado" });
+    }
+
+    const pendienteActual = toNum(tx.montoPendiente, 0);
+    if (!(pendienteActual > 0)) {
+      return res.status(400).json({ ok: false, error: "VALIDATION", message: "Esta factura ya no tiene saldo pendiente" });
+    }
+    if (monto > pendienteActual) {
+      return res.status(400).json({ ok: false, error: "VALIDATION", message: "El monto no puede ser mayor al saldo pendiente" });
+    }
+
+    // ✅ Cuenta pendiente según subtipo (otros_gastos => 2003, si no 2001)
+    const PROVEEDORES_2001 = process.env.CTA_CXP || "2001";
+    const OTROS_ACREEDORES_2003 = process.env.CTA_OTROS_ACREEDORES || "2003";
+    const cuentaPendiente = isOtrosGastosFromTx(tx) ? OTROS_ACREEDORES_2003 : PROVEEDORES_2001;
+
+    const creditInfo = resolveCreditAccountByMetodoPago(metodoPago);
+
+    const conceptText = `Pago CxP: ${tx.descripcion || "Egreso"} (${metodoPago})`;
+
+    const lines = [
+      {
+        accountCodigo: String(cuentaPendiente),
+        debit: monto,
+        credit: 0,
+        memo: `Aplicación a ${cuentaPendiente} (${isOtrosGastosFromTx(tx) ? "Acreedores" : "Proveedores"})`,
+      },
+      {
+        accountCodigo: String(creditInfo.cuentaCodigo),
+        debit: 0,
+        credit: monto,
+        memo: `Salida por ${creditInfo.tipo}`,
+      },
+    ];
+
+    const asiento = await JournalEntry.create({
+      owner,
+      date: new Date(),
+      concept: conceptText,
+      source: "pago_cxp",
+      sourceId: tx._id,
+      transaccionId: tx._id,
+      source_id: tx._id,
+      lines,
+      references: [
+        {
+          source: "egreso",
+          id: String(tx._id),
+          numero: String(tx.numeroAsiento || ""),
+        },
+      ],
+    });
+
+    // ✅ Actualizar factura
+    const nuevoPagado = toNum(tx.montoPagado, 0) + monto;
+    tx.montoPagado = nuevoPagado;
+    // El pre-validate del modelo recalcula pendiente correctamente, pero lo seteo explícito por claridad:
+    tx.montoPendiente = Math.max(0, toNum(tx.montoTotal, 0) - nuevoPagado);
+
+    // si ya quedó en 0, lo marcamos como contado (opcional)
+    if (tx.montoPendiente <= 0) {
+      tx.tipoPago = "contado";
+      tx.metodoPago = metodoPago; // último método usado
+    } else {
+      tx.tipoPago = "parcial"; // sigue siendo parcial
+      tx.metodoPago = metodoPago;
+    }
+
+    await tx.save();
+
+    return res.json({
+      ok: true,
+      pago_id: String(asiento._id),
+      asiento_id: String(asiento._id),
+      factura_id: String(tx._id),
+      data: { ok: true },
+    });
+  } catch (err) {
+    console.error("POST /api/cxp/pagos error:", err);
+    return res.status(500).json({ ok: false, error: "SERVER_ERROR", message: err?.message || "SERVER_ERROR" });
+  }
+});
+
+/**
+ * ✅ GET /api/cxp/asientos?cuentas=2001,2002&start&end&limit=500
  */
 router.get("/asientos", ensureAuth, async (req, res) => {
   try {
@@ -273,7 +501,6 @@ router.get("/asientos", ensureAuth, async (req, res) => {
       ];
     }
 
-    // Query por líneas (soporta distintas llaves)
     const docs = await JournalEntry.find({
       ...match,
       $or: [
@@ -307,7 +534,6 @@ router.get("/asientos", ensureAuth, async (req, res) => {
             descripcion: pickMemo(l) || null,
           };
         })
-        // (opcional) filtrar solo líneas de las cuentas pedidas
         .filter((l) => (l.cuenta_codigo ? cuentas.includes(l.cuenta_codigo) : false));
 
       return {
@@ -354,22 +580,141 @@ router.get("/egresos", ensureAuth, async (req, res) => {
 
 /**
  * GET /api/cxp/transacciones
- * Alias compatible (tu FE está llamando esto).
+ * ✅ Ahora mezcla: egresos + pagos (pago_cxp) para que el Resumen se vea completo.
  */
 router.get("/transacciones", ensureAuth, async (req, res) => {
   try {
     const owner = req.user._id;
 
-    const pendientesOnly = String(req.query.pendientes ?? "1").trim() === "1"; // por defecto 1
     const start = isoDateOrNull(req.query.start);
     const end = isoDateOrNull(req.query.end);
 
-    const limitRaw = Number(req.query.limit ?? 300);
-    const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), 1000) : 300;
+    const limitRaw = Number(req.query.limit ?? 500);
+    const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), 2000) : 500;
 
-    const items = await listEgresosCxP({ owner, pendientesOnly, start, end, limit });
+    // 1) facturas (egresos) - incluimos pagadas también aquí porque el resumen lo requiere
+    const egresos = await ExpenseTransaction.find({ owner, estado: { $ne: "cancelado" } })
+      .sort({ fecha: -1, createdAt: -1 })
+      .limit(limit)
+      .lean();
 
-    return res.json({ ok: true, data: items, items, meta: { pendientesOnly, limit, alias: "transacciones" } });
+    const facturas = egresos.map((d) => {
+      const tx = mapTxForCxP(d);
+      return {
+        id: tx.id,
+        created_at: tx.created_at || tx.fecha || new Date().toISOString(),
+        fecha: tx.fecha || null,
+
+        proveedor_nombre: tx.proveedor_nombre || "Sin proveedor",
+        descripcion: tx.descripcion || "",
+
+        tipo: isOtrosGastosFromTx(d) ? "Acreedores Diversos" : "Egreso",
+        subtipo: isOtrosGastosFromTx(d) ? "otros_gastos" : String(d.subtipoEgreso ?? d.subtipo_egreso ?? ""),
+
+        monto_total: toNum(tx.monto_total, 0),
+        monto_pagado: toNum(tx.monto_pagado, 0),
+        monto_pendiente: toNum(tx.saldo_pendiente, 0),
+
+        tipo_pago: tx.tipo_pago || "",
+        metodo_pago: tx.metodo_pago || "-",
+
+        fecha_vencimiento: tx.fecha_vencimiento || null,
+        estado: tx.estado || "activo",
+
+        fuente: "egreso",
+      };
+    });
+
+    // 2) pagos (JournalEntry source=pago_cxp)
+    let pagos = [];
+    if (JournalEntry) {
+      const match = { owner, source: { $in: ["pago_cxp", "pagos_cxp", "pago"] } };
+
+      if (start || end) {
+        const dateFilter = {};
+        if (start) dateFilter.$gte = start;
+        if (end) dateFilter.$lte = endOfDay(end);
+        match.$or = [
+          { date: dateFilter },
+          { fecha: dateFilter },
+          { entryDate: dateFilter },
+          { createdAt: dateFilter },
+          { created_at: dateFilter },
+        ];
+      }
+
+      const docs = await JournalEntry.find(match)
+        .sort({ createdAt: -1 })
+        .limit(limit)
+        .lean();
+
+      pagos = (docs || []).map((e) => {
+        const fecha = pickEntryDate(e);
+        const numero = pickEntryNumero(e);
+
+        const lines = pickLines(e);
+        let monto = 0;
+        let metodo = "-";
+
+        // monto: preferimos HABER (caja/bancos)
+        for (const l of lines) {
+          const code = pickCode(l);
+          const haber = pickHaber(l);
+          const debe = pickDebe(l);
+
+          if (haber > 0 && (code === "1001" || code === "1002" || code === "2101" || String(code).startsWith("10"))) {
+            monto = haber;
+          }
+          if (!monto && debe > 0 && (code === "2001" || code === "2003" || String(code).startsWith("20"))) {
+            monto = debe;
+          }
+        }
+
+        for (const l of lines) {
+          const code = pickCode(l);
+          const haber = pickHaber(l);
+          if (haber > 0 && code === (process.env.CTA_EFECTIVO || "1001")) metodo = "efectivo";
+          if (haber > 0 && code === (process.env.CTA_BANCOS || "1002")) metodo = "bancos";
+        }
+
+        const sourceId =
+          e.sourceId ? String(e.sourceId) : e.transaccionId ? String(e.transaccionId) : e.source_id ? String(e.source_id) : null;
+
+        return {
+          id: String(e._id),
+          created_at: fecha ? new Date(fecha).toISOString() : new Date().toISOString(),
+          fecha: fecha ? new Date(fecha).toISOString() : null,
+
+          proveedor_nombre: "Pago CxP",
+          descripcion: String(e.concept ?? e.concepto ?? e.descripcion ?? e.memo ?? "").trim() || `Pago CxP ${numero || ""}`,
+
+          tipo: "Pago CxP",
+          subtipo: sourceId ? `factura:${sourceId}` : "pago",
+
+          monto_total: Math.round(toNum(monto, 0) * 100) / 100,
+          monto_pagado: Math.round(toNum(monto, 0) * 100) / 100,
+          monto_pendiente: 0,
+
+          tipo_pago: "contado",
+          metodo_pago: metodo,
+
+          fecha_vencimiento: null,
+          estado: "activo",
+
+          fuente: "pago_cxp",
+        };
+      });
+    }
+
+    const out = [...facturas, ...pagos];
+
+    // ordenar desc por created_at
+    out.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+
+    // respetar limit final
+    const sliced = out.slice(0, limit);
+
+    return res.json({ ok: true, data: sliced, items: sliced, meta: { limit, hasPayments: !!JournalEntry } });
   } catch (err) {
     console.error("GET /api/cxp/transacciones error:", err);
     return res.status(500).json({ ok: false, error: "SERVER_ERROR", message: err?.message || "SERVER_ERROR" });
@@ -378,7 +723,6 @@ router.get("/transacciones", ensureAuth, async (req, res) => {
 
 /**
  * GET /api/cxp/detalle?pendientes=1&start&end
- * Regresa “cuentas” listas para la UI.
  */
 router.get("/detalle", ensureAuth, async (req, res) => {
   try {

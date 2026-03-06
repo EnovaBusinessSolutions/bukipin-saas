@@ -804,6 +804,16 @@ async function handleByTransaccion(req, res) {
       }
     }
 
+    // ✅ CxP: pagos
+if (s === "pago_cxp" || s === "pagos_cxp" || s === "pago") {
+  sourceAliases.add("pago_cxp");
+  sourceAliases.add("pagos_cxp");
+  sourceAliases.add("pago");
+  // variantes posibles (por si algún día se usan)
+  sourceAliases.add("pago_cxp_egreso");
+  sourceAliases.add("pago_cxp_capex");
+}
+
     const findBy = async (q) => JournalEntry.findOne(q).sort({ createdAt: -1 }).lean();
     const findMany = async (q) => JournalEntry.find(q).sort({ createdAt: -1 }).limit(20).lean();
 
@@ -932,7 +942,17 @@ async function handleByTransaccion(req, res) {
     }
 
     // Traer hasta 20 asientos relacionados por ingresoId: ingreso + cobro_cxc
-    const relatedSources = ["ingreso", "ingresos", "cobro_cxc", "cobro", "cobro_ingreso", "pago_cxc"];
+    // Traer hasta 20 asientos relacionados por id: ingreso + cobro_cxc (+ pagos cxp si aplica)
+const relatedSources = [
+  "ingreso",
+  "ingresos",
+  "cobro_cxc",
+  "cobro",
+  "cobro_ingreso",
+  "pago_cxc",
+  "pago_cxp",
+  "pagos_cxp",
+];
     const relQuery = { owner, source: { $in: relatedSources } };
     if (oid) {
       relQuery.$or = [

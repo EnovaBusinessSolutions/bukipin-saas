@@ -87,25 +87,56 @@ ExpenseTransactionSchema.index({ owner: 1, asientoId: 1 });
 // ✅ Normalizaciones automáticas
 // =============================
 ExpenseTransactionSchema.pre("validate", function (next) {
-  // Mantener tipoEgreso consistente si viene vacío
-  if (!this.tipoEgreso && this.tipo) this.tipoEgreso = this.tipo;
+  try {
+    // Mantener tipoEgreso consistente si viene vacío
+    if (!this.tipoEgreso && this.tipo) this.tipoEgreso = this.tipo;
 
-  // Calcular montoTotal si no viene pero sí cantidad/precioUnitario
-  if (!(this.montoTotal > 0)) {
-    const computed = Number(this.cantidad || 0) * Number(this.precioUnitario || 0);
-    if (computed > 0) this.montoTotal = computed;
+    // Normalizar números
+    const total = Number(this.montoTotal || 0);
+    let pagado = Number(this.montoPagado || 0);
+    let pendiente = Number(this.montoPendiente || 0);
+
+    // Calcular montoTotal si no viene pero sí cantidad/precioUnitario
+    if (!(total > 0)) {
+      const computed = Number(this.cantidad || 0) * Number(this.precioUnitario || 0);
+      if (computed > 0) this.montoTotal = computed;
+    }
+
+    // Legacy total: espejo de montoTotal (para compat)
+    if (!(Number(this.total || 0) > 0) && Number(this.montoTotal || 0) > 0) this.total = this.montoTotal;
+
+    // Releer total por si se calculó arriba
+    const total2 = Number(this.montoTotal || 0);
+
+    // ✅ Blindajes: pagado/pendiente no negativos
+    if (!Number.isFinite(pagado) || pagado < 0) pagado = 0;
+    if (!Number.isFinite(pendiente) || pendiente < 0) pendiente = 0;
+
+    // ✅ Si es contado: forzar pagado=total y pendiente=0
+    if (this.tipoPago === "contado") {
+      this.montoPagado = total2;
+      this.montoPendiente = 0;
+      return next();
+    }
+
+    // ✅ Si NO es contado: recalcular pendiente de forma consistente si tenemos total
+    // (Esto hace que los pagos siempre cuadren sin depender de quien setee montoPendiente)
+    if (total2 > 0) {
+      // cap pagado a total
+      if (pagado > total2) pagado = total2;
+
+      this.montoPagado = pagado;
+      this.montoPendiente = Math.max(0, total2 - pagado);
+    } else {
+      // si no hay total, respetar lo que venga (pero no negativo)
+      this.montoPagado = pagado;
+      this.montoPendiente = Math.max(0, pendiente);
+    }
+
+    next();
+  } catch (e) {
+    next(e);
   }
-
-  // Legacy total: espejo de montoTotal (para compat)
-  if (!(this.total > 0) && this.montoTotal > 0) this.total = this.montoTotal;
-
-  // Si es contado, pendiente debe ser 0
-  if (this.tipoPago === "contado") {
-    this.montoPagado = this.montoTotal;
-    this.montoPendiente = 0;
-  }
-
-  next();
 });
 
 module.exports = mongoose.model("ExpenseTransaction", ExpenseTransactionSchema);

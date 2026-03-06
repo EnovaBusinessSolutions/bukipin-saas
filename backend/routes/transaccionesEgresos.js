@@ -854,8 +854,16 @@ router.post("/", ensureAuth, async (req, res) => {
 });
 
 /**
- * GET /?estado=activo|cancelado&start=YYYY-MM-DD&end=YYYY-MM-DD&tipo=costo|gasto&limit=200
- * ✅ FIX: incluir COGS (5002) en ESTA ruta porque la tabla Resumen la consume.
+ * GET /
+ * Soporta:
+ * - estado=activo|cancelado
+ * - start=YYYY-MM-DD&end=YYYY-MM-DD
+ * - tipo=costo|gasto
+ * - limit=200
+ *
+ * ✅ NUEVO para CxP:
+ * - pendiente_gt=0  => filtra solo (credito|parcial) con monto_pendiente > pendiente_gt
+ * - cuando viene pendiente_gt, por default NO incluimos COGS (include_cogs=0) para no contaminar CxP
  */
 router.get("/", ensureAuth, async (req, res) => {
   try {
@@ -873,8 +881,16 @@ router.get("/", ensureAuth, async (req, res) => {
     const limitRaw = Number(req.query.limit ?? 200);
     const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), 500) : 200;
 
+    // ✅ NUEVO: pendiente_gt
+    const pendienteGtRaw = req.query.pendiente_gt ?? req.query.pendienteGt ?? null;
+    const pendienteGt =
+      pendienteGtRaw === null || pendienteGtRaw === undefined || String(pendienteGtRaw).trim() === ""
+        ? null
+        : toNum(pendienteGtRaw, 0);
+
     const filter = { owner };
 
+    // rango por fecha
     if (start || end) {
       filter.fecha = {};
       if (start) filter.fecha.$gte = start;
@@ -885,23 +901,57 @@ router.get("/", ensureAuth, async (req, res) => {
       }
     }
 
-    // "Otros gastos" se guarda como "gasto", así que entra aquí cuando tipo=gasto.
+    // tipo egreso
     if (tipo && ["costo", "gasto"].includes(tipo)) {
+      // "Otros gastos" se guarda como "gasto", así que entra aquí cuando tipo=gasto.
       filter.$or = [{ tipoEgreso: tipo }, { tipo: tipo }];
     }
 
+    // estado
     if (estado && ["activo", "cancelado"].includes(estado)) {
       filter.estado = estado;
     } else if (!includeCancelados) {
       filter.estado = { $ne: "cancelado" };
     }
 
+    // ✅ NUEVO: filtro CxP (pendiente_gt)
+    // Solo facturas a crédito/parcial con saldo pendiente > pendiente_gt
+    if (pendienteGt !== null) {
+      filter.$and = [
+        ...(Array.isArray(filter.$and) ? filter.$and : []),
+        {
+          $or: [
+            { tipoPago: { $in: ["credito", "parcial"] } },
+            { tipo_pago: { $in: ["credito", "parcial"] } },
+          ],
+        },
+        {
+          $or: [
+            { montoPendiente: { $gt: pendienteGt } },
+            { monto_pendiente: { $gt: pendienteGt } },
+          ],
+        },
+      ];
+    }
+
     const docs = await ExpenseTransaction.find(filter).sort({ fecha: -1, createdAt: -1 }).limit(limit).lean();
 
     let items = docs.map(mapTxForUI);
 
-    // ✅ incluir COGS (5002) desde JournalEntry
-    const includeCogs = String(req.query.include_cogs ?? req.query.includeCogs ?? "1").trim() !== "0";
+    /**
+     * ✅ include_cogs
+     * - default general: 1
+     * - pero si viene pendiente_gt (CxP), default: 0 (para NO contaminar con COGS)
+     */
+    const includeCogsParam = req.query.include_cogs ?? req.query.includeCogs ?? null;
+
+    const includeCogs =
+      includeCogsParam !== null && includeCogsParam !== undefined
+        ? String(includeCogsParam).trim() !== "0"
+        : pendienteGt !== null
+        ? false
+        : true;
+
     if (includeCogs && JournalEntry) {
       const startYmd = parseYMD(req.query.start) || start;
       const endYmd = parseYMD(req.query.end) || end;
@@ -927,9 +977,18 @@ router.get("/", ensureAuth, async (req, res) => {
     }
 
     if (!wrap) return res.json(items);
-    return res.json({ ok: true, data: items, items, meta: { limit, includeCogs } });
+    return res.json({
+      ok: true,
+      data: items,
+      items,
+      meta: {
+        limit,
+        includeCogs,
+        pendiente_gt: pendienteGt,
+      },
+    });
   } catch (err) {
-    console.error("GET /api/egresos/transacciones error:", err);
+    console.error("GET /api/transacciones/egresos error:", err);
     return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
   }
 });
