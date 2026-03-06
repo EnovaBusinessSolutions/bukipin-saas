@@ -36,22 +36,6 @@ function endOfDay(d) {
   return x;
 }
 
-function normalizeTipoPago(v) {
-  const s = asTrim(v).toLowerCase();
-  if (["credito", "crédito"].includes(s)) return "credito";
-  if (["parcial", "parciales"].includes(s)) return "parcial";
-  if (["contado", "total", "pago_total"].includes(s)) return "contado";
-  return s;
-}
-
-function normalizeEstado(v) {
-  const s = asTrim(v).toLowerCase();
-  if (!s) return "";
-  if (["activo", "activa", "active"].includes(s)) return "activo";
-  if (["cancelado", "cancelada", "canceled"].includes(s)) return "cancelado";
-  return s;
-}
-
 /**
  * Mapeo consistente para FE (snake_case + espejo camelCase)
  * Similar a mapTxForUI pero acotado a lo que CxP necesita.
@@ -131,19 +115,12 @@ function buildPendientesFilter({ owner, start, end, pendientesOnly }) {
   filter.estado = { $ne: "cancelado" };
 
   if (pendientesOnly) {
-    // tipoPago credito/parcial (soporta esquema camelCase y algún legacy)
     filter.$and = [
       {
-        $or: [
-          { tipoPago: { $in: ["credito", "parcial"] } },
-          { tipo_pago: { $in: ["credito", "parcial"] } },
-        ],
+        $or: [{ tipoPago: { $in: ["credito", "parcial"] } }, { tipo_pago: { $in: ["credito", "parcial"] } }],
       },
       {
-        $or: [
-          { montoPendiente: { $gt: 0 } },
-          { monto_pendiente: { $gt: 0 } },
-        ],
+        $or: [{ montoPendiente: { $gt: 0 } }, { monto_pendiente: { $gt: 0 } }],
       },
     ];
   }
@@ -162,15 +139,50 @@ function computeDueMeta(tx, now = new Date()) {
   if (!fv || Number.isNaN(fv.getTime())) return { status: "sin_fecha", dias: 0 };
 
   // comparar solo por día
-  const a = new Date(now); a.setHours(0,0,0,0);
-  const b = new Date(fv);  b.setHours(0,0,0,0);
+  const a = new Date(now);
+  a.setHours(0, 0, 0, 0);
+  const b = new Date(fv);
+  b.setHours(0, 0, 0, 0);
 
   const diffDays = Math.round((a.getTime() - b.getTime()) / (1000 * 60 * 60 * 24)); // >0 = vencida
-
   if (diffDays > 0) return { status: "vencida", dias: diffDays };
   if (diffDays === 0) return { status: "vence_hoy", dias: 0 };
   return { status: "por_vencer", dias: Math.abs(diffDays) };
 }
+
+/**
+ * Helper central para listar egresos CxP (evita duplicar lógica)
+ */
+async function listEgresosCxP({ owner, pendientesOnly, start, end, limit }) {
+  const filter = buildPendientesFilter({ owner, start, end, pendientesOnly });
+
+  const docs = await ExpenseTransaction.find(filter).sort({ fecha: -1, createdAt: -1 }).limit(limit).lean();
+
+  return docs.map(mapTxForCxP);
+}
+
+/**
+ * ✅ COMPAT: el FE está pegando a /api/cxp/inversiones?pendientes=1
+ * Por ahora devolvemos vacío para eliminar 404s y dejar panel E2E estable.
+ * (Luego lo conectamos a tu modelo real de inversiones/capex si aplica)
+ */
+router.get("/inversiones", ensureAuth, async (req, res) => {
+  try {
+    const pendientesOnly = String(req.query.pendientes ?? "0").trim() === "1";
+    const start = isoDateOrNull(req.query.start);
+    const end = isoDateOrNull(req.query.end);
+
+    return res.json({
+      ok: true,
+      data: [],
+      items: [],
+      meta: { pendientesOnly, start: start ? start.toISOString() : null, end: end ? end.toISOString() : null },
+    });
+  } catch (err) {
+    console.error("GET /api/cxp/inversiones error:", err);
+    return res.status(500).json({ ok: false, error: "SERVER_ERROR", message: err?.message || "SERVER_ERROR" });
+  }
+});
 
 /**
  * GET /api/cxp/egresos?pendientes=1&start&end&limit=200
@@ -187,14 +199,7 @@ router.get("/egresos", ensureAuth, async (req, res) => {
     const limitRaw = Number(req.query.limit ?? 300);
     const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), 1000) : 300;
 
-    const filter = buildPendientesFilter({ owner, start, end, pendientesOnly });
-
-    const docs = await ExpenseTransaction.find(filter)
-      .sort({ fecha: -1, createdAt: -1 })
-      .limit(limit)
-      .lean();
-
-    const items = docs.map(mapTxForCxP);
+    const items = await listEgresosCxP({ owner, pendientesOnly, start, end, limit });
 
     return res.json({ ok: true, data: items, items, meta: { pendientesOnly, limit } });
   } catch (err) {
@@ -205,20 +210,32 @@ router.get("/egresos", ensureAuth, async (req, res) => {
 
 /**
  * GET /api/cxp/transacciones
- * Alias compatible (tu FE está llamando esto).
- * Por defecto devuelve pendientes=1 si no se especifica.
+ * ✅ Alias compatible (tu FE está llamando esto).
+ * ✅ FIX: ya NO usamos router.handle (era frágil); usamos la misma lógica que /egresos.
  */
 router.get("/transacciones", ensureAuth, async (req, res) => {
-  // compat: si FE no manda pendientes, asumimos 1 porque CxP típicamente muestra pendientes
-  const pendientes = req.query.pendientes ?? "1";
-  req.query.pendientes = pendientes;
-  return router.handle(req, res, () => {});
-}, (req, res) => res.status(500).json({ ok:false, error:"SERVER_ERROR" }));
+  try {
+    const owner = req.user._id;
+
+    const pendientesOnly = String(req.query.pendientes ?? "1").trim() === "1"; // por defecto 1
+    const start = isoDateOrNull(req.query.start);
+    const end = isoDateOrNull(req.query.end);
+
+    const limitRaw = Number(req.query.limit ?? 300);
+    const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), 1000) : 300;
+
+    const items = await listEgresosCxP({ owner, pendientesOnly, start, end, limit });
+
+    return res.json({ ok: true, data: items, items, meta: { pendientesOnly, limit, alias: "transacciones" } });
+  } catch (err) {
+    console.error("GET /api/cxp/transacciones error:", err);
+    return res.status(500).json({ ok: false, error: "SERVER_ERROR", message: err?.message || "SERVER_ERROR" });
+  }
+});
 
 /**
  * GET /api/cxp/detalle?pendientes=1&start&end
  * Regresa “cuentas” listas para la UI (con status vencida/por_vencer/etc.)
- * Aquí puedes sumar KPIs/analytics del panel si quieres.
  */
 router.get("/detalle", ensureAuth, async (req, res) => {
   try {
@@ -231,9 +248,7 @@ router.get("/detalle", ensureAuth, async (req, res) => {
     const limitRaw = Number(req.query.limit ?? 2000);
     const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), 5000) : 2000;
 
-    const filter = buildPendientesFilter({ owner, start, end, pendientesOnly });
-
-    const docs = await ExpenseTransaction.find(filter)
+    const docs = await ExpenseTransaction.find(buildPendientesFilter({ owner, start, end, pendientesOnly }))
       .sort({ fecha: -1, createdAt: -1 })
       .limit(limit)
       .lean();
@@ -245,7 +260,7 @@ router.get("/detalle", ensureAuth, async (req, res) => {
       const due = computeDueMeta(tx, now);
 
       return {
-        // shape “cuenta” (mantenlo simple para FE)
+        // shape “cuenta”
         cuenta_id: tx.id,
         egreso_id: tx.id,
         transaccion_id: tx.id,
@@ -278,10 +293,12 @@ router.get("/detalle", ensureAuth, async (req, res) => {
       };
     });
 
-    // KPIs rápidos (útiles para cards)
+    // KPIs rápidos
     const totalPorPagar = cuentas.reduce((acc, c) => acc + toNum(c.saldo_pendiente, 0), 0);
     const vencidas = cuentas.filter((c) => c.vencimiento_status === "vencida");
-    const porVencer = cuentas.filter((c) => c.vencimiento_status === "por_vencer" || c.vencimiento_status === "vence_hoy");
+    const porVencer = cuentas.filter(
+      (c) => c.vencimiento_status === "por_vencer" || c.vencimiento_status === "vence_hoy"
+    );
 
     const summary = {
       total_por_pagar: Math.round(totalPorPagar * 100) / 100,

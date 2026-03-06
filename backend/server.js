@@ -104,6 +104,8 @@ app.use("/api/cuentas-por-cobrar", require("./routes/cxc"));
 
 app.use("/api/cxp", require("./routes/cxp"));
 
+app.use("/api/inversiones", require("./routes/inversiones"));
+
 // ==============================
 // ✅ Placeholders temporales (al final para no pisar rutas reales)
 // ==============================
