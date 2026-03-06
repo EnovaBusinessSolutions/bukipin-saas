@@ -772,7 +772,7 @@ async function handleByTransaccion(req, res) {
     const source_idCandidates = inFor(source_idIsObj);
     const transaccion_idCandidates = inFor(transaccion_idIsObj);
 
-    // ✅ 1.1) Source aliases (incluye cobros para CxC)
+    // ✅ 1.1) Source aliases
     const sourceAliases = new Set();
 
     if (source) {
@@ -794,25 +794,24 @@ async function handleByTransaccion(req, res) {
         sourceAliases.add("inventory");
       }
 
-      // ✅ CxC: si piden asiento "del ingreso", también aceptamos el asiento del cobro ligado a ese ingreso
-      // (porque cobro_cxc guarda sourceId = ingresoId)
+      // ✅ CxC
       if (s === "ingreso" || s === "ingresos") {
         sourceAliases.add("cobro_cxc");
         sourceAliases.add("cobro");
         sourceAliases.add("cobro_ingreso");
         sourceAliases.add("pago_cxc");
       }
-    }
 
-    // ✅ CxP: pagos
-if (s === "pago_cxp" || s === "pagos_cxp" || s === "pago") {
-  sourceAliases.add("pago_cxp");
-  sourceAliases.add("pagos_cxp");
-  sourceAliases.add("pago");
-  // variantes posibles (por si algún día se usan)
-  sourceAliases.add("pago_cxp_egreso");
-  sourceAliases.add("pago_cxp_capex");
-}
+      // ✅ CxP pagos
+      if (s === "pago_cxp" || s === "pagos_cxp" || s === "pago") {
+        sourceAliases.add("pago_cxp");
+        sourceAliases.add("pagos_cxp");
+        sourceAliases.add("pago");
+        sourceAliases.add("pago_egreso");
+        sourceAliases.add("pago_capex");
+        sourceAliases.add("cxp_pago");
+      }
+    }
 
     const findBy = async (q) => JournalEntry.findOne(q).sort({ createdAt: -1 }).lean();
     const findMany = async (q) => JournalEntry.find(q).sort({ createdAt: -1 }).limit(20).lean();
@@ -838,9 +837,28 @@ if (s === "pago_cxp" || s === "pagos_cxp" || s === "pago") {
           (await findBy({ owner, source: { $in: srcList }, source_id: { $in: source_idCandidates } })) ||
           asiento;
       }
+      if (!asiento && transaccion_idCandidates.length) {
+        asiento =
+          (await findBy({ owner, source: { $in: srcList }, transaccion_id: { $in: transaccion_idCandidates } })) ||
+          asiento;
+      }
 
       if (!asiento) {
-        asiento = await findBy({ owner, "references.source": { $in: srcList }, "references.id": idStr });
+        asiento =
+          (await findBy({
+            owner,
+            "references.source": { $in: srcList },
+            "references.id": idStr,
+          })) || asiento;
+      }
+
+      if (!asiento) {
+        asiento =
+          (await findBy({
+            owner,
+            "references.id": idStr,
+            $or: [{ source: { $in: srcList } }, { "references.source": { $in: srcList } }],
+          })) || asiento;
       }
     }
 
@@ -863,14 +881,40 @@ if (s === "pago_cxp" || s === "pagos_cxp" || s === "pago") {
       }
     }
 
-    // 3.1) ✅ EXTRA: si source=ingreso y no encontró, intenta directo por cobro_cxc ligado al ingresoId
-    // Esto evita “NOT_FOUND” cuando el panel pide el asiento del cobro desde /by-transaccion-ingreso/:id
+    // 3.1) ✅ EXTRA CxC
     if (!asiento && (source === "ingreso" || source === "ingresos") && oid) {
       asiento =
         (await findBy({ owner, source: "cobro_cxc", sourceId: oid })) ||
         (await findBy({ owner, source: "cobro_cxc", transaccionId: oid })) ||
         (await findBy({ owner, source: "cobro_cxc", source_id: oid })) ||
+        (await findBy({ owner, source: "cobro_cxc", transaccion_id: oid })) ||
         null;
+    }
+
+    // 3.2) ✅ EXTRA CxP: si el frontend pide el detalle del pago_cxp con el id del pago/transacción
+    if (!asiento && (source === "pago_cxp" || source === "pagos_cxp" || source === "pago")) {
+      const pagoSources = ["pago_cxp", "pagos_cxp", "pago", "pago_egreso", "pago_capex", "cxp_pago"];
+
+      if (oid) {
+        asiento =
+          (await findBy({ owner, source: { $in: pagoSources }, _id: oid })) ||
+          (await findBy({ owner, source: { $in: pagoSources }, sourceId: oid })) ||
+          (await findBy({ owner, source: { $in: pagoSources }, transaccionId: oid })) ||
+          (await findBy({ owner, source: { $in: pagoSources }, source_id: oid })) ||
+          (await findBy({ owner, source: { $in: pagoSources }, transaccion_id: oid })) ||
+          null;
+      }
+
+      if (!asiento) {
+        asiento =
+          (await findBy({ owner, source: { $in: pagoSources }, _id: idStr }).catch(() => null)) ||
+          (await findBy({ owner, source: { $in: pagoSources }, sourceId: idStr })) ||
+          (await findBy({ owner, source: { $in: pagoSources }, transaccionId: idStr })) ||
+          (await findBy({ owner, source: { $in: pagoSources }, source_id: idStr })) ||
+          (await findBy({ owner, source: { $in: pagoSources }, transaccion_id: idStr })) ||
+          (await findBy({ owner, "references.id": idStr, source: { $in: pagoSources } })) ||
+          null;
+      }
     }
 
     // 4) ✅ ESPECIAL INVENTARIO
@@ -906,7 +950,8 @@ if (s === "pago_cxp" || s === "pagos_cxp" || s === "pago") {
                 ? await findBy({ owner, source: movSrc, sourceId: { $in: [candOid] } }).catch(() => null)
                 : null) ||
               (await findBy({ owner, source: movSrc, source_id: { $in: cand } })) ||
-              (await findBy({ owner, source: movSrc, transaccionId: { $in: cand } }));
+              (await findBy({ owner, source: movSrc, transaccionId: { $in: cand } })) ||
+              (await findBy({ owner, source: movSrc, transaccion_id: { $in: cand } }));
           }
         }
       }
@@ -924,7 +969,6 @@ if (s === "pago_cxp" || s === "pagos_cxp" || s === "pago") {
     const numeroAsiento =
       asientoUI.numeroAsiento || asientoUI.numero_asiento || pickEntryNumero(asiento) || null;
 
-    // ✅ BONUS: si el caller quiere “todos los asientos relacionados” (útil para CxC)
     const includeAll =
       String(req.query.include_all || req.query.includeAll || "0").trim() === "1" ||
       String(req.query.all || "0").trim() === "1";
@@ -941,18 +985,21 @@ if (s === "pago_cxp" || s === "pagos_cxp" || s === "pago") {
       });
     }
 
-    // Traer hasta 20 asientos relacionados por ingresoId: ingreso + cobro_cxc
-    // Traer hasta 20 asientos relacionados por id: ingreso + cobro_cxc (+ pagos cxp si aplica)
-const relatedSources = [
-  "ingreso",
-  "ingresos",
-  "cobro_cxc",
-  "cobro",
-  "cobro_ingreso",
-  "pago_cxc",
-  "pago_cxp",
-  "pagos_cxp",
-];
+    const relatedSources = [
+      "ingreso",
+      "ingresos",
+      "cobro_cxc",
+      "cobro",
+      "cobro_ingreso",
+      "pago_cxc",
+      "pago_cxp",
+      "pagos_cxp",
+      "pago",
+      "pago_egreso",
+      "pago_capex",
+      "cxp_pago",
+    ];
+
     const relQuery = { owner, source: { $in: relatedSources } };
     if (oid) {
       relQuery.$or = [
