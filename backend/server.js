@@ -85,7 +85,12 @@ app.use("/api/contabilidad", require("./routes/contabilidad"));
 
 app.use("/api/flujo-efectivo", require("./routes/flujoEfectivo"));
 
+// ✅ Financiamientos
 app.use("/api/financiamientos", require("./routes/financiamientos"));
+
+// ✅ Catálogo de instituciones financieras
+app.use("/api/instituciones-financieras", require("./routes/institucionesFinancieras"));
+
 app.use("/api/egresos", require("./routes/egresos"));
 
 // ==============================
