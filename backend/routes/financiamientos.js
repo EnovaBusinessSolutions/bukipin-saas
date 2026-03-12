@@ -191,6 +191,123 @@ function getLegacyTipoMovimiento(doc) {
   return normalizeTipoMovimiento(doc?.tipo || doc?.tipo_transaccion || "otro");
 }
 
+function isOpenFacilityType(doc) {
+  const tipoUi = getUiTipoFromFinancingLike(doc);
+  return tipoUi === "revolvente" || tipoUi === "tarjeta_corporativa";
+}
+
+function getTipoLabelFromFinancing(doc) {
+  const tipoUi = getUiTipoFromFinancingLike(doc);
+
+  if (tipoUi === "simple") return "Crédito Simple";
+  if (tipoUi === "revolvente") return "Crédito Revolvente";
+  if (tipoUi === "tarjeta_corporativa") return "Tarjeta Corporativa";
+  return "Financiamiento";
+}
+
+function getEstadoLabelFromFinancing(doc) {
+  const estado = normalizeEstatusFinanciamiento(doc?.estatus || doc?.estado || "activo");
+  const labels = {
+    activo: "ACTIVO",
+    liquidado: "PAGADO",
+    vencido: "VENCIDO",
+    cancelado: "CANCELADO",
+    suspendido: "SUSPENDIDO",
+  };
+  return labels[estado] || estado.toUpperCase();
+}
+
+function buildDetailMetrics(doc) {
+  const tipoUi = getUiTipoFromFinancingLike(doc);
+  const estado = normalizeEstatusFinanciamiento(doc?.estatus || doc?.estado || "activo");
+
+  const lineaCredito = Math.max(0, toNum(doc?.linea_credito, 0));
+  const montoOriginal = Math.max(0, toNum(doc?.monto_original, 0));
+  const saldoDispuestoActual = Math.max(0, toNum(doc?.saldo_dispuesto_actual, 0));
+  const saldoCapitalActual = Math.max(0, toNum(doc?.saldo_capital_actual, 0));
+  const saldoTotalActual = Math.max(0, toNum(doc?.saldo_total_actual, 0));
+  const totalAmortizadoCapital = Math.max(0, toNum(doc?.total_amortizado_capital, 0));
+  const disponibleActual = Math.max(
+    0,
+    toNum(doc?.disponible_actual, Math.max(0, lineaCredito - saldoDispuestoActual))
+  );
+
+  const montoTotalVista =
+    tipoUi === "revolvente" || tipoUi === "tarjeta_corporativa"
+      ? lineaCredito
+      : montoOriginal;
+
+  const saldoActualVista =
+    tipoUi === "revolvente" || tipoUi === "tarjeta_corporativa"
+      ? saldoDispuestoActual
+      : saldoTotalActual;
+
+  const montoPagadoCapital =
+    tipoUi === "simple"
+      ? Math.max(0, montoOriginal - saldoCapitalActual)
+      : totalAmortizadoCapital;
+
+  const montoPendienteCapital =
+    tipoUi === "simple"
+      ? Math.max(0, saldoCapitalActual)
+      : Math.max(0, saldoDispuestoActual);
+
+  const usoLineaPct =
+    lineaCredito > 0 ? Math.min(100, (saldoDispuestoActual / lineaCredito) * 100) : 0;
+
+  const progresoPagoPct =
+    montoOriginal > 0 ? Math.min(100, (montoPagadoCapital / montoOriginal) * 100) : 0;
+
+  return {
+    tipo_ui: tipoUi,
+    tipoUi,
+    tipo_label: getTipoLabelFromFinancing(doc),
+    tipoLabel: getTipoLabelFromFinancing(doc),
+
+    estado_ui: estado,
+    estadoUi: estado,
+    estado_label: getEstadoLabelFromFinancing(doc),
+    estadoLabel: getEstadoLabelFromFinancing(doc),
+
+    cuenta_display:
+      asTrim(doc?.numero_cuenta) ||
+      asTrim(doc?.numero_contrato) ||
+      asTrim(doc?.referencia) ||
+      "",
+    cuentaDisplay:
+      asTrim(doc?.numero_cuenta) ||
+      asTrim(doc?.numero_contrato) ||
+      asTrim(doc?.referencia) ||
+      "",
+
+    condiciones_texto: asTrim(doc?.notas) || asTrim(doc?.descripcion) || "",
+    condicionesTexto: asTrim(doc?.notas) || asTrim(doc?.descripcion) || "",
+    descripcion_corta: asTrim(doc?.descripcion) || asTrim(doc?.notas) || "",
+    descripcionCorta: asTrim(doc?.descripcion) || asTrim(doc?.notas) || "",
+
+    monto_total_vista: montoTotalVista,
+    montoTotalVista,
+    saldo_actual_vista: saldoActualVista,
+    saldoActualVista,
+
+    monto_pagado_capital: montoPagadoCapital,
+    montoPagadoCapital,
+    monto_pendiente_capital: montoPendienteCapital,
+    montoPendienteCapital,
+
+    uso_linea_pct: usoLineaPct,
+    usoLineaPct,
+    progreso_pago_pct: progresoPagoPct,
+    progresoPagoPct,
+
+    disponible_linea: disponibleActual,
+    disponibleLinea: disponibleActual,
+
+    modo_visual: tipoUi === "simple" ? "progreso_pago" : "uso_linea",
+    modoVisual: tipoUi === "simple" ? "progreso_pago" : "uso_linea",
+  };
+}
+
 function recalcFinancingSnapshot(financingLike) {
   const f = financingLike?.toObject ? financingLike.toObject() : { ...(financingLike || {}) };
 
@@ -216,12 +333,15 @@ function recalcFinancingSnapshot(financingLike) {
 
   f.disponible_actual = Math.max(0, toNum(f.linea_credito, 0) - toNum(f.saldo_dispuesto_actual, 0));
 
-  if (toNum(f.saldo_total_actual, 0) <= 0) {
-    if (!["cancelado", "suspendido"].includes(asTrim(f.estatus, "").toLowerCase())) {
-      f.estatus = "liquidado";
+  const estatusActual = asTrim(f.estatus, "").toLowerCase();
+  const openFacility = isOpenFacilityType(f);
+
+  if (!["cancelado", "suspendido", "vencido"].includes(estatusActual)) {
+    if (toNum(f.saldo_total_actual, 0) <= 0) {
+      f.estatus = openFacility ? "activo" : "liquidado";
+    } else if (estatusActual === "liquidado") {
+      f.estatus = "activo";
     }
-  } else if (["liquidado"].includes(asTrim(f.estatus, "").toLowerCase())) {
-    f.estatus = "activo";
   }
 
   return f;
@@ -256,6 +376,8 @@ function applyMovementToFinancing(financingLike, payload) {
     case "amortizacion": {
       const capital = montoCapital || 0;
       const intereses = montoIntereses || 0;
+      const moratorios = montoMoratorios || 0;
+      const comisiones = montoComisiones || 0;
 
       f.saldo_capital_actual = Math.max(0, f.saldo_capital_actual - capital);
       f.saldo_dispuesto_actual = Math.max(0, f.saldo_dispuesto_actual - capital);
@@ -264,6 +386,15 @@ function applyMovementToFinancing(financingLike, payload) {
       if (intereses > 0) {
         f.saldo_intereses_actual = Math.max(0, f.saldo_intereses_actual - intereses);
         f.total_intereses_pagados += intereses;
+      }
+
+      if (moratorios > 0) {
+        f.saldo_moratorios_actual = Math.max(0, f.saldo_moratorios_actual - moratorios);
+      }
+
+      if (comisiones > 0) {
+        f.saldo_comisiones_actual = Math.max(0, f.saldo_comisiones_actual - comisiones);
+        f.total_comisiones_pagadas += comisiones;
       }
       break;
     }
@@ -314,6 +445,40 @@ function applyMovementToFinancing(financingLike, payload) {
   return recalcFinancingSnapshot(f);
 }
 
+function validateMovementAgainstFinancing(financing, payload) {
+  const tipoFin = getUiTipoFromFinancingLike(financing);
+  const tipoMov = normalizeTipoMovimiento(payload?.tipo || payload?.tipo_transaccion);
+
+  const montoCapital = Math.max(
+    0,
+    toNum(
+      payload?.monto_capital ??
+        payload?.montoCapital ??
+        payload?.capital_pagado ??
+        payload?.monto,
+      0
+    )
+  );
+
+  if (tipoMov === "disposicion" && tipoFin !== "revolvente") {
+    const err = new Error("La disposición solo aplica a créditos revolventes.");
+    err.statusCode = 400;
+    throw err;
+  }
+
+  if (tipoMov === "disposicion") {
+    const linea = Math.max(0, toNum(financing?.linea_credito, 0));
+    const saldoDispuestoActual = Math.max(0, toNum(financing?.saldo_dispuesto_actual, 0));
+    const disponible = Math.max(0, linea - saldoDispuestoActual);
+
+    if (montoCapital > disponible) {
+      const err = new Error("La disposición excede la línea de crédito disponible.");
+      err.statusCode = 400;
+      throw err;
+    }
+  }
+}
+
 function buildLegacyAliasesForFinancing(doc) {
   const tipoUi = getUiTipoFromFinancingLike(doc);
   const estado = getLegacyEstado(doc);
@@ -351,6 +516,7 @@ function mapFinancingForUI(doc) {
   const base = {
     id: String(d._id || ""),
     _id: d._id || null,
+    owner: d.owner || null,
 
     nombre: d.nombre || "",
     alias: d.alias || "",
@@ -471,10 +637,13 @@ function mapFinancingForUI(doc) {
     updatedAt: d.updatedAt || null,
   };
 
-  return {
+  const enriched = {
     ...base,
     ...buildLegacyAliasesForFinancing(base),
+    ...buildDetailMetrics(base),
   };
+
+  return enriched;
 }
 
 function buildLegacyAliasesForMovement(doc) {
@@ -499,6 +668,7 @@ function mapMovementForUI(doc) {
   const base = {
     id: String(d._id || ""),
     _id: d._id || null,
+    owner: d.owner || null,
 
     financingId: d.financingId ? String(d.financingId) : "",
     financing_id: d.financingId ? String(d.financingId) : "",
@@ -737,6 +907,16 @@ async function createMovementAndApply({ owner, financing, payload }) {
   }
 
   const tipo = normalizeTipoMovimiento(payload.tipo || payload.tipo_transaccion);
+
+  validateMovementAgainstFinancing(financing, {
+    ...payload,
+    tipo,
+    monto: effectiveAmount,
+    monto_capital: montoCapital,
+    monto_intereses: montoIntereses,
+    monto_moratorios: montoMoratorios,
+    monto_comisiones: montoComisiones,
+  });
 
   const current = recalcFinancingSnapshot(financing);
   const nextState = applyMovementToFinancing(current, {
@@ -1171,6 +1351,15 @@ router.post("/", ensureAuth, async (req, res) => {
 
     const tipoNormalized = normalizeTipoFinanciamiento(req.body?.tipo || req.body?.tipo_credito);
     const uiTipo = getUiTipoFromFinancingLike({ tipo: tipoNormalized });
+
+    const allowedCreateTypes = new Set(["credito_simple", "linea_credito", "tarjeta_credito"]);
+    if (!allowedCreateTypes.has(tipoNormalized)) {
+      return res.status(400).json({
+        ok: false,
+        error: "VALIDATION",
+        message: "Solo se permite registrar crédito simple, crédito revolvente o tarjeta de crédito.",
+      });
+    }
 
     const montoTotalLegacy = Math.max(0, toNum(req.body?.monto_total, 0));
     const montoOriginal = Math.max(
@@ -1616,7 +1805,11 @@ router.patch("/:id", ensureAuth, async (req, res) => {
       );
     }
 
-    if (req.body?.tasa_interes_anual !== undefined || req.body?.tasaInteresAnual !== undefined || req.body?.tasa_interes !== undefined) {
+    if (
+      req.body?.tasa_interes_anual !== undefined ||
+      req.body?.tasaInteresAnual !== undefined ||
+      req.body?.tasa_interes !== undefined
+    ) {
       patch.tasa_interes_anual = Math.max(
         0,
         toNum(req.body?.tasa_interes_anual ?? req.body?.tasaInteresAnual ?? req.body?.tasa_interes, 0)
