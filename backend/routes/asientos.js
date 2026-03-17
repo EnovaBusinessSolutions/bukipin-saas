@@ -1,4 +1,3 @@
-// backend/routes/asientos.js
 const express = require("express");
 const router = express.Router();
 const mongoose = require("mongoose");
@@ -396,6 +395,9 @@ function mapEntryForUI(entry, accountMapsOrNameMap = {}) {
     detalles,
     created_at: entry.createdAt ?? entry.created_at ?? null,
     updated_at: entry.updatedAt ?? entry.updated_at ?? null,
+    references: Array.isArray(entry?.references) ? entry.references : [],
+    sourceId: entry?.sourceId ? String(entry.sourceId) : null,
+    transaccionId: entry?.transaccionId ? String(entry.transaccionId) : null,
   };
 }
 
@@ -403,8 +405,98 @@ function mapEntryForUI(entry, accountMapsOrNameMap = {}) {
  * ✅ IMPORTANTE:
  * /depreciaciones DEBE ir ANTES de "/:id"
  */
-router.get("/depreciaciones", ensureAuth, async (_req, res) => {
-  return res.json({ ok: true, data: [], items: [] });
+router.get("/depreciaciones", ensureAuth, async (req, res) => {
+  try {
+    const owner = req.user._id;
+    const dateField = pickDateField();
+
+    const start = parseYMD(req.query.start ?? req.query.from);
+    const end = parseYMD(req.query.end ?? req.query.to);
+
+    const limitRaw = Number(req.query.limit ?? 1000);
+    const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), 5000) : 1000;
+
+    const depSources = [
+      "depreciacion_inversion",
+      "inversion_depreciacion",
+      "depreciacion",
+      "depreciaciones",
+    ];
+
+    const match = {
+      owner,
+      $or: [
+        { source: { $in: depSources } },
+        { concept: /depreci/gi },
+        { descripcion: /depreci/gi },
+        { memo: /depreci/gi },
+        { numeroAsiento: /dep/gi },
+        { numero_asiento: /dep/gi },
+        { numero: /dep/gi },
+        { "references.source": { $in: ["inversion", "capex"] } },
+      ],
+    };
+
+    if (start || end) {
+      match[dateField] = {};
+      if (start) match[dateField].$gte = start;
+      if (end) match[dateField].$lte = dayEnd(end);
+    }
+
+    const sortObj = {};
+    sortObj[dateField] = -1;
+    sortObj.createdAt = -1;
+
+    const docs = await JournalEntry.find(match).sort(sortObj).limit(limit).lean();
+
+    const allLines = [];
+    for (const a of docs) {
+      const lines = a.lines || a.detalle_asientos || a.detalles_asiento || [];
+      if (Array.isArray(lines) && lines.length) allLines.push(...lines);
+    }
+
+    const accountMaps = await getAccountMaps(owner, allLines);
+
+    const items = docs.map((a) => {
+      const ui = mapEntryForUI(a, accountMaps);
+
+      let inversionId =
+        a?.sourceId ? String(a.sourceId) :
+        a?.transaccionId ? String(a.transaccionId) :
+        null;
+
+      if (!inversionId && Array.isArray(a?.references)) {
+        const ref = a.references.find((r) =>
+          ["inversion", "capex"].includes(String(r?.source || "").toLowerCase())
+        );
+        if (ref?.id) inversionId = String(ref.id);
+      }
+
+      const periodo = ui.fecha ? String(toYMD(ui.fecha) || "").slice(0, 7).replace("-", "") : null;
+
+      return {
+        ...ui,
+        inversion_id: inversionId,
+        inversionId: inversionId,
+        periodo,
+      };
+    });
+
+    return res.json({
+      ok: true,
+      data: items,
+      items,
+      meta: {
+        limit,
+        start: start ? toYMD(start) : null,
+        end: end ? toYMD(end) : null,
+        docs_count: items.length,
+      },
+    });
+  } catch (e) {
+    console.error("GET /api/asientos/depreciaciones error:", e);
+    return res.status(500).json({ ok: false, error: "SERVER_ERROR" });
+  }
 });
 
 /**
@@ -594,6 +686,7 @@ router.get("/", ensureAuth, async (req, res) => {
     const includeDetalles =
       String(req.query.include_detalles || req.query.includeDetalles || "0").trim() === "1";
     const wrap = String(req.query.wrap || "").trim() === "1";
+    const tipo = String(req.query.tipo || "").trim().toLowerCase();
 
     const limitRaw = Number(req.query.limit ?? 200);
     const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), 500) : 200;
@@ -603,6 +696,17 @@ router.get("/", ensureAuth, async (req, res) => {
       match[dateField] = {};
       if (start) match[dateField].$gte = start;
       if (end) match[dateField].$lte = dayEnd(end);
+    }
+
+    if (tipo === "depreciacion" || tipo === "depreciaciones") {
+      match.$or = [
+        { source: { $in: ["depreciacion_inversion", "inversion_depreciacion", "depreciacion", "depreciaciones"] } },
+        { concept: /depreci/gi },
+        { descripcion: /depreci/gi },
+        { numeroAsiento: /dep/gi },
+        { numero_asiento: /dep/gi },
+        { numero: /dep/gi },
+      ];
     }
 
     const sortObj = {};
@@ -811,10 +915,34 @@ async function handleByTransaccion(req, res) {
         sourceAliases.add("pago_capex");
         sourceAliases.add("cxp_pago");
       }
+
+      // ✅ Inversiones / depreciaciones
+      if (s === "inversion" || s === "capex") {
+        sourceAliases.add("inversion");
+        sourceAliases.add("capex");
+        sourceAliases.add("inversion_alta");
+      }
+      if (s === "inversion_baja" || s === "baja_inversion") {
+        sourceAliases.add("inversion_baja");
+        sourceAliases.add("baja_inversion");
+        sourceAliases.add("inversion");
+      }
+      if (s === "inversion_venta" || s === "venta_inversion") {
+        sourceAliases.add("inversion_venta");
+        sourceAliases.add("venta_inversion");
+        sourceAliases.add("inversion_baja");
+        sourceAliases.add("inversion");
+      }
+      if (s === "depreciacion_inversion" || s === "inversion_depreciacion" || s === "depreciacion") {
+        sourceAliases.add("depreciacion_inversion");
+        sourceAliases.add("inversion_depreciacion");
+        sourceAliases.add("depreciacion");
+        sourceAliases.add("depreciaciones");
+      }
     }
 
     const findBy = async (q) => JournalEntry.findOne(q).sort({ createdAt: -1 }).lean();
-    const findMany = async (q) => JournalEntry.find(q).sort({ createdAt: -1 }).limit(20).lean();
+    const findMany = async (q) => JournalEntry.find(q).sort({ createdAt: -1 }).limit(50).lean();
 
     let asiento = null;
 
@@ -891,7 +1019,7 @@ async function handleByTransaccion(req, res) {
         null;
     }
 
-    // 3.2) ✅ EXTRA CxP: si el frontend pide el detalle del pago_cxp con el id del pago/transacción
+    // 3.2) ✅ EXTRA CxP
     if (!asiento && (source === "pago_cxp" || source === "pagos_cxp" || source === "pago")) {
       const pagoSources = ["pago_cxp", "pagos_cxp", "pago", "pago_egreso", "pago_capex", "cxp_pago"];
 
@@ -998,6 +1126,17 @@ async function handleByTransaccion(req, res) {
       "pago_egreso",
       "pago_capex",
       "cxp_pago",
+      "inversion",
+      "capex",
+      "inversion_alta",
+      "inversion_baja",
+      "baja_inversion",
+      "inversion_venta",
+      "venta_inversion",
+      "depreciacion_inversion",
+      "inversion_depreciacion",
+      "depreciacion",
+      "depreciaciones",
     ];
 
     const relQuery = { owner, source: { $in: relatedSources } };

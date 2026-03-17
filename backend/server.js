@@ -73,6 +73,7 @@ app.use("/api/subcuentas", require("./routes/subcuentas"));
 app.use("/api/productos", require("./routes/productos"));
 app.use("/api/clientes", require("./routes/clientes"));
 app.use("/api/proveedores", require("./routes/proveedores"));
+app.use("/api/recomendaciones-depreciacion", require("./routes/recomendacionesDepreciacion"));
 
 app.use("/api/ingresos", require("./routes/ingresos"));
 app.use("/api/transacciones", require("./routes/transacciones"));
