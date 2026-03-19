@@ -60,8 +60,50 @@ function normalizeTipoMovimiento(v) {
   return aliases[s] || "";
 }
 
+/**
+ * ✅ CLAVE:
+ * soporta docs mongoose y objetos lean()
+ */
 function normalizeItem(doc) {
-  return doc?.toJSON ? doc.toJSON() : doc;
+  if (!doc) return null;
+
+  if (typeof doc.toJSON === "function") {
+    return doc.toJSON();
+  }
+
+  return {
+    id: doc._id ? String(doc._id) : String(doc.id ?? ""),
+    user_id: doc.owner ? String(doc.owner) : "",
+
+    tipo_movimiento: asTrim(doc.tipo_movimiento, ""),
+    fecha: doc.fecha ? toYMD(doc.fecha) : null,
+    monto: toNum(doc.monto, 0),
+    socio: asTrim(doc.socio, ""),
+    accionista_id: doc.accionista_id ? String(doc.accionista_id) : null,
+    descripcion:
+      doc.descripcion === null || doc.descripcion === undefined
+        ? null
+        : asTrim(doc.descripcion, ""),
+    estado: asTrim(doc.estado, "activo"),
+
+    fecha_cancelacion: doc.fecha_cancelacion ? toYMD(doc.fecha_cancelacion) : null,
+    motivo_cancelacion:
+      doc.motivo_cancelacion === null || doc.motivo_cancelacion === undefined
+        ? null
+        : asTrim(doc.motivo_cancelacion, ""),
+
+    transaccion_cancelacion_id: doc.transaccion_cancelacion_id
+      ? String(doc.transaccion_cancelacion_id)
+      : null,
+
+    journalEntryId: doc.journalEntryId ? String(doc.journalEntryId) : null,
+    reversalJournalEntryId: doc.reversalJournalEntryId
+      ? String(doc.reversalJournalEntryId)
+      : null,
+
+    created_at: doc.createdAt ? new Date(doc.createdAt).toISOString() : null,
+    updated_at: doc.updatedAt ? new Date(doc.updatedAt).toISOString() : null,
+  };
 }
 
 function getDefaultAccounts(tipoMovimiento) {
@@ -268,7 +310,7 @@ router.get("/transacciones", ensureAuth, async (req, res) => {
       .limit(limit)
       .lean();
 
-    const items = docs.map(normalizeItem);
+    const items = docs.map(normalizeItem).filter(Boolean);
 
     if (!wrap) return res.json(items);
     return res.json({ ok: true, data: items, items });
