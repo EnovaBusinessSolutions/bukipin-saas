@@ -939,6 +939,26 @@ async function handleByTransaccion(req, res) {
         sourceAliases.add("depreciacion");
         sourceAliases.add("depreciaciones");
       }
+
+      // ✅ Capital / cancelaciones de capital
+      if (s === "capital") {
+        sourceAliases.add("capital");
+        sourceAliases.add("capital_cancelacion");
+        sourceAliases.add("capital_aportacion");
+        sourceAliases.add("capital_dividendo");
+      }
+      if (s === "capital_cancelacion") {
+        sourceAliases.add("capital");
+        sourceAliases.add("capital_cancelacion");
+      }
+      if (s === "capital_aportacion") {
+        sourceAliases.add("capital");
+        sourceAliases.add("capital_aportacion");
+      }
+      if (s === "capital_dividendo") {
+        sourceAliases.add("capital");
+        sourceAliases.add("capital_dividendo");
+      }
     }
 
     const findBy = async (q) => JournalEntry.findOne(q).sort({ createdAt: -1 }).lean();
@@ -1045,6 +1065,36 @@ async function handleByTransaccion(req, res) {
       }
     }
 
+    // 3.3) ✅ EXTRA Capital
+    if (!asiento && (source === "capital" || source === "capital_cancelacion")) {
+      const capitalSources = [
+        "capital",
+        "capital_cancelacion",
+        "capital_aportacion",
+        "capital_dividendo",
+      ];
+
+      if (oid) {
+        asiento =
+          (await findBy({ owner, source: { $in: capitalSources }, _id: oid })) ||
+          (await findBy({ owner, source: { $in: capitalSources }, sourceId: oid })) ||
+          (await findBy({ owner, source: { $in: capitalSources }, transaccionId: oid })) ||
+          (await findBy({ owner, source: { $in: capitalSources }, source_id: oid })) ||
+          (await findBy({ owner, source: { $in: capitalSources }, transaccion_id: oid })) ||
+          null;
+      }
+
+      if (!asiento) {
+        asiento =
+          (await findBy({ owner, source: { $in: capitalSources }, sourceId: idStr })) ||
+          (await findBy({ owner, source: { $in: capitalSources }, transaccionId: idStr })) ||
+          (await findBy({ owner, source: { $in: capitalSources }, source_id: idStr })) ||
+          (await findBy({ owner, source: { $in: capitalSources }, transaccion_id: idStr })) ||
+          (await findBy({ owner, "references.id": idStr, source: { $in: capitalSources } })) ||
+          null;
+      }
+    }
+
     // 4) ✅ ESPECIAL INVENTARIO
     if (!asiento && InventoryMovement && isObjectId(id)) {
       const mov = await InventoryMovement.findOne({ owner, _id: new mongoose.Types.ObjectId(id) })
@@ -1137,6 +1187,10 @@ async function handleByTransaccion(req, res) {
       "inversion_depreciacion",
       "depreciacion",
       "depreciaciones",
+      "capital",
+      "capital_cancelacion",
+      "capital_aportacion",
+      "capital_dividendo",
     ];
 
     const relQuery = { owner, source: { $in: relatedSources } };
@@ -1184,7 +1238,7 @@ async function handleByTransaccion(req, res) {
 
 /**
  * ✅ CLAVE:
- * GET /api/asientos/by-transaccion?source=ingreso|egreso|inventario|cobro_cxc|...&id=XXXXXXXX
+ * GET /api/asientos/by-transaccion?source=ingreso|egreso|inventario|cobro_cxc|capital|...&id=XXXXXXXX
  */
 router.get("/by-transaccion", ensureAuth, handleByTransaccion);
 

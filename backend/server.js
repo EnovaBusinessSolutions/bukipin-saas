@@ -75,6 +75,10 @@ app.use("/api/clientes", require("./routes/clientes"));
 app.use("/api/proveedores", require("./routes/proveedores"));
 app.use("/api/recomendaciones-depreciacion", require("./routes/recomendacionesDepreciacion"));
 
+// ✅ NUEVO: Accionistas / Capital
+app.use("/api/accionistas", require("./routes/accionistas"));
+app.use("/api/capital", require("./routes/capital"));
+
 app.use("/api/ingresos", require("./routes/ingresos"));
 app.use("/api/transacciones", require("./routes/transacciones"));
 
