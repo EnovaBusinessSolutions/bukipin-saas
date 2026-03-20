@@ -59,6 +59,9 @@ app.use("/api/auth", require("./routes/auth"));
 // (para evitar que rutas generales las "secuesten")
 // ------------------------------
 
+// ✅ Uploads autoridades fiscales
+app.use("/api/uploads/autoridades-fiscales", require("./routes/uploadsAutoridadesFiscales"));
+
 // ✅ Transacciones Egresos (más específico que /api/transacciones)
 app.use("/api/transacciones/egresos", require("./routes/transaccionesEgresos"));
 
@@ -87,6 +90,9 @@ app.use("/api/productos-egresos", require("./routes/productosEgresos"));
 
 app.use("/api/asientos", require("./routes/asientos"));
 app.use("/api/contabilidad", require("./routes/contabilidad"));
+
+// ✅ NUEVO: Impuestos
+app.use("/api/impuestos", require("./routes/impuestos"));
 
 app.use("/api/flujo-efectivo", require("./routes/flujoEfectivo"));
 
