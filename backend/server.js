@@ -96,6 +96,8 @@ app.use("/api/impuestos", require("./routes/impuestos"));
 
 app.use("/api/flujo-efectivo", require("./routes/flujoEfectivo"));
 
+app.use("/api/dashboard", require("./routes/dashboard"));
+
 // ✅ Financiamientos
 app.use("/api/financiamientos", require("./routes/financiamientos"));
 
