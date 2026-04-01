@@ -1,4 +1,3 @@
-// backend/routes/transaccionesEgresos.js
 const express = require("express");
 const router = express.Router();
 const mongoose = require("mongoose");
@@ -7,43 +6,48 @@ const ensureAuth = require("../middleware/ensureAuth");
 const ExpenseTransaction = require("../models/ExpenseTransaction");
 const ExpenseProduct = require("../models/ExpenseProduct");
 
-// ✅ Opcional: si existe en tu proyecto, lo usamos para crear el asiento contable
 let JournalEntry = null;
 try {
-  // eslint-disable-next-line global-require
   JournalEntry = require("../models/JournalEntry");
 } catch (e) {
   JournalEntry = null;
 }
 
-// ✅ Opcional: para nombre de cuenta en detalles (NO rompe si no existe)
 let Account = null;
 try {
-  // eslint-disable-next-line global-require
   Account = require("../models/Account");
 } catch (e) {
   Account = null;
 }
 
+const {
+  TZ_OFFSET_MINUTES,
+  num: dtNum,
+  asTrim,
+  asValidDate,
+  toYMDLocal,
+  parseInputDateSmart,
+  parseStartDate,
+  parseEndDate,
+  pickEffectiveDate,
+} = require("../utils/datetime");
+
+// ======================================================
+// Helpers base
+// ======================================================
+
 function toNum(v, def = 0) {
-  const n = Number(String(v ?? "").replace(/,/g, ""));
-  return Number.isFinite(n) ? n : def;
+  return dtNum(v, def);
 }
-function asStr(v, def = "") {
-  if (v === undefined || v === null) return def;
-  return String(v);
-}
-function asTrim(v, def = "") {
-  const s = asStr(v, def);
-  return s.trim();
-}
+
 function normalizeTipoEgreso(v) {
   const s = asTrim(v).toLowerCase();
   if (["costo", "costos"].includes(s)) return "costo";
   if (["gasto", "gastos"].includes(s)) return "gasto";
-  if (["otro", "otros"].includes(s)) return "otro"; // ✅ soporte FE "otro"
+  if (["otro", "otros"].includes(s)) return "otro";
   return s;
 }
+
 function normalizeTipoPago(v) {
   const s = asTrim(v).toLowerCase();
   if (["contado", "total", "pago_total"].includes(s)) return "contado";
@@ -52,16 +56,6 @@ function normalizeTipoPago(v) {
   return s;
 }
 
-/**
- * ✅ Canonical FE/BE:
- * - efectivo
- * - bancos
- * - tarjeta_credito_<id>
- *
- * Compat:
- * - tarjeta-transferencia => bancos
- * - transferencia => bancos
- */
 function normalizeMetodoPago(v) {
   const s = asTrim(v).toLowerCase();
   if (!s) return "";
@@ -85,25 +79,24 @@ function toObjectIdOrNull(v) {
   return mongoose.Types.ObjectId.isValid(s) ? new mongoose.Types.ObjectId(s) : null;
 }
 
-/**
- * ✅ Evita bugs de timezone con YYYY-MM-DD
- */
-function isoDateOrNull(v) {
-  const s = asTrim(v);
-  if (!s) return null;
-
-  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
-    const d = new Date(`${s}T00:00:00`);
-    if (Number.isNaN(d.getTime())) return null;
-    return d;
-  }
-
-  const d = new Date(s);
-  if (Number.isNaN(d.getTime())) return null;
-  return d;
+function getExpenseEffectiveDate(doc) {
+  return (
+    asValidDate(doc?.fecha) ||
+    asValidDate(doc?.date) ||
+    asValidDate(doc?.createdAt) ||
+    asValidDate(doc?.created_at) ||
+    null
+  );
 }
 
-// ✅ Detecta campo en schema de ExpenseTransaction para ligar el producto
+function getExpenseDueDate(doc) {
+  return (
+    asValidDate(doc?.fechaVencimiento) ||
+    asValidDate(doc?.fecha_vencimiento) ||
+    null
+  );
+}
+
 let _txProductField = null;
 function getTxProductField() {
   if (_txProductField) return _txProductField;
@@ -115,18 +108,19 @@ function getTxProductField() {
   return _txProductField;
 }
 
-// ✅ Mapea tx a UI (snake_case + camelCase)
 function mapTxForUI(doc) {
   const d = doc?.toObject ? doc.toObject() : doc;
 
   const subtipoResolved = d.subtipoEgreso ?? d.subtipo_egreso ?? "";
-  let tipoResolved = d.tipoEgreso ?? d.tipo_egreso ?? d.tipo ?? d.tipoEgreso ?? d.tipo_egreso ?? "";
+  let tipoResolved = d.tipoEgreso ?? d.tipo_egreso ?? d.tipo ?? "";
   const estadoResolved = d.estado ?? d.status ?? "activo";
 
-  // ✅ Si es "otros_gastos", lo reflejamos como tipo_egreso = "otro" hacia el FE
   if (String(subtipoResolved || "").toLowerCase() === "otros_gastos") {
     tipoResolved = "otro";
   }
+
+  const fecha = getExpenseEffectiveDate(d);
+  const fechaVencimiento = getExpenseDueDate(d);
 
   const item = {
     id: String(d._id),
@@ -154,12 +148,11 @@ function mapTxForUI(doc) {
     monto_pagado: toNum(d.montoPagado ?? d.monto_pagado, 0),
     monto_pendiente: toNum(d.montoPendiente ?? d.monto_pendiente, 0),
 
-    fecha: d.fecha ? new Date(d.fecha).toISOString() : d.createdAt ? new Date(d.createdAt).toISOString() : null,
-    fecha_vencimiento: d.fechaVencimiento
-      ? new Date(d.fechaVencimiento).toISOString()
-      : d.fecha_vencimiento
-      ? new Date(d.fecha_vencimiento).toISOString()
-      : null,
+    fecha: fecha ? fecha.toISOString() : null,
+    fecha_ymd: fecha ? toYMDLocal(fecha) : null,
+
+    fecha_vencimiento: fechaVencimiento ? fechaVencimiento.toISOString() : null,
+    fecha_vencimiento_ymd: fechaVencimiento ? toYMDLocal(fechaVencimiento) : null,
 
     proveedor_id: d.proveedorId ? String(d.proveedorId) : d.proveedor_id ? String(d.proveedor_id) : null,
     proveedor_nombre: d.proveedorNombre ?? d.proveedor_nombre ?? null,
@@ -178,13 +171,9 @@ function mapTxForUI(doc) {
       : null,
 
     comentarios: d.comentarios ?? null,
-
     numero_asiento: d.numeroAsiento ?? d.numero_asiento ?? null,
-
-    // ✅ CLAVE: asiento ligado
     asiento_id: d.asientoId ? String(d.asientoId) : d.asiento_id ? String(d.asiento_id) : null,
 
-    // ✅ estado/cancelación
     estado: estadoResolved,
     motivo_cancelacion: d.motivoCancelacion ?? d.motivo_cancelacion ?? null,
     cancelado_at: d.canceladoAt
@@ -194,11 +183,10 @@ function mapTxForUI(doc) {
       : null,
     numero_asiento_reversion: d.numeroAsientoReversion ?? d.numero_asiento_reversion ?? null,
 
-    created_at: d.createdAt ?? d.created_at ?? null,
-    updated_at: d.updatedAt ?? d.updated_at ?? null,
+    created_at: d.createdAt ? new Date(d.createdAt).toISOString() : d.created_at ?? null,
+    updated_at: d.updatedAt ? new Date(d.updatedAt).toISOString() : d.updated_at ?? null,
   };
 
-  // espejo camelCase por compat
   item.tipoEgreso = item.tipo_egreso;
   item.subtipoEgreso = item.subtipo_egreso;
   item.cuentaCodigo = item.cuenta_codigo;
@@ -212,9 +200,7 @@ function mapTxForUI(doc) {
   item.fechaVencimiento = item.fecha_vencimiento;
   item.proveedorId = item.proveedor_id;
   item.productoId = item.producto_egreso_id;
-
   item.asientoId = item.asiento_id;
-
   item.motivoCancelacion = item.motivo_cancelacion;
   item.canceladoAt = item.cancelado_at;
   item.numeroAsientoReversion = item.numero_asiento_reversion;
@@ -222,19 +208,13 @@ function mapTxForUI(doc) {
   return item;
 }
 
-/**
- * Genera un número de asiento “humano”
- */
 function genNumeroAsiento(ownerId) {
-  const ymd = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+  const ymd = toYMDLocal(new Date())?.replace(/-/g, "") || "00000000";
   const rand = Math.random().toString(36).slice(2, 7).toUpperCase();
   const tail = String(ownerId).slice(-4).toUpperCase();
   return `EGR-${ymd}-${tail}-${rand}`;
 }
 
-/**
- * Resuelve cuenta de pago según método
- */
 function resolveCreditAccountByMetodoPago(metodoPago) {
   const CASH = process.env.CTA_EFECTIVO || "1001";
   const BANK = process.env.CTA_BANCOS || "1002";
@@ -251,9 +231,6 @@ function resolveCreditAccountByMetodoPago(metodoPago) {
   return { tipo: "other", cuentaCodigo: BANK, meta: {} };
 }
 
-/**
- * Detecta si viene del flujo "precargados"
- */
 function isPrecargadosFlow(subtipoEgreso, reqBody) {
   const sub = String(subtipoEgreso || "").trim().toLowerCase();
   const src = String(reqBody?.source ?? reqBody?.origen ?? reqBody?.from ?? "").trim().toLowerCase();
@@ -265,58 +242,14 @@ function isPrecargadosFlow(subtipoEgreso, reqBody) {
   return false;
 }
 
-/**
- * Detecta si el frontend pide forzar Proveedores(2001)
- */
 function wantsForceProveedores2001(reqBody) {
   return reqBody?.force_proveedores_2001 === true || reqBody?.forceProveedores2001 === true;
 }
 
-/**
- * Detecta "Otros gastos"
- * - tipo_egreso: "otro"
- * - subtipo_egreso: "otros_gastos"
- */
 function isOtrosGastos(tipoEgresoRaw, subtipoEgreso) {
   const t = String(tipoEgresoRaw || "").toLowerCase().trim();
   const s = String(subtipoEgreso || "").toLowerCase().trim();
   return t === "otro" || s === "otros_gastos";
-}
-
-/* =========================================================
-   ✅ COGS (Costo de Venta Inventario) desde JournalEntry (5002)
-   La tabla "Resumen de Egresos" pega a /api/egresos/transacciones,
-   por eso lo inyectamos AQUÍ (no solo en /api/egresos legacy).
-========================================================= */
-
-function parseYMD(s) {
-  const str = String(s || "").trim();
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(str)) return null;
-  const d = new Date(`${str}T00:00:00`);
-  if (Number.isNaN(d.getTime())) return null;
-  return d;
-}
-
-function endOfDay(d) {
-  const x = new Date(d);
-  x.setHours(23, 59, 59, 999);
-  return x;
-}
-
-function buildJournalDateOrFilter(start, end) {
-  if (!start && !end) return null;
-
-  const dateFilter = {};
-  if (start) dateFilter.$gte = start;
-  if (end) dateFilter.$lte = endOfDay(end);
-
-  return [
-    { date: dateFilter },
-    { fecha: dateFilter },
-    { entryDate: dateFilter },
-    { createdAt: dateFilter },
-    { created_at: dateFilter },
-  ];
 }
 
 function pickLines(e) {
@@ -355,7 +288,7 @@ function pickMemo(l) {
 }
 
 function pickEntryDate(e) {
-  return e?.date || e?.fecha || e?.entryDate || e?.createdAt || e?.created_at || new Date();
+  return pickEffectiveDate(e);
 }
 
 function pickEntryNumero(e) {
@@ -366,11 +299,9 @@ function extractNameQtyFromText(text) {
   const s = String(text || "").trim();
   if (!s) return { producto_nombre: "", cantidad: null };
 
-  // "Costo de venta - jabones (3 unidades)"
   const m = s.match(/costo\s+de\s+venta\s*-\s*(.+?)\s*\((\d+)\s*unidades?\)/i);
   if (m) return { producto_nombre: String(m[1] || "").trim(), cantidad: toNum(m[2], 0) };
 
-  // "... - PRODUCTO (15 unidades)"
   const m2 = s.match(/-\s*(.+?)\s*\((\d+)\s*unidades?\)/i);
   if (m2) return { producto_nombre: String(m2[1] || "").trim(), cantidad: toNum(m2[2], 0) };
 
@@ -393,9 +324,7 @@ function mirrorCamel(item) {
   x.fechaVencimiento = x.fecha_vencimiento;
   x.proveedorId = x.proveedor_id;
   x.productoId = x.producto_egreso_id;
-
   x.asientoId = x.asiento_id;
-
   x.motivoCancelacion = x.motivo_cancelacion;
   x.canceladoAt = x.cancelado_at;
   x.numeroAsientoReversion = x.numero_asiento_reversion;
@@ -403,29 +332,42 @@ function mirrorCamel(item) {
   return x;
 }
 
+function sortByEffectiveDateDesc(a, b) {
+  const da = getExpenseEffectiveDate(a) || pickEntryDate(a);
+  const db = getExpenseEffectiveDate(b) || pickEntryDate(b);
+
+  const ta = da ? da.getTime() : 0;
+  const tb = db ? db.getTime() : 0;
+  if (tb !== ta) return tb - ta;
+
+  const ca = asValidDate(a?.createdAt ?? a?.created_at)?.getTime() || 0;
+  const cb = asValidDate(b?.createdAt ?? b?.created_at)?.getTime() || 0;
+  return cb - ca;
+}
+
 async function buildCogsTxItemsFromJournal({ owner, start, end, limit = 2000 }) {
   if (!JournalEntry) return [];
 
-  const match = { owner };
-  const orDates = buildJournalDateOrFilter(start, end);
-  if (orDates) match.$or = orDates;
-
-  const docs = await JournalEntry.find(match)
+  const docs = await JournalEntry.find({ owner })
     .select(
       "date fecha entryDate createdAt created_at concept concepto descripcion memo numeroAsiento numero_asiento numero folio lines detalle_asientos detalles_asiento"
     )
-    .sort({ createdAt: -1 })
     .limit(Math.min(Math.max(limit, 1), 5000))
     .lean();
 
-  if (!docs?.length) return [];
+  const filteredDocs = (docs || []).filter((e) => {
+    const fecha = pickEntryDate(e);
+    if (!fecha) return false;
+    if (start && fecha.getTime() < start.getTime()) return false;
+    if (end && fecha.getTime() > end.getTime()) return false;
+    return true;
+  });
 
-  // (Opcional) code->name
   let nameMap = new Map();
   if (Account) {
     try {
       const allLines = [];
-      for (const e of docs) {
+      for (const e of filteredDocs) {
         const lines = pickLines(e);
         if (Array.isArray(lines)) allLines.push(...lines);
       }
@@ -442,14 +384,12 @@ async function buildCogsTxItemsFromJournal({ owner, start, end, limit = 2000 }) 
           (accRows || []).map((a) => [String(a.code ?? a.codigo).trim(), a.name ?? a.nombre ?? ""])
         );
       }
-    } catch (_) {
-      // noop
-    }
+    } catch (_) {}
   }
 
   const out = [];
 
-  for (const e of docs) {
+  for (const e of filteredDocs) {
     const lines = pickLines(e);
     if (!Array.isArray(lines) || !lines.length) continue;
 
@@ -507,7 +447,8 @@ async function buildCogsTxItemsFromJournal({ owner, start, end, limit = 2000 }) 
       monto_pagado: montoTotal,
       monto_pendiente: 0,
 
-      fecha: new Date(fecha).toISOString(),
+      fecha: fecha ? fecha.toISOString() : null,
+      fecha_ymd: fecha ? toYMDLocal(fecha) : null,
       fecha_vencimiento: null,
 
       proveedor_id: null,
@@ -520,8 +461,6 @@ async function buildCogsTxItemsFromJournal({ owner, start, end, limit = 2000 }) 
       comentarios: null,
 
       numero_asiento: String(numero),
-
-      // para que puedas jalar detalle si lo ocupas
       asiento_id: String(e._id),
 
       estado: "activo",
@@ -530,7 +469,7 @@ async function buildCogsTxItemsFromJournal({ owner, start, end, limit = 2000 }) 
       cancelado_at: null,
       numero_asiento_reversion: null,
 
-      created_at: new Date(fecha).toISOString(),
+      created_at: fecha ? fecha.toISOString() : null,
       updated_at: null,
 
       source: "cogs_journal",
@@ -540,13 +479,14 @@ async function buildCogsTxItemsFromJournal({ owner, start, end, limit = 2000 }) 
     out.push(mirrorCamel(base));
   }
 
+  out.sort(sortByEffectiveDateDesc);
   return out;
 }
 
-/**
- * POST /
- * Crea la transacción de egreso y (si existe el modelo) su asiento contable.
- */
+// ======================================================
+// Routes
+// ======================================================
+
 router.post("/", ensureAuth, async (req, res) => {
   try {
     const owner = req.user._id;
@@ -556,11 +496,8 @@ router.post("/", ensureAuth, async (req, res) => {
     const descripcion = asTrim(req.body?.descripcion ?? req.body?.concepto ?? req.body?.concept);
 
     const otrosGastos = isOtrosGastos(tipoEgresoRaw, subtipoEgreso);
-
-    // ✅ Para storage/reportes: "Otros" se considera un "gasto"
     const tipoEgreso = otrosGastos ? "gasto" : tipoEgresoRaw;
 
-    // ✅ cuenta_codigo: acepta aliases del FE
     let cuentaCodigo = asTrim(
       req.body?.cuenta_codigo ??
         req.body?.cuentaCodigo ??
@@ -568,17 +505,11 @@ router.post("/", ensureAuth, async (req, res) => {
         req.body?.cuenta_principal_codigo
     );
 
-    // ✅ Forzar cuenta 5204 para "Otros gastos"
-    if (otrosGastos) {
-      cuentaCodigo = "5204";
-    }
+    if (otrosGastos) cuentaCodigo = "5204";
 
     const subcuentaId = toObjectIdOrNull(req.body?.subcuenta_id ?? req.body?.subcuentaId);
-
     const montoTotal = toNum(req.body?.monto_total ?? req.body?.montoTotal, 0);
 
-    // ✅ Para "otros_gastos" (no inventariados), FE no manda cantidad/precio_unitario.
-    //    Defaults seguros: cantidad=1, precio_unitario=monto_total
     let cantidad = toNum(req.body?.cantidad, 0);
     let precioUnitario = toNum(req.body?.precio_unitario ?? req.body?.precioUnitario, 0);
     if (otrosGastos) {
@@ -588,11 +519,13 @@ router.post("/", ensureAuth, async (req, res) => {
 
     const tipoPago = normalizeTipoPago(req.body?.tipo_pago ?? req.body?.tipoPago);
     const metodoPago = normalizeMetodoPago(req.body?.metodo_pago ?? req.body?.metodoPago);
-
     const montoPagado = toNum(req.body?.monto_pagado ?? req.body?.montoPagado, 0);
 
-    const fechaVencimiento = isoDateOrNull(req.body?.fecha_vencimiento ?? req.body?.fechaVencimiento);
-    const fecha = isoDateOrNull(req.body?.fecha) || new Date();
+    const fechaVencimiento = parseInputDateSmart(
+      req.body?.fecha_vencimiento ?? req.body?.fechaVencimiento,
+      new Date()
+    );
+    const fecha = parseInputDateSmart(req.body?.fecha, new Date());
 
     const proveedorId = toObjectIdOrNull(req.body?.proveedor_id ?? req.body?.proveedorId);
     const proveedorNombre = asTrim(req.body?.proveedor_nombre ?? req.body?.proveedorNombre ?? req.body?.proveedor ?? "");
@@ -609,11 +542,8 @@ router.post("/", ensureAuth, async (req, res) => {
     const isPrecargados = isPrecargadosFlow(subtipoEgreso, req.body);
     const forceProveedores2001 = wantsForceProveedores2001(req.body);
 
-    // ✅ Validaciones
     if (!["costo", "gasto"].includes(tipoEgreso)) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "VALIDATION", message: "tipo_egreso inválido (usa costo|gasto|otro)." });
+      return res.status(400).json({ ok: false, error: "VALIDATION", message: "tipo_egreso inválido (usa costo|gasto|otro)." });
     }
     if (!descripcion) {
       return res.status(400).json({ ok: false, error: "VALIDATION", message: "descripcion es requerida." });
@@ -631,12 +561,9 @@ router.post("/", ensureAuth, async (req, res) => {
       return res.status(400).json({ ok: false, error: "VALIDATION", message: "precio_unitario debe ser > 0." });
     }
     if (!["contado", "credito", "parcial"].includes(tipoPago)) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "VALIDATION", message: "tipo_pago inválido (contado|credito|parcial)." });
+      return res.status(400).json({ ok: false, error: "VALIDATION", message: "tipo_pago inválido (contado|credito|parcial)." });
     }
 
-    // Contado/parcial requieren método de pago
     if (tipoPago === "contado" || tipoPago === "parcial") {
       if (!metodoPago) {
         return res.status(400).json({
@@ -657,7 +584,6 @@ router.post("/", ensureAuth, async (req, res) => {
       }
     }
 
-    // ✅ Validar producto si viene (solo aplica si viene producto)
     if (productoEgresoId) {
       const productDoc = await ExpenseProduct.findOne({ _id: productoEgresoId, owner }).lean();
       if (!productDoc) {
@@ -669,18 +595,15 @@ router.post("/", ensureAuth, async (req, res) => {
       }
     }
 
-    // ✅ Normalizaciones finales (pagos)
     const fixedMontoPagado = tipoPago === "contado" ? montoTotal : tipoPago === "parcial" ? montoPagado : 0;
     const fixedMontoPendiente =
       tipoPago === "contado" ? 0 : tipoPago === "parcial" ? Math.max(0, montoTotal - fixedMontoPagado) : montoTotal;
 
     const numeroAsiento = genNumeroAsiento(owner);
 
-    // ✅ Construcción del documento (camelCase canonical)
     const txPayload = {
       owner,
       tipo: tipoEgreso,
-
       tipoEgreso,
       subtipoEgreso,
       descripcion,
@@ -708,7 +631,6 @@ router.post("/", ensureAuth, async (req, res) => {
       proveedorRfc: proveedorRfc || null,
 
       comentarios: comentarios || null,
-
       numeroAsiento,
     };
 
@@ -717,13 +639,11 @@ router.post("/", ensureAuth, async (req, res) => {
 
     const created = await ExpenseTransaction.create(txPayload);
 
-    // ✅ Crear asiento contable (si existe modelo)
     let asiento = null;
     if (JournalEntry) {
-      const PROVEEDORES_2001 = process.env.CTA_CXP || "2001"; // default
-      const OTROS_ACREEDORES_2003 = process.env.CTA_OTROS_ACREEDORES || "2003"; // ✅ regla otros gastos
+      const PROVEEDORES_2001 = process.env.CTA_CXP || "2001";
+      const OTROS_ACREEDORES_2003 = process.env.CTA_OTROS_ACREEDORES || "2003";
 
-      // ✅ Regla: SOLO Otros Gastos + (credito|parcial) => 2003
       const cuentaPendiente =
         otrosGastos && (tipoPago === "credito" || tipoPago === "parcial") ? OTROS_ACREEDORES_2003 : PROVEEDORES_2001;
 
@@ -743,7 +663,6 @@ router.post("/", ensureAuth, async (req, res) => {
         });
       };
 
-      // (1) DEBE: gasto/costo (para otros_gastos ya forzamos cuentaCodigo=5204)
       pushLine({
         side: "debit",
         cuentaCodigo,
@@ -751,9 +670,7 @@ router.post("/", ensureAuth, async (req, res) => {
         memo: `Egreso (${subtipoEgreso || tipoEgreso}) - ${descripcion}`,
       });
 
-      // (2) HABER según pago
       if (tipoPago === "contado") {
-        // Contado: pagar directo (Caja/Bancos/Tarjeta)
         pushLine({
           side: "credit",
           cuentaCodigo: creditInfo.cuentaCodigo,
@@ -761,7 +678,6 @@ router.post("/", ensureAuth, async (req, res) => {
           memo: `Pago contado (${creditInfo.tipo})`,
         });
       } else if (tipoPago === "credito") {
-        // Crédito: TODO a cuenta pendiente (2003 para otros gastos / 2001 en resto)
         pushLine({
           side: "credit",
           cuentaCodigo: cuentaPendiente,
@@ -772,7 +688,6 @@ router.post("/", ensureAuth, async (req, res) => {
               : `A crédito - Proveedores (${cuentaPendiente})`,
         });
       } else if (tipoPago === "parcial") {
-        // Parcial: pagado directo + pendiente a cuenta pendiente (2003 para otros gastos)
         if (fixedMontoPagado > 0) {
           pushLine({
             side: "credit",
@@ -801,13 +716,10 @@ router.post("/", ensureAuth, async (req, res) => {
         date: fecha,
         concept: conceptText,
         numeroAsiento,
-
         source: "egreso",
         sourceId: created._id,
-
         transaccionId: created._id,
         source_id: created._id,
-
         lines,
       });
 
@@ -841,6 +753,7 @@ router.post("/", ensureAuth, async (req, res) => {
         otrosGastos,
         forcedCuentaCodigo: otrosGastos ? "5204" : null,
         reglaPendienteOtrosGastos: otrosGastos ? "credito/parcial => 2003" : null,
+        timezoneOffsetMinutes: TZ_OFFSET_MINUTES,
       },
 
       data: item,
@@ -853,25 +766,13 @@ router.post("/", ensureAuth, async (req, res) => {
   }
 });
 
-/**
- * GET /
- * Soporta:
- * - estado=activo|cancelado
- * - start=YYYY-MM-DD&end=YYYY-MM-DD
- * - tipo=costo|gasto
- * - limit=200
- *
- * ✅ NUEVO para CxP:
- * - pendiente_gt=0  => filtra solo (credito|parcial) con monto_pendiente > pendiente_gt
- * - cuando viene pendiente_gt, por default NO incluimos COGS (include_cogs=0) para no contaminar CxP
- */
 router.get("/", ensureAuth, async (req, res) => {
   try {
     const owner = req.user._id;
     const wrap = String(req.query.wrap || "").trim() === "1";
 
-    const start = isoDateOrNull(req.query.start);
-    const end = isoDateOrNull(req.query.end);
+    const start = parseStartDate(req.query.start);
+    const end = parseEndDate(req.query.end);
 
     const tipo = normalizeTipoEgreso(req.query.tipo);
     const estado = normalizeEstado(req.query.estado);
@@ -881,7 +782,6 @@ router.get("/", ensureAuth, async (req, res) => {
     const limitRaw = Number(req.query.limit ?? 200);
     const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), 500) : 200;
 
-    // ✅ NUEVO: pendiente_gt
     const pendienteGtRaw = req.query.pendiente_gt ?? req.query.pendienteGt ?? null;
     const pendienteGt =
       pendienteGtRaw === null || pendienteGtRaw === undefined || String(pendienteGtRaw).trim() === ""
@@ -890,32 +790,22 @@ router.get("/", ensureAuth, async (req, res) => {
 
     const filter = { owner };
 
-    // rango por fecha
     if (start || end) {
       filter.fecha = {};
       if (start) filter.fecha.$gte = start;
-      if (end) {
-        const e = new Date(end);
-        e.setHours(23, 59, 59, 999);
-        filter.fecha.$lte = e;
-      }
+      if (end) filter.fecha.$lte = end;
     }
 
-    // tipo egreso
     if (tipo && ["costo", "gasto"].includes(tipo)) {
-      // "Otros gastos" se guarda como "gasto", así que entra aquí cuando tipo=gasto.
       filter.$or = [{ tipoEgreso: tipo }, { tipo: tipo }];
     }
 
-    // estado
     if (estado && ["activo", "cancelado"].includes(estado)) {
       filter.estado = estado;
     } else if (!includeCancelados) {
       filter.estado = { $ne: "cancelado" };
     }
 
-    // ✅ NUEVO: filtro CxP (pendiente_gt)
-    // Solo facturas a crédito/parcial con saldo pendiente > pendiente_gt
     if (pendienteGt !== null) {
       filter.$and = [
         ...(Array.isArray(filter.$and) ? filter.$and : []),
@@ -934,15 +824,14 @@ router.get("/", ensureAuth, async (req, res) => {
       ];
     }
 
-    const docs = await ExpenseTransaction.find(filter).sort({ fecha: -1, createdAt: -1 }).limit(limit).lean();
+    const docs = await ExpenseTransaction.find(filter)
+      .sort({ fecha: -1, createdAt: -1 })
+      .limit(limit)
+      .lean();
 
     let items = docs.map(mapTxForUI);
+    items.sort(sortByEffectiveDateDesc);
 
-    /**
-     * ✅ include_cogs
-     * - default general: 1
-     * - pero si viene pendiente_gt (CxP), default: 0 (para NO contaminar con COGS)
-     */
     const includeCogsParam = req.query.include_cogs ?? req.query.includeCogs ?? null;
 
     const includeCogs =
@@ -953,30 +842,20 @@ router.get("/", ensureAuth, async (req, res) => {
         : true;
 
     if (includeCogs && JournalEntry) {
-      const startYmd = parseYMD(req.query.start) || start;
-      const endYmd = parseYMD(req.query.end) || end;
-
       const cogsItems = await buildCogsTxItemsFromJournal({
         owner,
-        start: startYmd,
-        end: endYmd,
+        start,
+        end,
         limit: 5000,
       });
 
       items = items.concat(cogsItems);
-
-      // ordenar por fecha desc
-      items.sort((a, b) => {
-        const da = new Date(a.fecha || a.created_at || 0).getTime();
-        const db = new Date(b.fecha || b.created_at || 0).getTime();
-        return db - da;
-      });
-
-      // respetar limit
+      items.sort(sortByEffectiveDateDesc);
       items = items.slice(0, limit);
     }
 
     if (!wrap) return res.json(items);
+
     return res.json({
       ok: true,
       data: items,
@@ -985,6 +864,7 @@ router.get("/", ensureAuth, async (req, res) => {
         limit,
         includeCogs,
         pendiente_gt: pendienteGt,
+        timezoneOffsetMinutes: TZ_OFFSET_MINUTES,
       },
     });
   } catch (err) {
@@ -993,9 +873,6 @@ router.get("/", ensureAuth, async (req, res) => {
   }
 });
 
-/**
- * GET /:id
- */
 router.get("/:id", ensureAuth, async (req, res) => {
   try {
     const owner = req.user._id;
@@ -1005,7 +882,13 @@ router.get("/:id", ensureAuth, async (req, res) => {
     if (!doc) return res.status(404).json({ ok: false, error: "NOT_FOUND" });
 
     const item = mapTxForUI(doc);
-    return res.json({ ok: true, data: item, item, ...item });
+    return res.json({
+      ok: true,
+      data: item,
+      item,
+      ...item,
+      meta: { timezoneOffsetMinutes: TZ_OFFSET_MINUTES },
+    });
   } catch (err) {
     console.error("GET /api/egresos/transacciones/:id error:", err);
     return res.status(500).json({ ok: false, error: "SERVER_ERROR" });

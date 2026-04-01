@@ -11,6 +11,17 @@ try {
   JournalEntry = require("../models/JournalEntry");
 } catch (_) {}
 
+const {
+  TZ_OFFSET_MINUTES,
+  num: dtNum,
+  asTrim,
+  asValidDate,
+  toYMDLocal,
+  parseInputDateSmart,
+  fixMidnightUtcWithCreatedAt,
+  pickEffectiveDate,
+} = require("../utils/datetime");
+
 // =========================
 // Modelo: CobroPago (simple)
 // =========================
@@ -51,17 +62,14 @@ function getCobroPagoModel() {
         transform: (_doc, ret) => {
           ret.id = String(ret._id);
 
-          // ISO
           ret.created_at = ret.createdAt ? new Date(ret.createdAt).toISOString() : null;
           ret.updated_at = ret.updatedAt ? new Date(ret.updatedAt).toISOString() : null;
 
-          // compat snake_case
           ret.referencia_id = ret.referencia_id ? String(ret.referencia_id) : null;
           ret.asiento_id = ret.asientoId ? String(ret.asientoId) : null;
           ret.numero_asiento = ret.numeroAsiento || null;
           ret.metodo_pago = ret.metodoPago || null;
 
-          // ✅ compat adicional (frontend CxC suele leer "descripcion")
           ret.descripcion = ret.nota || "";
           ret.concepto = ret.nota || "";
           ret.tipo_transaccion = ret.tipo || "cobro";
@@ -86,23 +94,11 @@ function getCobroPagoModel() {
 // Helpers
 // =========================
 function num(v, def = 0) {
-  if (v === null || typeof v === "undefined") return def;
-  if (typeof v === "number") return Number.isFinite(v) ? v : def;
-  const s = String(v).trim();
-  if (!s) return def;
-  const cleaned = s.replace(/[$,\s]/g, "");
-  const n = Number(cleaned);
-  return Number.isFinite(n) ? n : def;
+  return dtNum(v, def);
 }
 
 function lower(v) {
   return String(v ?? "").trim().toLowerCase();
-}
-
-function asValidDate(v) {
-  if (!v) return null;
-  const d = v instanceof Date ? v : new Date(v);
-  return Number.isNaN(d.getTime()) ? null : d;
 }
 
 function normalizeMetodoPago(raw) {
@@ -113,8 +109,79 @@ function normalizeMetodoPago(raw) {
   return v;
 }
 
+function pickJournalEntryLines(je) {
+  const candidates =
+    je?.detalle_asientos ??
+    je?.detalles ??
+    je?.entries ??
+    je?.lines ??
+    je?.movimientos ??
+    je?.asientos ??
+    je?.detalles_asiento ??
+    [];
+
+  return Array.isArray(candidates) ? candidates : [];
+}
+
+function lineCode(line) {
+  const code =
+    line?.accountCodigo ??
+    line?.account_code ??
+    line?.accountCode ??
+    line?.codigo ??
+    line?.cuentaCodigo ??
+    line?.cuenta_codigo ??
+    line?.account ??
+    line?.code ??
+    null;
+
+  return code ? String(code).trim() : "";
+}
+
+function lineDebit(line) {
+  return num(line?.debit ?? line?.debe ?? line?.debitAmount ?? line?.debit_amount, 0);
+}
+
+function getCobroPagoEffectiveDate(doc) {
+  const rawFecha =
+    doc?.fecha ??
+    doc?.date ??
+    doc?.createdAt ??
+    doc?.created_at ??
+    null;
+
+  const created =
+    doc?.createdAt ??
+    doc?.created_at ??
+    null;
+
+  return (
+    fixMidnightUtcWithCreatedAt(rawFecha, created) ||
+    asValidDate(rawFecha) ||
+    asValidDate(created) ||
+    null
+  );
+}
+
+function getJournalEntryEffectiveDate(doc) {
+  return pickEffectiveDate(doc);
+}
+
+function sortByEffectiveDateDesc(a, b) {
+  const da = getCobroPagoEffectiveDate(a) || getJournalEntryEffectiveDate(a);
+  const db = getCobroPagoEffectiveDate(b) || getJournalEntryEffectiveDate(b);
+
+  const ta = da ? da.getTime() : 0;
+  const tb = db ? db.getTime() : 0;
+
+  if (tb !== ta) return tb - ta;
+
+  const ca = asValidDate(a?.createdAt ?? a?.created_at)?.getTime() || 0;
+  const cb = asValidDate(b?.createdAt ?? b?.created_at)?.getTime() || 0;
+  return cb - ca;
+}
+
 function mapCobroPagoCompat(doc) {
-  // doc puede venir de .toJSON() o de un objeto lean
   const _id = doc?._id ?? doc?.id ?? null;
 
   const referenciaId =
@@ -129,6 +196,7 @@ function mapCobroPagoCompat(doc) {
     doc?.asientoId ?? doc?.asiento_id ?? doc?.journalEntryId ?? null;
 
   const fecha =
+    getCobroPagoEffectiveDate(doc) ||
     asValidDate(doc?.fecha) ||
     asValidDate(doc?.date) ||
     asValidDate(doc?.createdAt) ||
@@ -140,26 +208,25 @@ function mapCobroPagoCompat(doc) {
   const numeroAsiento =
     doc?.numeroAsiento ?? doc?.numero_asiento ?? doc?.numero ?? doc?.folio ?? null;
 
-  const nota = String(doc?.nota ?? doc?.concepto ?? doc?.descripcion ?? "").trim();
+  const nota = asTrim(doc?.nota ?? doc?.concepto ?? doc?.descripcion ?? "", "");
 
-  const out = {
+  return {
     id: _id ? String(_id) : undefined,
 
     tipo: doc?.tipo ?? "cobro",
-    // ✅ compat para el frontend (pago inicial usa tipo_transaccion)
     tipo_transaccion: doc?.tipo_transaccion ?? doc?.tipo ?? "cobro",
 
     referencia_tipo: doc?.referencia_tipo ?? "ingreso",
     referencia_id: referenciaId ? String(referenciaId) : null,
 
     fecha: fecha.toISOString(),
+    fecha_ymd: toYMDLocal(fecha),
 
     metodoPago,
     metodo_pago: metodoPago,
 
     monto: num(doc?.monto, 0),
 
-    // ✅ compat: el frontend muestra "pago.descripcion"
     nota,
     descripcion: nota,
     concepto: nota,
@@ -175,16 +242,11 @@ function mapCobroPagoCompat(doc) {
     created_at: doc?.created_at ?? (doc?.createdAt ? new Date(doc.createdAt).toISOString() : null),
     updated_at: doc?.updated_at ?? (doc?.updatedAt ? new Date(doc.updatedAt).toISOString() : null),
   };
-
-  return out;
 }
 
 async function fallbackHistorialFromJournalEntries(owner, referenciaId, tipo, limit) {
-  // Si no existe JournalEntry, no podemos hacer fallback
   if (!JournalEntry) return [];
 
-  // Para CxC: cobros reales están en JournalEntry con source="cobro_cxc"
-  // y sourceId/transaccionId = id del ingreso (lo crea cxc.js)
   const refObjId = new mongoose.Types.ObjectId(String(referenciaId));
 
   const q = {
@@ -197,23 +259,19 @@ async function fallbackHistorialFromJournalEntries(owner, referenciaId, tipo, li
     .select(
       "date fecha createdAt updatedAt concept concepto descripcion numeroAsiento numero_asiento numero folio source sourceId transaccionId lines detalle_asientos detalles_asiento"
     )
-    .sort({ date: -1, fecha: -1, createdAt: -1 })
-    .limit(limit)
     .lean();
 
-  // Inferir monto y metodoPago desde lines:
-  // Cobro CxC: Debe 1001/1002, Haber 1003/1009
-  const out = (rows || []).map((e) => {
-    const lines = e.lines || e.detalle_asientos || e.detalles_asiento || [];
+  const sortedRows = (rows || []).sort(sortByEffectiveDateDesc).slice(0, limit);
+
+  const out = sortedRows.map((e) => {
+    const lines = pickJournalEntryLines(e);
 
     let debe1001 = 0;
     let debe1002 = 0;
 
-    for (const l of lines || []) {
-      const code = String(
-        l.accountCodigo ?? l.accountCode ?? l.cuenta_codigo ?? l.cuentaCodigo ?? ""
-      ).trim();
-      const debit = num(l.debit ?? l.debe, 0);
+    for (const l of lines) {
+      const code = lineCode(l);
+      const debit = lineDebit(l);
 
       if (code === "1001") debe1001 += debit;
       if (code === "1002") debe1002 += debit;
@@ -221,8 +279,7 @@ async function fallbackHistorialFromJournalEntries(owner, referenciaId, tipo, li
 
     const monto = Math.max(0, Number((debe1001 + debe1002).toFixed(2)));
     const metodoPago = debe1002 > 0 ? "bancos" : "efectivo";
-
-    const conceptText = e.concept ?? e.concepto ?? e.descripcion ?? "";
+    const conceptText = asTrim(e?.concept ?? e?.concepto ?? e?.descripcion ?? "", "");
 
     return mapCobroPagoCompat({
       _id: e._id,
@@ -231,7 +288,7 @@ async function fallbackHistorialFromJournalEntries(owner, referenciaId, tipo, li
       referencia_tipo: "ingreso",
       referencia_id: referenciaId,
 
-      fecha: e.date ?? e.fecha ?? e.createdAt,
+      fecha: getJournalEntryEffectiveDate(e) || e?.date || e?.fecha || e?.createdAt,
 
       metodoPago,
       monto,
@@ -241,12 +298,12 @@ async function fallbackHistorialFromJournalEntries(owner, referenciaId, tipo, li
       concepto: conceptText,
 
       asientoId: e._id,
-      numeroAsiento: e.numeroAsiento ?? e.numero_asiento ?? e.numero ?? e.folio ?? null,
+      numeroAsiento: e?.numeroAsiento ?? e?.numero_asiento ?? e?.numero ?? e?.folio ?? null,
 
       estado: "activo",
 
-      createdAt: e.createdAt,
-      updatedAt: e.updatedAt,
+      createdAt: e?.createdAt ?? null,
+      updatedAt: e?.updatedAt ?? null,
     });
   });
 
@@ -273,7 +330,7 @@ router.get("/historial", ensureAuth, async (req, res) => {
       return res.status(400).json({ ok: false, message: "referencia_id inválido." });
     }
 
-    const tipo = lower(req.query.tipo || "cobro"); // cobro|pago
+    const tipo = lower(req.query.tipo || "cobro");
     if (!["cobro", "pago"].includes(tipo)) {
       return res.status(400).json({ ok: false, message: "tipo inválido (cobro|pago)." });
     }
@@ -282,25 +339,31 @@ router.get("/historial", ensureAuth, async (req, res) => {
 
     const CobroPago = getCobroPagoModel();
 
-    // ✅ NO usamos lean para aprovechar toJSON/transform
     const docs = await CobroPago.find({
       owner,
       tipo,
       referencia_id: new mongoose.Types.ObjectId(String(referenciaId)),
       estado: { $ne: "cancelado" },
-    })
-      .sort({ fecha: -1, createdAt: -1 })
-      .limit(limit);
+    });
 
-    let data = (docs || []).map((d) => mapCobroPagoCompat(d.toJSON()));
+    let data = (docs || [])
+      .sort(sortByEffectiveDateDesc)
+      .slice(0, limit)
+      .map((d) => mapCobroPagoCompat(d.toJSON ? d.toJSON() : d));
 
-    // ✅ Fallback E2E: si no hay registros guardados, derivamos desde JournalEntry (cobro_cxc)
     if (!data.length) {
       const fallback = await fallbackHistorialFromJournalEntries(owner, referenciaId, tipo, limit);
       data = fallback;
     }
 
-    return res.json({ ok: true, data, items: data });
+    return res.json({
+      ok: true,
+      data,
+      items: data,
+      meta: {
+        timezoneOffsetMinutes: TZ_OFFSET_MINUTES,
+      },
+    });
   } catch (err) {
     console.error("GET /api/cobros-pagos/historial error:", err);
     return res.status(500).json({ ok: false, message: "Error cargando historial" });
@@ -325,11 +388,16 @@ router.post("/registrar", ensureAuth, async (req, res) => {
     }
 
     const monto = num(req.body?.monto, 0);
-    if (!(monto > 0)) return res.status(400).json({ ok: false, message: "monto debe ser > 0." });
+    if (!(monto > 0)) {
+      return res.status(400).json({ ok: false, message: "monto debe ser > 0." });
+    }
 
-    const metodoPago = normalizeMetodoPago(req.body?.metodoPago ?? req.body?.metodo_pago ?? "efectivo");
-    const fecha = asValidDate(req.body?.fecha) || new Date();
-    const nota = String(req.body?.nota ?? req.body?.descripcion ?? req.body?.concepto ?? "").trim();
+    const metodoPago = normalizeMetodoPago(
+      req.body?.metodoPago ?? req.body?.metodo_pago ?? "efectivo"
+    );
+
+    const fecha = parseInputDateSmart(req.body?.fecha, new Date());
+    const nota = asTrim(req.body?.nota ?? req.body?.descripcion ?? req.body?.concepto ?? "", "");
 
     const asientoIdRaw = req.body?.asientoId ?? req.body?.asiento_id ?? null;
     const asientoId =
@@ -337,7 +405,7 @@ router.post("/registrar", ensureAuth, async (req, res) => {
         ? new mongoose.Types.ObjectId(String(asientoIdRaw))
         : null;
 
-    const numeroAsiento = String(req.body?.numeroAsiento ?? req.body?.numero_asiento ?? "").trim();
+    const numeroAsiento = asTrim(req.body?.numeroAsiento ?? req.body?.numero_asiento ?? "", "");
 
     const CobroPago = getCobroPagoModel();
 
@@ -355,7 +423,13 @@ router.post("/registrar", ensureAuth, async (req, res) => {
       estado: "activo",
     });
 
-    return res.status(201).json({ ok: true, data: mapCobroPagoCompat(doc.toJSON()) });
+    return res.status(201).json({
+      ok: true,
+      data: mapCobroPagoCompat(doc.toJSON()),
+      meta: {
+        timezoneOffsetMinutes: TZ_OFFSET_MINUTES,
+      },
+    });
   } catch (err) {
     console.error("POST /api/cobros-pagos/registrar error:", err);
     return res.status(500).json({ ok: false, message: "Error registrando historial" });

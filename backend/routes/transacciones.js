@@ -19,67 +19,41 @@ try {
   Client = require("../models/Client");
 } catch (_) {}
 
-const TZ_OFFSET_MINUTES = Number(process.env.APP_TZ_OFFSET_MINUTES ?? -360);
+const {
+  TZ_OFFSET_MINUTES,
+  num: dtNum,
+  asValidDate,
+  toYMDLocal,
+  fixMidnightUtcWithCreatedAt,
+} = require("../utils/datetime");
+
+// ======================================================
+// Helpers base
+// ======================================================
 
 function num(v, def = 0) {
-  if (v === null || typeof v === "undefined") return def;
-  if (typeof v === "number") return Number.isFinite(v) ? v : def;
-  const s = String(v).trim();
-  if (!s) return def;
-  const cleaned = s.replace(/[$,\s]/g, "");
-  const n = Number(cleaned);
-  return Number.isFinite(n) ? n : def;
+  return dtNum(v, def);
 }
 
-function asValidDate(v) {
-  if (!v) return null;
-  const d = v instanceof Date ? v : new Date(v);
-  return Number.isNaN(d.getTime()) ? null : d;
-}
+function getTxEffectiveDate(tx) {
+  const rawFecha =
+    tx?.fecha ??
+    tx?.date ??
+    tx?.entryDate ??
+    tx?.createdAt ??
+    tx?.created_at ??
+    null;
 
-function toYMDLocal(d) {
-  const dt = asValidDate(d);
-  if (!dt) return null;
-  const local = new Date(dt.getTime() + TZ_OFFSET_MINUTES * 60 * 1000);
-  const y = local.getUTCFullYear();
-  const m = String(local.getUTCMonth() + 1).padStart(2, "0");
-  const day = String(local.getUTCDate()).padStart(2, "0");
-  return `${y}-${m}-${day}`;
-}
+  const created =
+    tx?.createdAt ??
+    tx?.created_at ??
+    null;
 
-/**
- * ✅ FIX FECHA/HORA (TZ issue)
- * Si `fecha` viene guardada como 00:00:00.000Z, el navegador (-06)
- * la mueve a 18:00 del día anterior.
- *
- * Solución: mantener el día de `fecha` pero tomar la hora real desde `createdAt`.
- */
-function fixFechaWithCreatedAt(tx) {
-  const f = asValidDate(tx?.fecha);
-  const c = asValidDate(tx?.createdAt);
-
-  if (!f && c) return c;
-  if (!f) return null;
-
-  const isMidnightUTC =
-    f.getUTCHours() === 0 &&
-    f.getUTCMinutes() === 0 &&
-    f.getUTCSeconds() === 0 &&
-    f.getUTCMilliseconds() === 0;
-
-  if (!isMidnightUTC) return f;
-  if (!c) return f;
-
-  return new Date(
-    Date.UTC(
-      f.getUTCFullYear(),
-      f.getUTCMonth(),
-      f.getUTCDate(),
-      c.getUTCHours(),
-      c.getUTCMinutes(),
-      c.getUTCSeconds(),
-      c.getUTCMilliseconds()
-    )
+  return (
+    fixMidnightUtcWithCreatedAt(rawFecha, created) ||
+    asValidDate(rawFecha) ||
+    asValidDate(created) ||
+    null
   );
 }
 
@@ -95,7 +69,7 @@ async function getAccountNameMap(owner, codes) {
     .lean();
 
   const map = {};
-  for (const r of rows) {
+  for (const r of rows || []) {
     const code = String(r.code ?? r.codigo ?? "").trim();
     if (!code) continue;
     map[code] = r.name ?? r.nombre ?? "";
@@ -178,7 +152,7 @@ async function attachClientInfo(owner, items) {
     .lean();
 
   const map = new Map(
-    clients.map((c) => [
+    (clients || []).map((c) => [
       String(c._id),
       {
         nombre: c.nombre ?? c.name ?? "",
@@ -241,7 +215,6 @@ function getLineAccountCode(line) {
 }
 
 async function filterTxIdsByJournalAccountCodes(owner, txIds, allowedCodes) {
-  // Si no existe el modelo, no filtramos (evita romper en repos legacy)
   if (!JournalEntry) return null;
   if (!txIds?.length) return new Set();
 
@@ -252,7 +225,6 @@ async function filterTxIdsByJournalAccountCodes(owner, txIds, allowedCodes) {
     $or: [
       { sourceId: { $in: txIds } },
       { source_id: { $in: txIds } },
-      // fallback ultra-compat
       { transaccionId: { $in: txIds } },
       { transaccion_id: { $in: txIds } },
     ],
@@ -264,7 +236,7 @@ async function filterTxIdsByJournalAccountCodes(owner, txIds, allowedCodes) {
 
   const okIds = new Set();
 
-  for (const je of rows) {
+  for (const je of rows || []) {
     const sid =
       je?.sourceId ??
       je?.source_id ??
@@ -291,7 +263,7 @@ function isOnlyARRequested(req) {
 }
 
 function mapTxCompat(tx) {
-  const fechaFixed = fixFechaWithCreatedAt(tx);
+  const fechaFinal = getTxEffectiveDate(tx);
 
   const montoTotal = num(tx.montoTotal ?? tx.monto_total ?? 0);
   const montoDescuento = num(tx.montoDescuento ?? tx.monto_descuento ?? 0);
@@ -319,11 +291,6 @@ function mapTxCompat(tx) {
     tx.cuenta_principal_codigo ??
     null;
 
-  // ✅ normaliza fecha FINAL para evitar strings raras / Invalid Date
-  const fechaFinal =
-    asValidDate(fechaFixed) || asValidDate(tx.fecha) || asValidDate(tx.createdAt) || null;
-
-  // ✅ Fecha límite / vencimiento (CxC)
   const fechaLimiteFinal =
     asValidDate(tx.fechaLimite) ||
     asValidDate(tx.fecha_limite) ||
@@ -334,7 +301,6 @@ function mapTxCompat(tx) {
   const fechaLimiteISO = fechaLimiteFinal ? fechaLimiteFinal.toISOString() : null;
   const fechaLimiteYMD = fechaLimiteFinal ? toYMDLocal(fechaLimiteFinal) : null;
 
-  // ✅ Subcuenta (E2E)
   const subcuentaIdAny =
     tx.subcuentaId ??
     tx.subcuenta_id ??
@@ -356,7 +322,6 @@ function mapTxCompat(tx) {
     tx.sub_cuenta_nombre ??
     null;
 
-  // ✅ Tipo de ingreso (E2E)
   const tipoIngresoAny =
     tx.tipoIngreso ??
     tx.tipo_ingreso ??
@@ -372,16 +337,14 @@ function mapTxCompat(tx) {
     id: String(tx._id ?? tx.id),
 
     fecha: fechaFinal,
-    fecha_fixed: fechaFixed ? fechaFixed.toISOString() : null,
+    fecha_fixed: fechaFinal ? fechaFinal.toISOString() : null,
     fecha_ymd: fechaFinal ? toYMDLocal(fechaFinal) : null,
 
-    // ✅ E2E: fecha límite/vencimiento
     fechaLimite: fechaLimiteISO,
     fecha_limite: fechaLimiteISO,
     fecha_vencimiento: fechaLimiteYMD,
     fechaVencimiento: fechaLimiteYMD,
 
-    // ✅ E2E: subcuenta
     subcuentaId: subcuentaIdAny ? String(subcuentaIdAny) : null,
     subcuenta_id: subcuentaIdAny ? String(subcuentaIdAny) : null,
     subcuentaCodigo: subcuentaCodigoAny ? String(subcuentaCodigoAny) : null,
@@ -389,7 +352,6 @@ function mapTxCompat(tx) {
     subcuentaNombre: subcuentaNombreAny ? String(subcuentaNombreAny) : null,
     subcuenta_nombre: subcuentaNombreAny ? String(subcuentaNombreAny) : null,
 
-    // ✅ E2E: tipo (para que el modal no quede vacío)
     tipoIngreso: tipoIngresoAny || null,
     tipo_ingreso: tipoIngresoAny || null,
 
@@ -424,22 +386,16 @@ function mapTxCompat(tx) {
 function parseOrder(order) {
   const o = String(order || "").trim().toLowerCase();
 
-  // defaults pensados para CxC: último creado primero
   if (!o) return { createdAt: -1 };
-
   if (o === "created_at_desc") return { createdAt: -1 };
   if (o === "created_at_asc") return { createdAt: 1 };
-
-  // fecha + fallback createdAt
   if (o === "fecha_desc") return { fecha: -1, createdAt: -1 };
   if (o === "fecha_asc") return { fecha: 1, createdAt: 1 };
 
-  // compat por si llega algo raro
   return { createdAt: -1 };
 }
 
-// ✅ projection ligera (evita regresar payload enorme)
-// 👇 IMPORTANTE: incluir fechaLimite + subcuenta* + tipoIngreso para que se devuelva en /recientes y /ingresos
+// ✅ projection ligera
 const TX_SELECT =
   "fecha fechaLimite createdAt updatedAt descripcion concept concepto " +
   "tipoIngreso tipo_ingreso " +
@@ -470,9 +426,6 @@ router.get("/ingresos", ensureAuth, async (req, res) => {
 
     const query = { owner };
 
-    // ✅ lógica clara:
-    // - si pendientes=1 => filtra pendientes
-    // - si NO pendientes=1 => solo filtra pendientes cuando include_all NO es true
     if (pendientesFlag || !includeAll) {
       query.$or = [
         { saldoPendiente: { $gt: 0 } },
@@ -487,23 +440,41 @@ router.get("/ingresos", ensureAuth, async (req, res) => {
       .limit(limit)
       .lean();
 
-    // ✅ Solo CxC real: filtra por asientos con 1003 ó 1009 (cuando se solicite)
     let rows = rowsRaw;
     if (isOnlyARRequested(req)) {
       const txIds = rowsRaw.map((r) => String(r._id));
       const okIds = await filterTxIdsByJournalAccountCodes(owner, txIds, ["1003", "1009"]);
 
-      // Si okIds === null, es que no existe JournalEntry y no debemos romper: regresamos sin filtrar.
       if (okIds && okIds.size >= 0) {
         rows = rowsRaw.filter((r) => okIds.has(String(r._id)));
       }
     }
 
     let items = rows.map(mapTxCompat);
+
+    if (String(req.query.order || "").trim().toLowerCase() === "fecha_desc") {
+      items.sort(
+        (a, b) =>
+          new Date(b?.fecha || 0).getTime() - new Date(a?.fecha || 0).getTime()
+      );
+    } else if (String(req.query.order || "").trim().toLowerCase() === "fecha_asc") {
+      items.sort(
+        (a, b) =>
+          new Date(a?.fecha || 0).getTime() - new Date(b?.fecha || 0).getTime()
+      );
+    }
+
     items = await attachAccountInfo(owner, items);
     items = await attachClientInfo(owner, items);
 
-    return res.json({ ok: true, data: items, items });
+    return res.json({
+      ok: true,
+      data: items,
+      items,
+      meta: {
+        timezoneOffsetMinutes: TZ_OFFSET_MINUTES,
+      },
+    });
   } catch (err) {
     console.error("GET /api/transacciones/ingresos error:", err);
     return res.status(500).json({ ok: false, message: "Error cargando transacciones de ingresos" });
@@ -511,9 +482,6 @@ router.get("/ingresos", ensureAuth, async (req, res) => {
 });
 
 /**
- * ✅ IMPORTANTE: esta ruta DEBE ir ANTES de /ingresos/:id
- * porque si no, "/ingresos/recientes" se interpreta como id="recientes".
- *
  * GET /api/transacciones/ingresos/recientes?limit=1000&only_ar=1
  */
 router.get("/ingresos/recientes", ensureAuth, async (req, res) => {
@@ -527,23 +495,34 @@ router.get("/ingresos/recientes", ensureAuth, async (req, res) => {
       .limit(limit)
       .lean();
 
-    // ✅ Solo CxC real: filtra por asientos con 1003 ó 1009 (cuando se solicite)
     let rows = rowsRaw;
     if (isOnlyARRequested(req)) {
       const txIds = rowsRaw.map((r) => String(r._id));
       const okIds = await filterTxIdsByJournalAccountCodes(owner, txIds, ["1003", "1009"]);
 
-      // Si okIds === null, es que no existe JournalEntry y no debemos romper: regresamos sin filtrar.
       if (okIds && okIds.size >= 0) {
         rows = rowsRaw.filter((r) => okIds.has(String(r._id)));
       }
     }
 
     let items = rows.map(mapTxCompat);
+
+    items.sort(
+      (a, b) =>
+        new Date(b?.fecha || 0).getTime() - new Date(a?.fecha || 0).getTime()
+    );
+
     items = await attachAccountInfo(owner, items);
     items = await attachClientInfo(owner, items);
 
-    return res.json({ ok: true, data: items, items });
+    return res.json({
+      ok: true,
+      data: items,
+      items,
+      meta: {
+        timezoneOffsetMinutes: TZ_OFFSET_MINUTES,
+      },
+    });
   } catch (err) {
     console.error("GET /api/transacciones/ingresos/recientes error:", err);
     return res.status(500).json({ ok: false, message: "Error cargando transacciones recientes" });
@@ -577,7 +556,14 @@ router.get("/ingresos/:id", ensureAuth, async (req, res) => {
     item = (await attachAccountInfo(owner, [item]))[0];
     item = (await attachClientInfo(owner, [item]))[0];
 
-    return res.json({ ok: true, data: item, item });
+    return res.json({
+      ok: true,
+      data: item,
+      item,
+      meta: {
+        timezoneOffsetMinutes: TZ_OFFSET_MINUTES,
+      },
+    });
   } catch (err) {
     console.error("GET /api/transacciones/ingresos/:id error:", err);
     return res.status(500).json({ ok: false, message: "Error cargando el detalle de la transacción" });

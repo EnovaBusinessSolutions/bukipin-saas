@@ -9,13 +9,26 @@ const IncomeTransaction = require("../models/IncomeTransaction");
 const JournalEntry = require("../models/JournalEntry");
 const Account = require("../models/Account");
 
-// ✅ Client opcional (si existe, enriquecemos cliente_nombre; si no, no rompe)
+const {
+  TZ_OFFSET_MINUTES,
+  num: dtNum,
+  asTrim,
+  asValidDate,
+  toYMDLocal,
+  parseInputDateSmart,
+  parseStartDate,
+  parseEndDate,
+  fixMidnightUtcWithCreatedAt,
+  pickEffectiveDate,
+} = require("../utils/datetime");
+
+// Client opcional
 let Client = null;
 try {
   Client = require("../models/Client");
 } catch (_) {}
 
-// ✅ Counter opcional (si no existe, no debe tumbar el server)
+// Counter opcional
 let Counter = null;
 try {
   Counter = require("../models/Counter");
@@ -24,16 +37,9 @@ try {
 // =========================
 // Helpers
 // =========================
-const TZ_OFFSET_MINUTES = Number(process.env.APP_TZ_OFFSET_MINUTES ?? -360); // CDMX -06
 
 function num(v, def = 0) {
-  if (v === null || typeof v === "undefined") return def;
-  if (typeof v === "number") return Number.isFinite(v) ? v : def;
-  const s = String(v).trim();
-  if (!s) return def;
-  const cleaned = s.replace(/[$,\s]/g, "");
-  const n = Number(cleaned);
-  return Number.isFinite(n) ? n : def;
+  return dtNum(v, def);
 }
 
 function lower(v) {
@@ -44,84 +50,48 @@ function isObjectId(v) {
   return !!v && mongoose.Types.ObjectId.isValid(String(v));
 }
 
-function asValidDate(v) {
-  if (!v) return null;
-  const d = v instanceof Date ? v : new Date(v);
-  return Number.isNaN(d.getTime()) ? null : d;
+function pickJournalEntryLines(entry) {
+  if (Array.isArray(entry?.lines)) return entry.lines;
+  if (Array.isArray(entry?.detalle_asientos)) return entry.detalle_asientos;
+  if (Array.isArray(entry?.detalles_asiento)) return entry.detalles_asiento;
+  if (Array.isArray(entry?.detalles)) return entry.detalles;
+  return [];
 }
 
-function isDateOnly(str) {
-  return /^\d{4}-\d{2}-\d{2}$/.test(String(str || "").trim());
+function lineCode(line) {
+  return String(
+    line?.accountCodigo ??
+      line?.accountCode ??
+      line?.account_codigo ??
+      line?.cuentaCodigo ??
+      line?.cuenta_codigo ??
+      line?.codigo ??
+      line?.account?.codigo ??
+      line?.cuentas?.codigo ??
+      ""
+  ).trim();
 }
 
-function toYMDLocal(d) {
-  const dt = new Date(d);
-  if (Number.isNaN(dt.getTime())) return null;
-  const local = new Date(dt.getTime() + TZ_OFFSET_MINUTES * 60 * 1000);
-  const y = local.getUTCFullYear();
-  const m = String(local.getUTCMonth() + 1).padStart(2, "0");
-  const day = String(local.getUTCDate()).padStart(2, "0");
-  return `${y}-${m}-${day}`;
+function lineName(line) {
+  return String(
+    line?.accountNombre ??
+      line?.accountName ??
+      line?.account_nombre ??
+      line?.cuentaNombre ??
+      line?.cuenta_nombre ??
+      line?.nombre ??
+      line?.account?.nombre ??
+      line?.account?.name ??
+      ""
+  ).trim();
 }
 
-/**
- * ✅ FIX TZ (como en transacciones.js)
- */
-function fixFechaWithCreatedAt(tx) {
-  const f = asValidDate(tx?.fecha);
-  const c = asValidDate(tx?.createdAt);
-
-  if (!f && c) return c;
-  if (!f) return null;
-
-  const isMidnightUTC =
-    f.getUTCHours() === 0 &&
-    f.getUTCMinutes() === 0 &&
-    f.getUTCSeconds() === 0 &&
-    f.getUTCHours() === 0 &&
-    f.getUTCMilliseconds() === 0;
-
-  if (!isMidnightUTC) return f;
-  if (!c) return f;
-
-  return new Date(
-    Date.UTC(
-      f.getUTCFullYear(),
-      f.getUTCMonth(),
-      f.getUTCDate(),
-      c.getUTCHours(),
-      c.getUTCMinutes(),
-      c.getUTCSeconds(),
-      c.getUTCMilliseconds()
-    )
-  );
+function lineDebit(line) {
+  return num(line?.debit ?? line?.debe ?? line?.debitAmount ?? line?.debit_amount, 0);
 }
 
-function dateOnlyToUtc(str, hh = 0, mm = 0, ss = 0, ms = 0) {
-  const s = String(str || "").trim();
-  if (!isDateOnly(s)) return null;
-  const [y, m, d] = s.split("-").map((x) => Number(x));
-  if (!y || !m || !d) return null;
-  const utcMillis = Date.UTC(y, m - 1, d, hh, mm, ss, ms);
-  return new Date(utcMillis - TZ_OFFSET_MINUTES * 60 * 1000);
-}
-
-function parseTxDateSmart(raw, now = new Date()) {
-  if (!raw) return now;
-  const str = String(raw).trim();
-  if (!str) return now;
-
-  if (!isDateOnly(str)) {
-    const d = new Date(str);
-    return Number.isNaN(d.getTime()) ? now : d;
-  }
-
-  const partsLocal = new Date(now.getTime() + TZ_OFFSET_MINUTES * 60 * 1000);
-  const hh = partsLocal.getUTCHours();
-  const mm = partsLocal.getUTCMinutes();
-  const ss = partsLocal.getUTCSeconds();
-  const ms = partsLocal.getUTCMilliseconds();
-  return dateOnlyToUtc(str, hh, mm, ss, ms) || now;
+function lineCredit(line) {
+  return num(line?.credit ?? line?.haber ?? line?.creditAmount ?? line?.credit_amount, 0);
 }
 
 function normalizeMetodoPago(raw) {
@@ -142,21 +112,61 @@ function parseOrder(order) {
   return { createdAt: -1 };
 }
 
+function getLocalBusinessYear(dateObj = new Date()) {
+  const ymd = toYMDLocal(dateObj);
+  const year = Number(String(ymd || "").slice(0, 4));
+  return Number.isFinite(year) ? year : new Date().getUTCFullYear();
+}
+
+function getTxEffectiveDate(tx) {
+  const fixedFecha = fixMidnightUtcWithCreatedAt(
+    tx?.fecha ??
+      tx?.date ??
+      tx?.entryDate ??
+      tx?.createdAt ??
+      tx?.created_at ??
+      null,
+    tx?.createdAt ?? tx?.created_at ?? null
+  );
+
+  if (fixedFecha) return fixedFecha;
+  return pickEffectiveDate(tx);
+}
+
+function getDueDate(tx) {
+  return (
+    asValidDate(tx?.fechaLimite) ||
+    asValidDate(tx?.fecha_limite) ||
+    asValidDate(tx?.fecha_vencimiento) ||
+    asValidDate(tx?.fechaVencimiento) ||
+    null
+  );
+}
+
+function inLocalRangeByEffectiveDate(doc, start, end) {
+  const d = getTxEffectiveDate(doc) || pickEffectiveDate(doc);
+  if (!d) return false;
+  if (start && d.getTime() < start.getTime()) return false;
+  if (end && d.getTime() > end.getTime()) return false;
+  return true;
+}
+
 async function nextJournalNumber(owner, dateObj) {
+  const businessYear = getLocalBusinessYear(dateObj || new Date());
+
   if (!Counter) {
-    const y = new Date(dateObj || new Date()).getFullYear();
-    return `${y}-0000`;
+    return `${businessYear}-0000`;
   }
 
-  const year = new Date(dateObj).getFullYear();
-  const key = `journal-${year}`;
+  const key = `journal-${businessYear}`;
   const doc = await Counter.findOneAndUpdate(
     { owner, key },
     { $inc: { seq: 1 } },
     { new: true, upsert: true }
   ).lean();
+
   const seq = doc?.seq || 1;
-  return `${year}-${String(seq).padStart(4, "0")}`;
+  return `${businessYear}-${String(seq).padStart(4, "0")}`;
 }
 
 async function buildLine(owner, { code, debit = 0, credit = 0, memo = "" }) {
@@ -197,12 +207,12 @@ async function buildAccountMaps(owner, entries) {
   const ids = new Set();
 
   for (const e of entries || []) {
-    const lines = e.lines || e.detalle_asientos || e.detalles_asiento || [];
-    for (const l of lines || []) {
-      const c = l.accountCodigo ?? l.accountCode ?? l.cuenta_codigo ?? l.cuentaCodigo ?? null;
-      if (c) codes.add(String(c).trim());
+    const lines = pickJournalEntryLines(e);
+    for (const l of lines) {
+      const c = lineCode(l);
+      if (c) codes.add(c);
 
-      const aid = l.accountId ?? l.cuenta_id ?? l.account ?? null;
+      const aid = l?.accountId ?? l?.cuenta_id ?? l?.account ?? null;
       if (aid && mongoose.Types.ObjectId.isValid(String(aid))) ids.add(String(aid));
     }
   }
@@ -218,13 +228,15 @@ async function buildAccountMaps(owner, entries) {
     or.push({ _id: { $in: [...ids].map((x) => new mongoose.Types.ObjectId(x)) } });
   }
 
-  const rows = await Account.find({ owner, $or: or }).select("_id code codigo name nombre").lean();
+  const rows = await Account.find({ owner, $or: or })
+    .select("_id code codigo name nombre")
+    .lean();
 
   const nameByCode = {};
   const codeById = {};
   const nameById = {};
 
-  for (const r of rows) {
+  for (const r of rows || []) {
     const id = String(r._id);
     const code = String(r.code ?? r.codigo ?? "").trim();
     const name = r.name ?? r.nombre ?? "";
@@ -244,35 +256,35 @@ function mapEntryForUI(entry, accountMaps = {}) {
   const codeById = accountMaps?.codeById || {};
   const nameById = accountMaps?.nameById || {};
 
-  const rawLines = entry.lines || entry.detalle_asientos || entry.detalles_asiento || [];
+  const rawLines = pickJournalEntryLines(entry);
 
-  const detalle_asientos = (rawLines || []).map((l) => {
-    let cuenta_codigo = String(
-      l.accountCodigo ?? l.accountCode ?? l.cuenta_codigo ?? l.cuentaCodigo ?? ""
-    ).trim();
+  const detalle_asientos = rawLines.map((l) => {
+    let cuenta_codigo = lineCode(l);
 
     if (!cuenta_codigo) {
-      const aid = l.accountId ?? l.cuenta_id ?? l.account ?? null;
+      const aid = l?.accountId ?? l?.cuenta_id ?? l?.account ?? null;
       if (aid) {
         const sid = String(aid);
         if (codeById[sid]) cuenta_codigo = String(codeById[sid]).trim();
       }
     }
 
-    const aid2 = l.accountId ?? l.cuenta_id ?? l.account ?? null;
+    const aid2 = l?.accountId ?? l?.cuenta_id ?? l?.account ?? null;
     const sid2 = aid2 ? String(aid2) : null;
 
     const cuenta_nombre =
       (cuenta_codigo ? (nameByCode[cuenta_codigo] || null) : null) ||
-      (sid2 ? (nameById[sid2] || null) : null);
+      (sid2 ? (nameById[sid2] || null) : null) ||
+      lineName(l) ||
+      null;
 
-    const memo = l.memo ?? l.descripcion ?? l.concepto ?? "";
+    const memo = l?.memo ?? l?.descripcion ?? l?.concepto ?? "";
 
     return {
       cuenta_codigo: cuenta_codigo || null,
       cuenta_nombre,
-      debe: num(l.debit ?? l.debe, 0),
-      haber: num(l.credit ?? l.haber, 0),
+      debe: lineDebit(l),
+      haber: lineCredit(l),
       memo,
       descripcion: memo,
     };
@@ -286,14 +298,15 @@ function mapEntryForUI(entry, accountMaps = {}) {
     haber: d.haber,
   }));
 
-  const concepto = entry.concept ?? entry.concepto ?? entry.descripcion ?? "";
-  const numeroAsiento = entry.numeroAsiento ?? entry.numero_asiento ?? entry.numero ?? entry.folio ?? null;
+  const concepto = entry?.concept ?? entry?.concepto ?? entry?.descripcion ?? "";
+  const numeroAsiento =
+    entry?.numeroAsiento ?? entry?.numero_asiento ?? entry?.numero ?? entry?.folio ?? null;
 
-  const fecha = entry.date ?? entry.fecha ?? entry.entryDate ?? entry.createdAt ?? null;
+  const fecha = pickEffectiveDate(entry);
 
   return {
-    id: String(entry._id),
-    _id: entry._id,
+    id: String(entry?._id || ""),
+    _id: entry?._id,
 
     numeroAsiento,
     numero_asiento: numeroAsiento,
@@ -304,14 +317,18 @@ function mapEntryForUI(entry, accountMaps = {}) {
     descripcion: concepto,
     concepto,
 
-    source: entry.source ?? "",
-    sourceId: entry.sourceId ? String(entry.sourceId) : (entry.transaccionId ? String(entry.transaccionId) : null),
+    source: entry?.source ?? "",
+    sourceId: entry?.sourceId
+      ? String(entry.sourceId)
+      : entry?.transaccionId
+        ? String(entry.transaccionId)
+        : null,
 
     detalle_asientos,
     detalles,
 
-    created_at: entry.createdAt,
-    updated_at: entry.updatedAt,
+    created_at: entry?.createdAt ?? null,
+    updated_at: entry?.updatedAt ?? null,
   };
 }
 
@@ -323,10 +340,14 @@ function computeMontosTx(tx) {
     Math.max(0, total - Math.max(0, descuento))
   );
   const pagado = num(tx?.montoPagado ?? tx?.monto_pagado ?? tx?.pagado, 0);
-  const pendienteSaved = num(tx?.saldoPendiente ?? tx?.saldo_pendiente ?? tx?.monto_pendiente, NaN);
+  const pendienteSaved = num(
+    tx?.saldoPendiente ?? tx?.saldo_pendiente ?? tx?.monto_pendiente,
+    NaN
+  );
   const pendiente = Number.isFinite(pendienteSaved)
     ? pendienteSaved
     : Math.max(0, Number((neto - pagado).toFixed(2)));
+
   return { total, descuento, neto, pagado, pendiente };
 }
 
@@ -334,34 +355,30 @@ function mapTxForUI(tx) {
   const montos = computeMontosTx(tx);
 
   const cuentaCodigo =
-    tx.cuentaCodigo ??
-    tx.cuenta_codigo ??
-    tx.cuentaPrincipalCodigo ??
-    tx.cuenta_principal_codigo ??
+    tx?.cuentaCodigo ??
+    tx?.cuenta_codigo ??
+    tx?.cuentaPrincipalCodigo ??
+    tx?.cuenta_principal_codigo ??
     null;
 
-  const subcuentaId = tx.subcuentaId ?? tx.subcuenta_id ?? null;
+  const subcuentaId = tx?.subcuentaId ?? tx?.subcuenta_id ?? null;
 
-  const fechaFixed = fixFechaWithCreatedAt(tx);
-  const fechaFinal = fechaFixed || asValidDate(tx.fecha) || asValidDate(tx.createdAt) || null;
-
-  // ✅ incluir fechaLimite / fecha_vencimiento para que CxC no dependa de otros endpoints
-  const fechaLimiteFinal =
-    asValidDate(tx.fechaLimite) ||
-    asValidDate(tx.fecha_limite) ||
-    asValidDate(tx.fecha_vencimiento) ||
-    asValidDate(tx.fechaVencimiento) ||
+  const fechaFinal =
+    getTxEffectiveDate(tx) ||
+    asValidDate(tx?.fecha) ||
+    asValidDate(tx?.createdAt) ||
     null;
+
+  const fechaLimiteFinal = getDueDate(tx);
 
   return {
     ...tx,
-    id: tx._id ? String(tx._id) : tx.id,
+    id: tx?._id ? String(tx._id) : tx?.id,
 
     fecha: fechaFinal,
-    fecha_fixed: fechaFixed ? fechaFixed.toISOString() : null,
+    fecha_fixed: fechaFinal ? fechaFinal.toISOString() : null,
     fecha_ymd: fechaFinal ? toYMDLocal(fechaFinal) : null,
 
-    // ✅ vencimiento
     fechaLimite: fechaLimiteFinal ? fechaLimiteFinal.toISOString() : null,
     fecha_limite: fechaLimiteFinal ? fechaLimiteFinal.toISOString() : null,
     fecha_vencimiento: fechaLimiteFinal ? toYMDLocal(fechaLimiteFinal) : null,
@@ -387,20 +404,19 @@ function mapTxForUI(tx) {
     subcuentaId: subcuentaId ? String(subcuentaId) : null,
     subcuenta_id: subcuentaId ? String(subcuentaId) : null,
 
-    clienteId: tx.clienteId ?? tx.clientId ?? tx.cliente_id ?? tx.client_id ?? null,
-    cliente_id: tx.cliente_id ?? tx.clienteId ?? tx.clientId ?? tx.client_id ?? null,
+    clienteId: tx?.clienteId ?? tx?.clientId ?? tx?.cliente_id ?? tx?.client_id ?? null,
+    cliente_id: tx?.cliente_id ?? tx?.clienteId ?? tx?.clientId ?? tx?.client_id ?? null,
 
-    cliente_nombre: tx.cliente_nombre ?? tx.clienteNombre ?? tx.cliente_name ?? null,
+    cliente_nombre: tx?.cliente_nombre ?? tx?.clienteNombre ?? tx?.cliente_name ?? null,
 
-    metodoPago: tx.metodoPago ?? tx.metodo_pago ?? null,
-    tipoPago: tx.tipoPago ?? tx.tipo_pago ?? null,
+    metodoPago: tx?.metodoPago ?? tx?.metodo_pago ?? null,
+    tipoPago: tx?.tipoPago ?? tx?.tipo_pago ?? null,
 
-    metodo_pago: tx.metodoPago ?? tx.metodo_pago ?? null,
-    tipo_pago: tx.tipoPago ?? tx.tipo_pago ?? null,
+    metodo_pago: tx?.metodoPago ?? tx?.metodo_pago ?? null,
+    tipo_pago: tx?.tipoPago ?? tx?.tipo_pago ?? null,
 
-    // para bucket 1009 (otros ingresos)
-    tipo_ingreso: tx.tipoIngreso ?? tx.tipo_ingreso ?? null,
-    tipoIngreso: tx.tipoIngreso ?? tx.tipo_ingreso ?? null,
+    tipo_ingreso: tx?.tipoIngreso ?? tx?.tipo_ingreso ?? null,
+    tipoIngreso: tx?.tipoIngreso ?? tx?.tipo_ingreso ?? null,
     cuenta_principal_codigo: cuentaCodigo ?? null,
   };
 }
@@ -408,6 +424,7 @@ function mapTxForUI(tx) {
 // =========================
 // Handlers compartidos
 // =========================
+
 async function handleListIngresos(req, res) {
   try {
     const owner = req.user._id;
@@ -432,7 +449,15 @@ async function handleListIngresos(req, res) {
     let items = (rows || []).map(mapTxForUI);
 
     if (Client) {
-      const ids = [...new Set(items.map((x) => x.clienteId || x.cliente_id).filter(isObjectId).map(String))];
+      const ids = [
+        ...new Set(
+          items
+            .map((x) => x.clienteId || x.cliente_id)
+            .filter(isObjectId)
+            .map(String)
+        ),
+      ];
+
       if (ids.length) {
         const clients = await Client.find({
           owner,
@@ -458,7 +483,14 @@ async function handleListIngresos(req, res) {
       }
     }
 
-    return res.json({ ok: true, data: items, items });
+    return res.json({
+      ok: true,
+      data: items,
+      items,
+      meta: {
+        timezoneOffsetMinutes: TZ_OFFSET_MINUTES,
+      },
+    });
   } catch (err) {
     console.error("GET /api/cxc/ingresos error:", err);
     return res.status(500).json({ ok: false, message: "Error cargando CxC (ingresos)" });
@@ -500,7 +532,14 @@ async function handleGetIngresoById(req, res) {
       }
     }
 
-    return res.json({ ok: true, data: item, item });
+    return res.json({
+      ok: true,
+      data: item,
+      item,
+      meta: {
+        timezoneOffsetMinutes: TZ_OFFSET_MINUTES,
+      },
+    });
   } catch (err) {
     console.error("GET /api/cxc/ingresos/:id error:", err);
     return res.status(500).json({ ok: false, message: "Error cargando el detalle del ingreso" });
@@ -508,20 +547,20 @@ async function handleGetIngresoById(req, res) {
 }
 
 // =========================
-// Handler real para registrar pago
+// Registrar pago
 // =========================
+
 async function handleRegistrarPago(req, res) {
   let session = null;
 
   try {
     const owner = req.user._id;
 
-    // ✅ FIX: aceptar "cuentaId" (frontend) + aliases comunes
     const ingresoIdRaw =
       req.body?.ingresoId ??
       req.body?.ingreso_id ??
-      req.body?.cuentaId ??            // ✅ NUEVO
-      req.body?.cuenta_id ??           // ✅ NUEVO
+      req.body?.cuentaId ??
+      req.body?.cuenta_id ??
       req.body?.transaccion_id ??
       req.body?.transaccionId ??
       req.body?.referencia_id ??
@@ -540,14 +579,16 @@ async function handleRegistrarPago(req, res) {
 
     const metodoPago = normalizeMetodoPago(req.body?.metodoPago ?? req.body?.metodo_pago);
     if (!["efectivo", "bancos"].includes(metodoPago)) {
-      return res.status(400).json({ ok: false, message: "metodoPago inválido (efectivo|bancos)." });
+      return res
+        .status(400)
+        .json({ ok: false, message: "metodoPago inválido (efectivo|bancos)." });
     }
 
-    const fecha = parseTxDateSmart(req.body?.fecha, new Date());
-    const nota = String(req.body?.nota ?? req.body?.concepto ?? req.body?.descripcion ?? "").trim();
-
-    // ✅ soporte para 1003 vs 1009 (si viene del front / o inferimos)
-    const tipoRegistro = lower(req.body?.tipoRegistro ?? req.body?.referencia_tipo ?? req.body?.tipo ?? "ingreso");
+    const fecha = parseInputDateSmart(req.body?.fecha, new Date());
+    const nota = asTrim(req.body?.nota ?? req.body?.concepto ?? req.body?.descripcion ?? "", "");
+    const tipoRegistro = lower(
+      req.body?.tipoRegistro ?? req.body?.referencia_tipo ?? req.body?.tipo ?? "ingreso"
+    );
 
     const COD_CAJA = "1001";
     const COD_BANCOS = "1002";
@@ -578,7 +619,9 @@ async function handleRegistrarPago(req, res) {
 
     if (!(pendiente > 0)) {
       if (session) await session.abortTransaction().catch(() => {});
-      return res.status(400).json({ ok: false, message: "Este ingreso no tiene saldo pendiente." });
+      return res
+        .status(400)
+        .json({ ok: false, message: "Este ingreso no tiene saldo pendiente." });
     }
 
     if (monto > pendiente) {
@@ -589,7 +632,6 @@ async function handleRegistrarPago(req, res) {
       });
     }
 
-    // ✅ Actualizar tx
     const neto = num(montos.neto, 0);
     const pagadoPrev = num(tx.montoPagado ?? tx.monto_pagado, 0);
     const pagadoNew = Number((pagadoPrev + monto).toFixed(2));
@@ -611,24 +653,42 @@ async function handleRegistrarPago(req, res) {
       tx.tipo_pago = "parcial";
     }
 
-    // ✅ siempre reflejar método del cobro
     tx.metodoPago = metodoPago;
     tx.metodo_pago = metodoPago;
 
     await tx.save({ session: session || undefined });
 
-    // ✅ decidir cuenta CxC a acreditar (1003 o 1009)
     let codCxC = COD_CXC_CLIENTES;
 
-    // inferencia pro: si es "otros" o cuenta principal 4102 -> 1009
     const tipoIng = lower(tx.tipoIngreso ?? tx.tipo_ingreso);
-    const cuentaPrincipal = String(tx.cuentaPrincipalCodigo ?? tx.cuenta_principal_codigo ?? tx.cuentaCodigo ?? tx.cuenta_codigo ?? "").trim();
-    const is1009 = tipoRegistro === "venta_activo" ? false : (tipoIng === "otros" || cuentaPrincipal === "4102");
+    const cuentaPrincipal = String(
+      tx.cuentaPrincipalCodigo ??
+        tx.cuenta_principal_codigo ??
+        tx.cuentaCodigo ??
+        tx.cuenta_codigo ??
+        ""
+    ).trim();
+
+    const is1009 =
+      tipoRegistro === "venta_activo"
+        ? false
+        : tipoIng === "otros" || cuentaPrincipal === "4102";
+
     if (is1009) codCxC = COD_DEUDORES;
 
     const lines = [
-      await buildLine(owner, { code: codCobro, debit: monto, credit: 0, memo: "Cobro de cliente" }),
-      await buildLine(owner, { code: codCxC, debit: 0, credit: monto, memo: "Aplicación a Cuentas por Cobrar" }),
+      await buildLine(owner, {
+        code: codCobro,
+        debit: monto,
+        credit: 0,
+        memo: nota || "Cobro de cliente",
+      }),
+      await buildLine(owner, {
+        code: codCxC,
+        debit: 0,
+        credit: monto,
+        memo: nota || "Aplicación a Cuentas por Cobrar",
+      }),
     ];
 
     const numeroAsiento = await nextJournalNumber(owner, fecha);
@@ -692,6 +752,9 @@ async function handleRegistrarPago(req, res) {
           nota: nota || "",
           cuenta_abonada: codCxC,
         },
+        meta: {
+          timezoneOffsetMinutes: TZ_OFFSET_MINUTES,
+        },
       },
       transaction: txUI,
       asiento,
@@ -707,17 +770,22 @@ async function handleRegistrarPago(req, res) {
 
     console.error("POST /api/cxc/registrar-pago error:", err);
     const status = err?.statusCode || 500;
-    return res.status(status).json({ ok: false, message: err?.message || "Error registrando cobro" });
+    return res
+      .status(status)
+      .json({ ok: false, message: err?.message || "Error registrando cobro" });
   }
 }
 
 // =========================
 // Endpoints
 // =========================
+
 router.get("/ingresos", ensureAuth, handleListIngresos);
 router.get("/ingresos/:id", ensureAuth, handleGetIngresoById);
 router.get("/detalle", ensureAuth, handleListIngresos);
-router.get("/ventas-activos", ensureAuth, async (req, res) => res.json({ ok: true, data: [], items: [] }));
+router.get("/ventas-activos", ensureAuth, async (req, res) =>
+  res.json({ ok: true, data: [], items: [] })
+);
 
 router.get("/asientos", ensureAuth, async (req, res) => {
   try {
@@ -728,61 +796,58 @@ router.get("/asientos", ensureAuth, async (req, res) => {
       return res.status(400).json({ ok: false, message: "Falta cuenta_codigo" });
     }
 
-    const start = req.query.start ? asValidDate(String(req.query.start)) : null;
-    const end = req.query.end ? asValidDate(String(req.query.end)) : null;
+    const start = req.query.start ? parseStartDate(req.query.start) : null;
+    const end = req.query.end ? parseEndDate(req.query.end) : null;
 
-    if (req.query.start && !start) return res.status(400).json({ ok: false, message: "start inválido" });
-    if (req.query.end && !end) return res.status(400).json({ ok: false, message: "end inválido" });
-
-    const endInclusive = end ? new Date(end.getTime()) : null;
-    if (endInclusive) endInclusive.setHours(23, 59, 59, 999);
+    if (req.query.start && !start) {
+      return res.status(400).json({ ok: false, message: "start inválido" });
+    }
+    if (req.query.end && !end) {
+      return res.status(400).json({ ok: false, message: "end inválido" });
+    }
 
     const entries = await JournalEntry.find({ owner }).sort({ createdAt: 1 }).lean();
 
     const out = [];
     for (const e of entries || []) {
-      const fechaRaw = e?.date ?? e?.fecha ?? e?.entryDate ?? e?.asiento_fecha ?? e?.createdAt ?? e?.created_at ?? null;
-      const fecha = asValidDate(fechaRaw);
+      const fecha = pickEffectiveDate(e);
       if (!fecha) continue;
 
-      if (start && fecha < start) continue;
-      if (endInclusive && fecha > endInclusive) continue;
+      if (start && fecha.getTime() < start.getTime()) continue;
+      if (end && fecha.getTime() > end.getTime()) continue;
 
-      const lines = Array.isArray(e.lines)
-        ? e.lines
-        : Array.isArray(e.detalle_asientos)
-          ? e.detalle_asientos
-          : Array.isArray(e.detalles_asiento)
-            ? e.detalles_asiento
-            : [];
-
+      const lines = pickJournalEntryLines(e);
       if (!lines.length) continue;
 
       let debe = 0;
       let haber = 0;
 
       for (const ln of lines) {
-        const code = String(
-          ln?.accountCodigo ??
-          ln?.accountCode ??
-          ln?.cuenta_codigo ??
-          ln?.cuentaCodigo ??
-          ln?.account?.codigo ??
-          ln?.cuentas?.codigo ??
-          ""
-        ).trim();
+        const code = lineCode(ln);
         if (code !== cuentaCodigo) continue;
 
-        debe += num(ln?.debe ?? ln?.debit ?? ln?.debitAmount ?? ln?.debit_amount, 0);
-        haber += num(ln?.haber ?? ln?.credit ?? ln?.creditAmount ?? ln?.credit_amount, 0);
+        debe += lineDebit(ln);
+        haber += lineCredit(ln);
       }
 
       if (debe === 0 && haber === 0) continue;
 
-      out.push({ fecha: fecha.toISOString(), debe, haber });
+      out.push({
+        fecha: fecha.toISOString(),
+        fecha_ymd: toYMDLocal(fecha),
+        debe,
+        haber,
+      });
     }
 
-    return res.json({ ok: true, data: out, items: out });
+    return res.json({
+      ok: true,
+      data: out,
+      items: out,
+      meta: {
+        timezoneOffsetMinutes: TZ_OFFSET_MINUTES,
+      },
+    });
   } catch (err) {
     console.error("GET /api/cxc/asientos error:", err);
     return res.status(500).json({ ok: false, message: "Error cargando asientos CxC" });
