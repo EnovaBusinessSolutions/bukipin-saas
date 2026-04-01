@@ -4,6 +4,24 @@ const router = express.Router();
 
 const ensureAuth = require("../middleware/ensureAuth");
 
+const {
+  TZ_OFFSET_MINUTES,
+  asTrim,
+  asValidDate,
+  isDateOnly,
+  toYMDLocal,
+  toYMLocal,
+  startOfTodayLocal,
+  endOfTodayLocal,
+  startOfMonthLocal,
+  startOfYearLocal,
+  isSameLocalDay,
+  isSameLocalMonth,
+  isSameLocalYear,
+  dateOnlyToUtcStart,
+  pickEffectiveDate,
+} = require("../utils/datetime");
+
 let JournalEntry = null;
 let IncomeTransaction = null;
 let ExpenseTransaction = null;
@@ -34,8 +52,6 @@ try {
 // Helpers base
 // ======================================================
 
-const TZ_OFFSET_MINUTES = Number(process.env.APP_TZ_OFFSET_MINUTES ?? -360); // CDMX -06
-
 function num(v, def = 0) {
   if (v === null || v === undefined) return def;
   const s = String(v).trim();
@@ -43,93 +59,6 @@ function num(v, def = 0) {
   const cleaned = s.replace(/[$,\s]/g, "");
   const n = Number(cleaned);
   return Number.isFinite(n) ? n : def;
-}
-
-function asTrim(v, def = "") {
-  if (v === undefined || v === null) return def;
-  return String(v).trim();
-}
-
-function asValidDate(v) {
-  if (!v) return null;
-  const d = v instanceof Date ? v : new Date(v);
-  return Number.isNaN(d.getTime()) ? null : d;
-}
-
-function isDateOnly(str) {
-  return /^\d{4}-\d{2}-\d{2}$/.test(String(str || "").trim());
-}
-
-function parseStartDate(s) {
-  if (!s) return null;
-  const str = String(s).trim();
-  const d = new Date(isDateOnly(str) ? `${str}T00:00:00` : str);
-  return Number.isNaN(d.getTime()) ? null : d;
-}
-
-function parseEndDate(s) {
-  if (!s) return null;
-  const str = String(s).trim();
-  const d = new Date(isDateOnly(str) ? `${str}T23:59:59.999` : str);
-  return Number.isNaN(d.getTime()) ? null : d;
-}
-
-function nowLocal() {
-  return new Date();
-}
-
-function startOfTodayLocal(base = new Date()) {
-  return new Date(base.getFullYear(), base.getMonth(), base.getDate(), 0, 0, 0, 0);
-}
-
-function endOfTodayLocal(base = new Date()) {
-  return new Date(base.getFullYear(), base.getMonth(), base.getDate(), 23, 59, 59, 999);
-}
-
-function startOfMonthLocal(base = new Date()) {
-  return new Date(base.getFullYear(), base.getMonth(), 1, 0, 0, 0, 0);
-}
-
-function startOfYearLocal(base = new Date()) {
-  return new Date(base.getFullYear(), 0, 1, 0, 0, 0, 0);
-}
-
-function toYMDLocal(d) {
-  const dt = asValidDate(d);
-  if (!dt) return null;
-  const local = new Date(dt.getTime() + TZ_OFFSET_MINUTES * 60 * 1000);
-  const y = local.getUTCFullYear();
-  const m = String(local.getUTCMonth() + 1).padStart(2, "0");
-  const day = String(local.getUTCDate()).padStart(2, "0");
-  return `${y}-${m}-${day}`;
-}
-
-function monthKeyLocal(d) {
-  const ymd = toYMDLocal(d);
-  if (!ymd) return null;
-  return ymd.slice(0, 7);
-}
-
-function isSameOrAfterDateYMD(dateStr, compareStr) {
-  if (!dateStr || !compareStr) return false;
-  return String(dateStr) >= String(compareStr);
-}
-
-function sumObjectValues(obj) {
-  return Object.values(obj || {}).reduce((acc, v) => acc + num(v, 0), 0);
-}
-
-function pickEntryDate(entry) {
-  return (
-    entry?.date ||
-    entry?.fecha ||
-    entry?.entryDate ||
-    entry?.asiento_fecha ||
-    entry?.asientoFecha ||
-    entry?.createdAt ||
-    entry?.created_at ||
-    null
-  );
 }
 
 function pickEntryLines(entry) {
@@ -219,7 +148,7 @@ function classifyCashflowByCounterparty(counterCodes) {
 }
 
 function getMonthLabelsForYear(baseDate = new Date()) {
-  const year = baseDate.getFullYear();
+  const year = Number(toYMDLocal(baseDate)?.slice(0, 4) || new Date().getFullYear());
   const labels = ["Ene", "Feb", "Mar", "Abr", "May", "Jun", "Jul", "Ago", "Sep", "Oct", "Nov", "Dic"];
 
   return labels.map((label, idx) => ({
@@ -294,7 +223,10 @@ function getDueStatus(fechaVencimiento, saldoPendiente, now = new Date()) {
   const saldo = num(saldoPendiente, 0);
   if (!(saldo > 0)) return "pagada";
 
-  const fv = asValidDate(fechaVencimiento);
+  let fv = null;
+  if (isDateOnly(fechaVencimiento)) fv = dateOnlyToUtcStart(fechaVencimiento);
+  else fv = asValidDate(fechaVencimiento);
+
   if (!fv) return "sin_fecha";
 
   const a = startOfTodayLocal(now);
@@ -315,12 +247,7 @@ function pickInventoryQty(m) {
 }
 
 function pickInventoryProductId(m) {
-  const raw =
-    m?.productId ??
-    m?.productoId ??
-    m?.producto_id ??
-    m?.product ??
-    null;
+  const raw = m?.productId ?? m?.productoId ?? m?.producto_id ?? m?.product ?? null;
 
   if (!raw) return "";
   if (typeof raw === "object") return String(raw?._id ?? raw?.id ?? "");
@@ -329,13 +256,7 @@ function pickInventoryProductId(m) {
 
 function pickInventoryProductName(m) {
   const p = m?.productId && typeof m.productId === "object" ? m.productId : null;
-  return String(
-    p?.nombre ??
-      p?.name ??
-      m?.producto_nombre ??
-      m?.product_name ??
-      "Producto"
-  ).trim();
+  return String(p?.nombre ?? p?.name ?? m?.producto_nombre ?? m?.product_name ?? "Producto").trim();
 }
 
 function pickInventoryMinStock(m) {
@@ -355,14 +276,8 @@ function pickInventoryMinStock(m) {
 // Builders de bloques
 // ======================================================
 
-async function buildVentasYKpis({ owner, now }) {
-  const startToday = startOfTodayLocal(now);
-  const startMonth = startOfMonthLocal(now);
-  const startYear = startOfYearLocal(now);
-
-  const ymdToday = toYMDLocal(startToday);
-  const ymdMonth = toYMDLocal(startMonth);
-  const ymdYear = toYMDLocal(startYear);
+async function buildVentasYKpis({ now, journalEntries }) {
+  const endToday = endOfTodayLocal(now);
 
   let ventasDelDia = 0;
   let ventasDelMes = 0;
@@ -379,60 +294,50 @@ async function buildVentasYKpis({ owner, now }) {
   let efectivo = 0;
   let bancos = 0;
 
-  if (JournalEntry) {
-    const entries = await JournalEntry.find({
-      owner,
-      date: { $lte: endOfTodayLocal(now) },
-    })
-      .sort({ date: 1, createdAt: 1 })
-      .lean();
+  for (const entry of journalEntries || []) {
+    const entryDate = pickEffectiveDate(entry);
+    if (!entryDate) continue;
+    if (entryDate.getTime() > endToday.getTime()) continue;
 
-    for (const entry of entries || []) {
-      const entryDate = pickEntryDate(entry);
-      const ymd = toYMDLocal(entryDate);
-      const lines = pickEntryLines(entry);
+    const lines = pickEntryLines(entry);
 
-      for (const line of lines) {
-        const code = lineCode(line);
-        const debe = lineDebit(line);
-        const haber = lineCredit(line);
+    for (const line of lines) {
+      const code = lineCode(line);
+      const debe = lineDebit(line);
+      const haber = lineCredit(line);
 
-        // Caja hoy (saldo acumulado al día)
-        if (isCashAccount(code)) efectivo += debe - haber;
-        if (isBankAccount(code)) bancos += debe - haber;
+      // Caja acumulada al día de hoy
+      if (isCashAccount(code)) efectivo += debe - haber;
+      if (isBankAccount(code)) bancos += debe - haber;
 
-        if (!ymd) continue;
-        if (!isSameOrAfterDateYMD(ymd, ymdYear)) continue;
+      // Solo cuentas 4XXX para ventas/ingresos
+      if (!String(code).startsWith("4")) continue;
 
-        // 4003 descuentos
-        if (code === "4003") {
-          const montoDescuento = debe - haber;
+      // 4003 descuentos
+      if (code === "4003") {
+        const montoDescuento = debe - haber;
 
-          if (isSameOrAfterDateYMD(ymd, ymdToday)) descuentosDelDia += montoDescuento;
-          if (isSameOrAfterDateYMD(ymd, ymdMonth)) descuentosDelMes += montoDescuento;
-          descuentosDelAno += montoDescuento;
-          continue;
-        }
-
-        // 4001 ventas
-        if (code === "4001") {
-          const montoVenta = haber - debe;
-
-          if (isSameOrAfterDateYMD(ymd, ymdToday)) ventasDelDia += montoVenta;
-          if (isSameOrAfterDateYMD(ymd, ymdMonth)) ventasDelMes += montoVenta;
-          ventasDelAno += montoVenta;
-          continue;
-        }
-
-        // otras 4XXX
-        if (String(code).startsWith("4")) {
-          const montoOtros = haber - debe;
-
-          if (isSameOrAfterDateYMD(ymd, ymdToday)) otrosIngresosDelDia += montoOtros;
-          if (isSameOrAfterDateYMD(ymd, ymdMonth)) otrosIngresosDelMes += montoOtros;
-          otrosIngresosDelAno += montoOtros;
-        }
+        if (isSameLocalDay(entryDate, now)) descuentosDelDia += montoDescuento;
+        if (isSameLocalMonth(entryDate, now)) descuentosDelMes += montoDescuento;
+        if (isSameLocalYear(entryDate, now)) descuentosDelAno += montoDescuento;
+        continue;
       }
+
+      // 4001 ventas
+      if (code === "4001") {
+        const montoVenta = haber - debe;
+
+        if (isSameLocalDay(entryDate, now)) ventasDelDia += montoVenta;
+        if (isSameLocalMonth(entryDate, now)) ventasDelMes += montoVenta;
+        if (isSameLocalYear(entryDate, now)) ventasDelAno += montoVenta;
+        continue;
+      }
+
+      // otras 4XXX = otros ingresos
+      const montoOtros = haber - debe;
+      if (isSameLocalDay(entryDate, now)) otrosIngresosDelDia += montoOtros;
+      if (isSameLocalMonth(entryDate, now)) otrosIngresosDelMes += montoOtros;
+      if (isSameLocalYear(entryDate, now)) otrosIngresosDelAno += montoOtros;
     }
   }
 
@@ -471,35 +376,26 @@ async function buildVentasYKpis({ owner, now }) {
   };
 }
 
-async function buildEstadoResultados({ owner, now }) {
-  const startYear = startOfYearLocal(now);
-  const endToday = endOfTodayLocal(now);
-
+async function buildEstadoResultados({ now, journalEntries }) {
   const series = makeEmptyEstadoResultadosSeries(now);
-  const byMonth = Object.fromEntries(series.map((s) => [s.monthKey, s]));
-
-  if (!JournalEntry) {
-    return {
-      series,
-      totales: {
-        ingresos: 0,
-        egresos: 0,
-        utilidadBruta: 0,
-        ebitda: 0,
-        utilidadNeta: 0,
+  const byMonth = Object.fromEntries(
+    series.map((s) => [
+      s.monthKey,
+      {
+        ...s,
+        _costos: 0,
+        _gastosOperativos: 0,
+        _depAmort: 0,
       },
-    };
-  }
+    ])
+  );
 
-  const entries = await JournalEntry.find({
-    owner,
-    date: { $gte: startYear, $lte: endToday },
-  })
-    .sort({ date: 1, createdAt: 1 })
-    .lean();
+  for (const entry of journalEntries || []) {
+    const entryDate = pickEffectiveDate(entry);
+    if (!entryDate) continue;
+    if (!isSameLocalYear(entryDate, now)) continue;
 
-  for (const entry of entries || []) {
-    const monthKey = monthKeyLocal(pickEntryDate(entry));
+    const monthKey = toYMLocal(entryDate);
     if (!monthKey || !byMonth[monthKey]) continue;
 
     const bucket = byMonth[monthKey];
@@ -515,170 +411,92 @@ async function buildEstadoResultados({ owner, now }) {
 
       // ingresos = 4XXX netos
       if (code.startsWith("4")) {
-        const monto = haber - debe;
-        bucket.ingresos += monto;
+        bucket.ingresos += haber - debe;
         continue;
       }
 
       // costos = 5XXX
       if (code.startsWith("5")) {
-        const monto = debe - haber;
-        bucket.egresos += monto;
+        bucket._costos += debe - haber;
         continue;
       }
 
       // gastos = 6XXX
       if (code.startsWith("6")) {
         const monto = debe - haber;
-        bucket.egresos += monto;
-
-        // EBITDA excluye dep/amort
-        if (isDepreciationOrAmortizationLine(code, name)) {
-          // no sumar este gasto a EBITDA
-        }
+        if (isDepreciationOrAmortizationLine(code, name)) bucket._depAmort += monto;
+        else bucket._gastosOperativos += monto;
       }
     }
   }
 
-  for (const bucket of series) {
-    const monthEntries = await getMonthEntriesForEstadoResultados({
-      owner,
-      monthKey: bucket.monthKey,
-      now,
+  const normalizedSeries = Object.values(byMonth)
+    .sort((a, b) => String(a.monthKey).localeCompare(String(b.monthKey)))
+    .map((bucket) => {
+      const costos = num(bucket._costos, 0);
+      const gastosOperativos = num(bucket._gastosOperativos, 0);
+      const depAmort = num(bucket._depAmort, 0);
+      const ingresos = num(bucket.ingresos, 0);
+
+      const egresos = costos + gastosOperativos + depAmort;
+      const utilidadBruta = ingresos - costos;
+      const ebitda = utilidadBruta - gastosOperativos;
+      const utilidadNeta = ingresos - egresos;
+
+      return {
+        mes: bucket.mes,
+        monthKey: bucket.monthKey,
+        ingresos: num(ingresos, 0),
+        egresos: num(egresos, 0),
+        utilidadBruta: num(utilidadBruta, 0),
+        ebitda: num(ebitda, 0),
+        utilidadNeta: num(utilidadNeta, 0),
+      };
     });
 
-    bucket.ingresos = num(monthEntries.ingresos, 0);
-    bucket.egresos = num(monthEntries.egresos, 0);
-    bucket.utilidadBruta = num(monthEntries.utilidadBruta, 0);
-    bucket.ebitda = num(monthEntries.ebitda, 0);
-    bucket.utilidadNeta = num(monthEntries.utilidadNeta, 0);
-  }
-
   const totales = {
-    ingresos: num(series.reduce((acc, x) => acc + num(x.ingresos, 0), 0), 0),
-    egresos: num(series.reduce((acc, x) => acc + num(x.egresos, 0), 0), 0),
-    utilidadBruta: num(series.reduce((acc, x) => acc + num(x.utilidadBruta, 0), 0), 0),
-    ebitda: num(series.reduce((acc, x) => acc + num(x.ebitda, 0), 0), 0),
-    utilidadNeta: num(series.reduce((acc, x) => acc + num(x.utilidadNeta, 0), 0), 0),
+    ingresos: num(normalizedSeries.reduce((acc, x) => acc + num(x.ingresos, 0), 0), 0),
+    egresos: num(normalizedSeries.reduce((acc, x) => acc + num(x.egresos, 0), 0), 0),
+    utilidadBruta: num(normalizedSeries.reduce((acc, x) => acc + num(x.utilidadBruta, 0), 0), 0),
+    ebitda: num(normalizedSeries.reduce((acc, x) => acc + num(x.ebitda, 0), 0), 0),
+    utilidadNeta: num(normalizedSeries.reduce((acc, x) => acc + num(x.utilidadNeta, 0), 0), 0),
   };
 
-  return { series, totales };
+  return { series: normalizedSeries, totales };
 }
 
-// helper separado para mayor claridad en la clasificación mensual P&L
-async function getMonthEntriesForEstadoResultados({ owner, monthKey }) {
-  if (!JournalEntry) {
-    return {
-      ingresos: 0,
-      egresos: 0,
-      utilidadBruta: 0,
-      ebitda: 0,
-      utilidadNeta: 0,
-    };
-  }
-
-  const [year, month] = String(monthKey).split("-").map(Number);
-  const start = new Date(year, month - 1, 1, 0, 0, 0, 0);
-  const end = new Date(year, month, 0, 23, 59, 59, 999);
-
-  const entries = await JournalEntry.find({
-    owner,
-    date: { $gte: start, $lte: end },
-  }).lean();
-
-  let ingresos = 0;
-  let costos = 0;
-  let gastosOperativos = 0;
-  let depAmort = 0;
-
-  for (const entry of entries || []) {
-    const lines = pickEntryLines(entry);
-
-    for (const line of lines) {
-      const code = lineCode(line);
-      const name = lineName(line);
-      const debe = lineDebit(line);
-      const haber = lineCredit(line);
-
-      if (!code) continue;
-
-      if (code.startsWith("4")) {
-        ingresos += haber - debe;
-        continue;
-      }
-
-      if (code.startsWith("5")) {
-        costos += debe - haber;
-        continue;
-      }
-
-      if (code.startsWith("6")) {
-        const monto = debe - haber;
-        if (isDepreciationOrAmortizationLine(code, name)) depAmort += monto;
-        else gastosOperativos += monto;
-      }
-    }
-  }
-
-  const egresos = costos + gastosOperativos + depAmort;
-  const utilidadBruta = ingresos - costos;
-  const ebitda = utilidadBruta - gastosOperativos;
-  const utilidadNeta = ingresos - egresos;
-
-  return {
-    ingresos: num(ingresos, 0),
-    egresos: num(egresos, 0),
-    utilidadBruta: num(utilidadBruta, 0),
-    ebitda: num(ebitda, 0),
-    utilidadNeta: num(utilidadNeta, 0),
-  };
-}
-
-async function buildFlujoWaterfall({ owner, now }) {
+async function buildFlujoWaterfall({ now, journalEntries }) {
   const startYear = startOfYearLocal(now);
   const endToday = endOfTodayLocal(now);
 
   const series = makeEmptyFlujoSeries(now);
   const byMonth = Object.fromEntries(series.map((s) => [s.monthKey, s]));
 
-  if (!JournalEntry) {
-    return {
-      saldoInicial: 0,
-      saldoFinal: 0,
-      seriesMensuales: series,
-    };
-  }
-
-  // saldo inicial del año para caja
-  const beforeYearEntries = await JournalEntry.find({
-    owner,
-    date: { $lt: startYear },
-  }).lean();
-
   let saldoInicial = 0;
-  for (const entry of beforeYearEntries || []) {
+
+  for (const entry of journalEntries || []) {
+    const entryDate = pickEffectiveDate(entry);
+    if (!entryDate) continue;
+
     const lines = pickEntryLines(entry);
-    for (const line of lines) {
-      const code = lineCode(line);
-      if (!isCashOrBank(code)) continue;
-      saldoInicial += lineDebit(line) - lineCredit(line);
+
+    // saldo inicial del año
+    if (entryDate.getTime() < startYear.getTime()) {
+      for (const line of lines) {
+        const code = lineCode(line);
+        if (!isCashOrBank(code)) continue;
+        saldoInicial += lineDebit(line) - lineCredit(line);
+      }
+      continue;
     }
-  }
 
-  const yearEntries = await JournalEntry.find({
-    owner,
-    date: { $gte: startYear, $lte: endToday },
-  })
-    .sort({ date: 1, createdAt: 1 })
-    .lean();
+    // fuera del periodo visible
+    if (entryDate.getTime() > endToday.getTime()) continue;
 
-  for (const entry of yearEntries || []) {
-    const monthKey = monthKeyLocal(pickEntryDate(entry));
+    const monthKey = toYMLocal(entryDate);
     if (!monthKey || !byMonth[monthKey]) continue;
 
     const bucket = byMonth[monthKey];
-    const lines = pickEntryLines(entry);
-
     const codes = lines.map((l) => lineCode(l));
     const counterparties = new Set(codes.filter((c) => c && !isCashOrBank(c)));
     const categoria = classifyCashflowByCounterparty(counterparties);
@@ -697,23 +515,32 @@ async function buildFlujoWaterfall({ owner, now }) {
   }
 
   let running = saldoInicial;
-  for (const bucket of series) {
-    bucket.operativo = num(bucket.operativo, 0);
-    bucket.inversion = num(bucket.inversion, 0);
-    bucket.financiamiento = num(bucket.financiamiento, 0);
-    bucket.neto = num(bucket.operativo + bucket.inversion + bucket.financiamiento, 0);
-    running += bucket.neto;
-    bucket.acumulado = num(running, 0);
-  }
+  const normalizedSeries = series.map((bucket) => {
+    const operativo = num(bucket.operativo, 0);
+    const inversion = num(bucket.inversion, 0);
+    const financiamiento = num(bucket.financiamiento, 0);
+    const neto = operativo + inversion + financiamiento;
+
+    running += neto;
+
+    return {
+      ...bucket,
+      operativo,
+      inversion,
+      financiamiento,
+      neto: num(neto, 0),
+      acumulado: num(running, 0),
+    };
+  });
 
   return {
     saldoInicial: num(saldoInicial, 0),
     saldoFinal: num(running, 0),
-    seriesMensuales: series,
+    seriesMensuales: normalizedSeries,
   };
 }
 
-async function buildBalanceGeneral({ owner, now }) {
+async function buildBalanceGeneral({ now, journalEntries }) {
   const endToday = endOfTodayLocal(now);
 
   const estructura = {
@@ -724,24 +551,16 @@ async function buildBalanceGeneral({ owner, now }) {
     capitalContable: 0,
   };
 
-  if (!JournalEntry) {
-    return {
-      activos: 0,
-      pasivos: 0,
-      capital: 0,
-      estructura,
-    };
-  }
-
-  const entries = await JournalEntry.find({
-    owner,
-    date: { $lte: endToday },
-  }).lean();
-
   const byCode = {};
+  let resultadoEjercicio = 0;
 
-  for (const entry of entries || []) {
+  for (const entry of journalEntries || []) {
+    const entryDate = pickEffectiveDate(entry);
+    if (!entryDate) continue;
+    if (entryDate.getTime() > endToday.getTime()) continue;
+
     const lines = pickEntryLines(entry);
+
     for (const line of lines) {
       const code = lineCode(line);
       if (!code) continue;
@@ -752,6 +571,15 @@ async function buildBalanceGeneral({ owner, now }) {
 
       byCode[code].debe += lineDebit(line);
       byCode[code].haber += lineCredit(line);
+
+      // resultado del ejercicio del año en curso
+      if (isSameLocalYear(entryDate, now)) {
+        const debe = lineDebit(line);
+        const haber = lineCredit(line);
+
+        if (code.startsWith("4")) resultadoEjercicio += haber - debe;
+        else if (code.startsWith("5") || code.startsWith("6")) resultadoEjercicio -= debe - haber;
+      }
     }
   }
 
@@ -769,6 +597,9 @@ async function buildBalanceGeneral({ owner, now }) {
       estructura.capitalContable += saldo;
     }
   }
+
+  // 🔥 FIX clave: sumar resultado del ejercicio al capital contable
+  estructura.capitalContable += num(resultadoEjercicio, 0);
 
   const activos = num(estructura.activoCirculante + estructura.activoNoCirculante, 0);
   const pasivos = num(estructura.pasivoCirculante + estructura.pasivoNoCirculante, 0);
@@ -859,12 +690,9 @@ async function buildCxP({ owner, now }) {
     cantidad += 1;
     total += pendiente;
 
-    const due =
-      tx?.fechaVencimiento ??
-      tx?.fecha_vencimiento ??
-      null;
-
+    const due = tx?.fechaVencimiento ?? tx?.fecha_vencimiento ?? null;
     const status = getDueStatus(due, pendiente, now);
+
     if (status === "vencida") vencido += pendiente;
     else corriente += pendiente;
   }
@@ -921,7 +749,6 @@ async function buildInventario({ owner }) {
     } else if (tipo === "venta" || tipo === "salida" || tipo === "ajuste_salida") {
       byProduct[productId].stock -= qty;
     } else if (tipo === "ajuste") {
-      // si algún ajuste viene directo, lo tratamos como delta
       byProduct[productId].stock += qty;
     }
   }
@@ -1032,7 +859,12 @@ router.get("/ping", ensureAuth, (req, res) => {
 router.get("/resumen", ensureAuth, async (req, res) => {
   try {
     const owner = req.user._id;
-    const now = nowLocal();
+    const now = new Date();
+
+    // 🔥 Una sola lectura de JournalEntry para evitar inconsistencias
+    const journalEntries = JournalEntry
+      ? await JournalEntry.find({ owner }).sort({ createdAt: 1 }).lean()
+      : [];
 
     const [
       ventasYKpis,
@@ -1044,10 +876,10 @@ router.get("/resumen", ensureAuth, async (req, res) => {
       inventario,
       pasivosBancarios,
     ] = await Promise.all([
-      buildVentasYKpis({ owner, now }),
-      buildEstadoResultados({ owner, now }),
-      buildFlujoWaterfall({ owner, now }),
-      buildBalanceGeneral({ owner, now }),
+      buildVentasYKpis({ now, journalEntries }),
+      buildEstadoResultados({ now, journalEntries }),
+      buildFlujoWaterfall({ now, journalEntries }),
+      buildBalanceGeneral({ now, journalEntries }),
       buildCxC({ owner, now }),
       buildCxP({ owner, now }),
       buildInventario({ owner }),
@@ -1063,26 +895,18 @@ router.get("/resumen", ensureAuth, async (req, res) => {
           ventasAno: ventasYKpis.ventas.ventasDelAno,
           caja: ventasYKpis.caja,
 
-          // extras útiles para UI
           descuentosMes: ventasYKpis.ventas.descuentosDelMes,
           ingresoNetoMes: ventasYKpis.ventas.ingresoNetoDelMes,
           totalIngresosMes: ventasYKpis.ventas.totalIngresosDelMes,
         },
 
         ventas: ventasYKpis.ventas,
-
         estadoResultados,
-
         flujo,
-
         balanceGeneral,
-
         cxc,
-
         cxp,
-
         inventario,
-
         pasivosBancarios,
 
         pendientes: {
