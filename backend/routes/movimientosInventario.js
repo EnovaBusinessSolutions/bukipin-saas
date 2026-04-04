@@ -4,6 +4,7 @@ const router = express.Router();
 
 const mongoose = require("mongoose");
 const ensureAuth = require("../middleware/ensureAuth");
+const { applyEntrada, computeSaleCost, pickAvgCost, pickStock, pickInventoryValue } = require("../services/inventoryCostEngine");
 
 // Modelos
 let InventoryMovement = null;
@@ -833,17 +834,19 @@ router.post("/", ensureAuth, async (req, res) => {
       return res.status(400).json({ ok: false, message: "cantidad es requerida y no puede ser 0." });
     }
 
-    // ✅ 1) fallback costo del producto
-    if ((!Number.isFinite(costoUnitario) || costoUnitario <= 0) && Product) {
-      const prod = await Product.findOne({ _id: new mongoose.Types.ObjectId(productoId), owner })
-        .select("costoCompra costo_compra precio price")
-        .lean();
+    let productDoc = null;
+    if (Product) {
+      productDoc = await Product.findOne({ _id: new mongoose.Types.ObjectId(productoId), owner }).lean();
+    }
 
+    // ✅ 1) fallback costo del producto (prioriza costo promedio para salidas)
+    if ((!Number.isFinite(costoUnitario) || costoUnitario <= 0) && productDoc) {
       const fallback =
-        numOrNaN(prod?.costoCompra) ||
-        numOrNaN(prod?.costo_compra) ||
-        numOrNaN(prod?.precio) ||
-        numOrNaN(prod?.price);
+        (isSalida(tipo) ? numOrNaN(pickAvgCost(productDoc)) : NaN) ||
+        numOrNaN(productDoc?.costoCompra) ||
+        numOrNaN(productDoc?.costo_compra) ||
+        numOrNaN(productDoc?.precio) ||
+        numOrNaN(productDoc?.price);
 
       if (Number.isFinite(fallback) && fallback > 0) costoUnitario = fallback;
     }
@@ -860,10 +863,121 @@ router.post("/", ensureAuth, async (req, res) => {
 
     const qtyCanon = Math.abs(cantidad);
 
+    let cppSnapshot = {
+      stockAntes: null,
+      stockDespues: null,
+      costoPromedioAntes: null,
+      costoPromedioDespues: null,
+      unidadesConStock: null,
+      unidadesSinStock: null,
+      costoProvisional: null,
+      esVentaSinStock: false,
+      valorInventarioAntes: null,
+      valorInventarioDespues: null,
+    };
+
     const asientoIdExterno = pickAsientoIdFromBody(req.body) || null;
     const numeroAsientoExterno = pickNumeroAsientoFromBody(req.body) || null;
 
     const prodOid = new mongoose.Types.ObjectId(productoId);
+
+
+    // ✅ Motor CPP: backend como fuente de verdad de stock + costo promedio
+    if (Product && productDoc && (isEntrada(tipo) || isSalida(tipo))) {
+      const stockActual = pickStock(productDoc);
+      const costoPromedio = pickAvgCost(productDoc);
+      const valorInventarioActual = pickInventoryValue(productDoc);
+
+      if (isEntrada(tipo)) {
+        const cpp = applyEntrada({
+          stockActual,
+          costoPromedio,
+          unidades: qtyCanon,
+          costoCompra: costoUnitario,
+          valorInventarioActual,
+        });
+
+        cppSnapshot = {
+          stockAntes: cpp.stockAntes,
+          stockDespues: cpp.stockDespues,
+          costoPromedioAntes: cpp.costoPromedioAntes,
+          costoPromedioDespues: cpp.costoPromedioDespues,
+          unidadesConStock: qtyCanon,
+          unidadesSinStock: 0,
+          costoProvisional: null,
+          esVentaSinStock: false,
+          valorInventarioAntes: cpp.valorInventarioAntes,
+          valorInventarioDespues: cpp.valorInventarioDespues,
+        };
+
+        await Product.updateOne(
+          { owner, _id: prodOid },
+          {
+            $set: {
+              stockActual: cpp.stockDespues,
+              stock_actual: cpp.stockDespues,
+              stock: cpp.stockDespues,
+              costoPromedio: cpp.costoPromedioDespues,
+              costo_promedio: cpp.costoPromedioDespues,
+              costoPromedioPonderado: cpp.costoPromedioDespues,
+              costoUltimoCompra: costoUnitario,
+              costo_ultimo_compra: costoUnitario,
+              costoCompra: costoUnitario,
+              costo_compra: costoUnitario,
+              valorInventarioActual: cpp.valorInventarioDespues,
+              valor_inventario_actual: cpp.valorInventarioDespues,
+              inventoryValueRunning: cpp.valorInventarioDespues,
+            },
+          }
+        );
+      }
+
+      if (isSalida(tipo)) {
+        const costoProvManual = numOrNaN(
+          req.body?.costoProvisional ?? req.body?.costo_provisional ?? req.body?.costoManual ?? req.body?.costo_manual
+        );
+        const sale = computeSaleCost({
+          stockActual,
+          costoPromedio,
+          unidades: qtyCanon,
+          costoProvisionalManual: Number.isFinite(costoProvManual) ? costoProvManual : undefined,
+          valorInventarioActual,
+        });
+
+        costoUnitario = sale.costoUnitarioAplicado;
+        costoTotal = sale.costoTotal;
+
+        cppSnapshot = {
+          stockAntes: sale.stockAntes,
+          stockDespues: sale.stockDespues,
+          costoPromedioAntes: sale.costoPromedioAntes,
+          costoPromedioDespues: sale.costoPromedioAntes,
+          unidadesConStock: sale.unidadesConStock,
+          unidadesSinStock: sale.unidadesSinStock,
+          costoProvisional: sale.costoProvisional,
+          esVentaSinStock: sale.unidadesSinStock > 0,
+          valorInventarioAntes: sale.valorInventarioAntes,
+          valorInventarioDespues: sale.valorInventarioDespues,
+        };
+
+        await Product.updateOne(
+          { owner, _id: prodOid },
+          {
+            $set: {
+              stockActual: sale.stockDespues,
+              stock_actual: sale.stockDespues,
+              stock: sale.stockDespues,
+              costoPromedio: costoPromedio,
+              costo_promedio: costoPromedio,
+              costoPromedioPonderado: costoPromedio,
+              valorInventarioActual: sale.valorInventarioDespues,
+              valor_inventario_actual: sale.valorInventarioDespues,
+              inventoryValueRunning: sale.valorInventarioDespues,
+            },
+          }
+        );
+      }
+    }
 
     const payload = {
       owner,
@@ -897,6 +1011,17 @@ router.post("/", ensureAuth, async (req, res) => {
 
       costoTotal,
       costo_total: costoTotal,
+
+      stockAntes: cppSnapshot.stockAntes,
+      stockDespues: cppSnapshot.stockDespues,
+      costoPromedioAntes: cppSnapshot.costoPromedioAntes,
+      costoPromedioDespues: cppSnapshot.costoPromedioDespues,
+      unidadesConStock: cppSnapshot.unidadesConStock,
+      unidadesSinStock: cppSnapshot.unidadesSinStock,
+      costoProvisional: cppSnapshot.costoProvisional,
+      esVentaSinStock: cppSnapshot.esVentaSinStock,
+      valorInventarioAntes: cppSnapshot.valorInventarioAntes,
+      valorInventarioDespues: cppSnapshot.valorInventarioDespues,
 
       descripcion,
       referencia,

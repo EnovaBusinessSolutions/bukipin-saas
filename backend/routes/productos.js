@@ -115,6 +115,33 @@ function normalizeOut(doc) {
         ? doc.precio_venta
         : 0;
 
+  const stockActual =
+    typeof doc.stockActual === "number"
+      ? doc.stockActual
+      : typeof doc.stock_actual === "number"
+        ? doc.stock_actual
+        : typeof doc.stock === "number"
+          ? doc.stock
+          : 0;
+
+  const costoPromedio =
+    typeof doc.costoPromedio === "number"
+      ? doc.costoPromedio
+      : typeof doc.costo_promedio === "number"
+        ? doc.costo_promedio
+        : typeof doc.costoPromedioPonderado === "number"
+          ? doc.costoPromedioPonderado
+          : 0;
+
+  const valorInventarioActual =
+    typeof doc.valorInventarioActual === "number"
+      ? doc.valorInventarioActual
+      : typeof doc.valor_inventario_actual === "number"
+        ? doc.valor_inventario_actual
+        : typeof doc.inventoryValueRunning === "number"
+          ? doc.inventoryValueRunning
+          : Number((stockActual * costoPromedio).toFixed(6));
+
   return {
     id: String(doc._id),
     nombre: doc.nombre ?? doc.name ?? "",
@@ -129,6 +156,18 @@ function normalizeOut(doc) {
 
     precioVenta,
     precio_venta: precioVenta,
+
+    stockActual,
+    stock_actual: stockActual,
+    stock: stockActual,
+
+    costoPromedio,
+    costo_promedio: costoPromedio,
+    costoPromedioPonderado: costoPromedio,
+
+    valorInventarioActual,
+    valor_inventario_actual: valorInventarioActual,
+    inventoryValueRunning: valorInventarioActual,
 
     cuentaCodigo: doc.cuentaCodigo ?? doc.accountCode ?? null,
     subcuentaId: doc.subcuentaId ? String(doc.subcuentaId) : null,
@@ -374,19 +413,10 @@ async function buildInventoryMetricsMap({ owner, productIds }) {
     const salidas = Number(r.salidasQty || 0);
     const ajustes = Number(r.ajustesQty || 0);
 
-    const costQty = Number(r.costQty || 0);
-    const costSum = Number(r.costSum || 0);
-
-    const costo_unitario = costQty > 0 ? costSum / costQty : 0;
-
-    const cantidad_stock = entradas - salidas + ajustes;
-
     map.set(String(r._id), {
       cantidad_comprada: entradas,
       cantidad_vendida: salidas,
-      cantidad_stock,
-      costo_unitario,
-      valor_total_inventario: cantidad_stock * costo_unitario,
+      ajustes_qty: ajustes,
       ultimo_movimiento: r.lastDate ? new Date(r.lastDate).toISOString() : null,
     });
   }
@@ -476,21 +506,34 @@ router.get("/", ensureAuth, async (req, res) => {
       const m = metricsMap.get(base.id) || {
         cantidad_comprada: 0,
         cantidad_vendida: 0,
-        cantidad_stock: 0,
-        costo_unitario: 0,
-        valor_total_inventario: 0,
+        ajustes_qty: 0,
         ultimo_movimiento: null,
       };
+
+      const cantidad_stock = numOrNull(base.stockActual) ?? numOrNull(base.stock_actual) ?? numOrNull(base.stock) ?? 0;
+      const costo_unitario =
+        numOrNull(base.costoPromedio) ??
+        numOrNull(base.costo_promedio) ??
+        numOrNull(base.costoPromedioPonderado) ??
+        0;
+      const valor_total_inventario =
+        numOrNull(base.valorInventarioActual) ??
+        numOrNull(base.valor_inventario_actual) ??
+        numOrNull(base.inventoryValueRunning) ??
+        Number((cantidad_stock * costo_unitario).toFixed(2));
 
       return {
         ...base,
 
-        // ✅ métricas E2E para inventario (lo que tu frontend necesita)
+        // ✅ Estado consolidado CPP (fuente de verdad)
+        cantidad_stock,
+        costo_unitario,
+        valor_total_inventario,
+
+        // ✅ Métricas complementarias del ledger
         cantidad_comprada: m.cantidad_comprada,
         cantidad_vendida: m.cantidad_vendida,
-        cantidad_stock: m.cantidad_stock,
-        costo_unitario: m.costo_unitario,
-        valor_total_inventario: m.valor_total_inventario,
+        ajustes_qty: m.ajustes_qty,
         ultimo_movimiento: m.ultimo_movimiento,
       };
     });

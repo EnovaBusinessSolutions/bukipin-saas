@@ -33,6 +33,19 @@ const inventoryMovementSchema = new mongoose.Schema(
     unitCost: { type: Number, default: 0 },
     total: { type: Number, default: 0 },
 
+
+    // ✅ Snapshot CPP (auditoría)
+    stockAntes: { type: Number, default: null },
+    stockDespues: { type: Number, default: null },
+    costoPromedioAntes: { type: Number, default: null },
+    costoPromedioDespues: { type: Number, default: null },
+    unidadesConStock: { type: Number, default: null },
+    unidadesSinStock: { type: Number, default: null },
+    costoProvisional: { type: Number, default: null },
+    esVentaSinStock: { type: Boolean, default: false },
+    valorInventarioAntes: { type: Number, default: null },
+    valorInventarioDespues: { type: Number, default: null },
+
     // Texto
     nota: { type: String, default: "" },
     referencia: { type: String, default: "" },

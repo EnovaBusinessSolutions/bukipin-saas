@@ -31,6 +31,23 @@ const productSchema = new mongoose.Schema(
     cuentaCodigo: { type: String, default: "4001" },
     subcuentaId: { type: mongoose.Schema.Types.ObjectId, ref: "Account", default: null },
 
+
+    // ✅ Motor CPP (fuente de verdad backend)
+    stockActual: { type: Number, default: 0 },
+    stock_actual: { type: Number, default: 0 },
+    stock: { type: Number, default: 0 },
+
+    costoPromedio: { type: Number, default: 0 },
+    costo_promedio: { type: Number, default: 0 },
+    costoPromedioPonderado: { type: Number, default: 0 },
+
+    costoUltimoCompra: { type: Number, default: 0 },
+    costo_ultimo_compra: { type: Number, default: 0 },
+
+    valorInventarioActual: { type: Number, default: 0 },
+    valor_inventario_actual: { type: Number, default: 0 },
+    inventoryValueRunning: { type: Number, default: 0 },
+
     activo: { type: Boolean, default: true },
   },
   { timestamps: true }
@@ -58,6 +75,50 @@ productSchema.pre("save", function (next) {
   }
   if (typeof this.costo_compra === "number" && (!this.costoCompra || this.costoCompra === 0)) {
     this.costoCompra = this.costo_compra;
+  }
+
+  // ===== STOCK (camel <-> snake) =====
+  if (typeof this.stockActual === "number") {
+    this.stock_actual = this.stockActual;
+    this.stock = this.stockActual;
+  } else if (typeof this.stock_actual === "number") {
+    this.stockActual = this.stock_actual;
+    this.stock = this.stock_actual;
+  } else if (typeof this.stock === "number") {
+    this.stockActual = this.stock;
+    this.stock_actual = this.stock;
+  }
+
+  // ===== COSTO PROMEDIO (camel <-> snake) =====
+  if (typeof this.costoPromedio === "number") {
+    this.costo_promedio = this.costoPromedio;
+    this.costoPromedioPonderado = this.costoPromedio;
+  } else if (typeof this.costo_promedio === "number") {
+    this.costoPromedio = this.costo_promedio;
+    this.costoPromedioPonderado = this.costo_promedio;
+  } else if (typeof this.costoPromedioPonderado === "number") {
+    this.costoPromedio = this.costoPromedioPonderado;
+    this.costo_promedio = this.costoPromedioPonderado;
+  }
+
+
+  // ===== VALOR INVENTARIO RUNNING (camel <-> snake) =====
+  if (typeof this.valorInventarioActual === "number") {
+    this.valor_inventario_actual = this.valorInventarioActual;
+    this.inventoryValueRunning = this.valorInventarioActual;
+  } else if (typeof this.valor_inventario_actual === "number") {
+    this.valorInventarioActual = this.valor_inventario_actual;
+    this.inventoryValueRunning = this.valor_inventario_actual;
+  } else if (typeof this.inventoryValueRunning === "number") {
+    this.valorInventarioActual = this.inventoryValueRunning;
+    this.valor_inventario_actual = this.inventoryValueRunning;
+  }
+
+  // ===== ÚLTIMO COSTO DE COMPRA (solo referencia) =====
+  if (typeof this.costoUltimoCompra === "number") {
+    this.costo_ultimo_compra = this.costoUltimoCompra;
+  } else if (typeof this.costo_ultimo_compra === "number") {
+    this.costoUltimoCompra = this.costo_ultimo_compra;
   }
 
   // ===== COMPAT: precio = costo compra =====

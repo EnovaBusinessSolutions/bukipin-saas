@@ -31,6 +31,17 @@ const incomeItemSchema = new mongoose.Schema(
     costo_unitario: { type: Number, default: 0 },
     costoTotal: { type: Number, default: 0 },
     costo_total: { type: Number, default: 0 },
+
+    // ✅ Snapshot CPP por item (auditoría)
+    stockAntes: { type: Number, default: null },
+    stockDespues: { type: Number, default: null },
+    costoPromedioAntes: { type: Number, default: null },
+    costoPromedioDespues: { type: Number, default: null },
+    unidadesConStock: { type: Number, default: null },
+    unidadesSinStock: { type: Number, default: null },
+    costoProvisional: { type: Number, default: null },
+    valorInventarioAntes: { type: Number, default: null },
+    valorInventarioDespues: { type: Number, default: null },
   },
   { _id: false }
 );
@@ -166,6 +177,16 @@ const incomeTransactionSchema = new mongoose.Schema(
             const costoUnitario = Number(it.costoUnitario || it.costo_unitario || 0);
             const costoTotal = Number(it.costoTotal || it.costo_total || 0);
 
+            const stockAntes = it.stockAntes ?? null;
+            const stockDespues = it.stockDespues ?? null;
+            const costoPromedioAntes = it.costoPromedioAntes ?? null;
+            const costoPromedioDespues = it.costoPromedioDespues ?? null;
+            const unidadesConStock = it.unidadesConStock ?? null;
+            const unidadesSinStock = it.unidadesSinStock ?? null;
+            const costoProvisional = it.costoProvisional ?? null;
+            const valorInventarioAntes = it.valorInventarioAntes ?? null;
+            const valorInventarioDespues = it.valorInventarioDespues ?? null;
+
             return {
               ...it,
               productoId: productoId ? String(productoId) : null,
@@ -185,6 +206,16 @@ const incomeTransactionSchema = new mongoose.Schema(
               costo_unitario: costoUnitario,
               costoTotal,
               costo_total: costoTotal,
+
+              stockAntes,
+              stockDespues,
+              costoPromedioAntes,
+              costoPromedioDespues,
+              unidadesConStock,
+              unidadesSinStock,
+              costoProvisional,
+              valorInventarioAntes,
+              valorInventarioDespues,
             };
           });
         }
