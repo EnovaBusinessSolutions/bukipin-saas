@@ -8,6 +8,7 @@ const IncomeTransaction = require("../models/IncomeTransaction");
 const JournalEntry = require("../models/JournalEntry");
 const Account = require("../models/Account");
 const Counter = require("../models/Counter");
+const { computeSaleCost, pickAvgCost, pickInventoryValue } = require("../services/inventoryCostEngine");
 
 // Opcional
 let Client = null;
@@ -1293,7 +1294,7 @@ async function getStockByMovements(owner, productIdRaw) {
 /**
  * ✅ NUEVO: sincronizar campo stock del producto (best-effort)
  */
-async function syncProductStockBestEffort(owner, productId, stockKey, newStock) {
+async function syncProductStockBestEffort(owner, productId, stockKey, newStock, inventoryValue = null) {
   if (!Product || !productId || !stockKey) return;
   const n = num(newStock, null);
   if (n === null) return;
@@ -1301,7 +1302,21 @@ async function syncProductStockBestEffort(owner, productId, stockKey, newStock) 
   try {
     await Product.updateOne(
       { owner, _id: new mongoose.Types.ObjectId(String(productId)) },
-      { $set: { [stockKey]: n } }
+      {
+        $set: {
+          [stockKey]: n,
+          stockActual: n,
+          stock_actual: n,
+          stock: n,
+          ...(typeof inventoryValue === "number" && Number.isFinite(inventoryValue)
+            ? {
+                valorInventarioActual: inventoryValue,
+                valor_inventario_actual: inventoryValue,
+                inventoryValueRunning: inventoryValue,
+              }
+            : {}),
+        },
+      }
     ).catch(() => {});
   } catch (_) {}
 }
@@ -1896,34 +1911,30 @@ const COD_PENDIENTE = isOtrosIngreso ? COD_DEUDORES : COD_CXC;
         const stock = hasMovStock ? stockByMov : stockByField;
         const stockSource = hasMovStock ? "movements" : "product_field";
 
-        if (stock < qty) {
-          return res.status(400).json({
-            ok: false,
-            message: `Stock insuficiente para "${getProductName(productDoc)}". Stock actual: ${stock}. Requerido: ${qty}.`,
-            code: "STOCK_INSUFICIENTE",
-            meta: { stockSource, stockKey, stockByMov, stockByField, productId: String(productDoc._id) },
-          });
-        }
 
-        // costo: 1) desde item, 2) desde body, 3) desde Product, 4) desde último movimiento ENTRADA
-        const fromItem = getCostFromAny(it.raw, qty);
-        const fromBody = getCostFromAny(req.body, qty);
+        // costo CPP en venta: stock existente al promedio y faltante con provisión
+        const provisionalManual = num(
+          it.raw?.costoProvisional ??
+            it.raw?.costo_provisional ??
+            it.raw?.costoManual ??
+            it.raw?.costo_manual ??
+            req.body?.costoProvisional ??
+            req.body?.costo_provisional ??
+            req.body?.costoManual ??
+            req.body?.costo_manual,
+          NaN
+        );
 
-        let costUnit = num(fromItem.costUnit, 0) || num(fromBody.costUnit, 0);
-        let costTotal = num(fromItem.costTotal, 0) || num(fromBody.costTotal, 0);
+        const saleCost = computeSaleCost({
+          stockActual: stock,
+          costoPromedio: pickAvgCost(productDoc),
+          valorInventarioActual: pickInventoryValue(productDoc),
+          unidades: qty,
+          costoProvisionalManual: Number.isFinite(provisionalManual) ? provisionalManual : undefined,
+        });
 
-        if (!(costUnit > 0) && !(costTotal > 0)) {
-          costUnit = num(getProductCostUnit(productDoc), 0);
-          costTotal = costUnit > 0 ? Number((costUnit * qty).toFixed(2)) : 0;
-        }
-
-        if (!(costUnit > 0) && !(costTotal > 0)) {
-          const cuMov = await getCostUnitFromLastEntrada(owner, productDoc._id);
-          if (cuMov > 0) {
-            costUnit = cuMov;
-            costTotal = Number((costUnit * qty).toFixed(2));
-          }
-        }
+        let costUnit = num(saleCost.costoUnitarioAplicado, 0);
+        let costTotal = num(saleCost.costoTotal, 0);
 
         // si el stock viene de movimientos, sincronizamos best-effort el campo del producto para UI
         if (stockSource === "movements") {
@@ -1940,8 +1951,17 @@ const COD_PENDIENTE = isOtrosIngreso ? COD_DEUDORES : COD_CXC;
           costTotal: num(costTotal, 0),
           stockKey,
           stockBefore: stock,
-          stockAfter: Number((stock - qty).toFixed(6)),
+          stockAfter: saleCost.stockDespues,
           stockSource,
+
+          costoPromedioAntes: saleCost.costoPromedioAntes,
+          costoPromedioDespues: saleCost.costoPromedioAntes, // en venta no cambia
+          unidadesConStock: saleCost.unidadesConStock,
+          unidadesSinStock: saleCost.unidadesSinStock,
+          costoProvisional: saleCost.costoProvisional,
+          esVentaSinStock: saleCost.unidadesSinStock > 0,
+          valorInventarioAntes: saleCost.valorInventarioAntes,
+          valorInventarioDespues: saleCost.valorInventarioDespues,
         });
       }
     }
@@ -1991,6 +2011,16 @@ const COD_PENDIENTE = isOtrosIngreso ? COD_DEUDORES : COD_CXC;
         qty: x.qty,
         costUnit: x.costUnit,
         costTotal: x.costTotal,
+
+        stockAntes: x.stockBefore,
+        stockDespues: x.stockAfter,
+        costoPromedioAntes: x.costoPromedioAntes,
+        costoPromedioDespues: x.costoPromedioDespues,
+        unidadesConStock: x.unidadesConStock,
+        unidadesSinStock: x.unidadesSinStock,
+        costoProvisional: x.costoProvisional,
+        valorInventarioAntes: x.valorInventarioAntes,
+        valorInventarioDespues: x.valorInventarioDespues,
       })),
 
       saldoPendiente,
@@ -2021,30 +2051,9 @@ const COD_PENDIENTE = isOtrosIngreso ? COD_DEUDORES : COD_CXC;
      * Si algún producto usa stock por campo, descontamos en forma atómica.
      * Si falla uno, revertimos best-effort los anteriores y abortamos.
      */
-    const decremented = [];
     for (const meta of invItemsMeta) {
       if (meta.stockSource !== "product_field") continue;
-
-      const ok = await updateProductStockAtomic(owner, meta.productIdStr, meta.stockKey, meta.qty);
-      if (!ok?.ok) {
-        // revertimos lo que sí descontamos
-        for (const prev of decremented) {
-          try {
-            await Product.updateOne(
-              { owner, _id: new mongoose.Types.ObjectId(prev.productIdStr) },
-              { $inc: { [prev.stockKey]: prev.qty } }
-            ).catch(() => {});
-          } catch (_) {}
-        }
-
-        await IncomeTransaction.deleteOne({ _id: tx._id, owner }).catch(() => {});
-        return res.status(400).json({
-          ok: false,
-          message: "No se pudo actualizar el stock (posible carrera / stock insuficiente). Intenta de nuevo.",
-        });
-      }
-
-      decremented.push(meta);
+      await syncProductStockBestEffort(owner, meta.productIdStr, meta.stockKey, meta.stockAfter, meta.valorInventarioDespues);
     }
 
     // ✅ Asiento contable
@@ -2177,7 +2186,7 @@ const COD_PENDIENTE = isOtrosIngreso ? COD_DEUDORES : COD_CXC;
      */
     for (const meta of invItemsMeta) {
       if (meta.stockSource === "movements") {
-        await syncProductStockBestEffort(owner, meta.productIdStr, meta.stockKey, meta.stockAfter);
+        await syncProductStockBestEffort(owner, meta.productIdStr, meta.stockKey, meta.stockAfter, meta.valorInventarioDespues);
       }
     }
 
@@ -2222,6 +2231,17 @@ const COD_PENDIENTE = isOtrosIngreso ? COD_DEUDORES : COD_CXC;
         costo_unitario: meta.costUnit,
         costoTotal: meta.costTotal,
         costo_total: meta.costTotal,
+
+        stockAntes: meta.stockBefore,
+        stockDespues: meta.stockAfter,
+        costoPromedioAntes: meta.costoPromedioAntes,
+        costoPromedioDespues: meta.costoPromedioDespues,
+        unidadesConStock: meta.unidadesConStock,
+        unidadesSinStock: meta.unidadesSinStock,
+        costoProvisional: meta.costoProvisional,
+        esVentaSinStock: meta.esVentaSinStock,
+        valorInventarioAntes: meta.valorInventarioAntes,
+        valorInventarioDespues: meta.valorInventarioDespues,
 
         descripcion: tx.descripcion,
         memo: tx.descripcion,
