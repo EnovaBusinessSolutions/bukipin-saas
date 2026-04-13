@@ -297,16 +297,63 @@ async function aggregateByAccount({ owner, start = null, end = null }) {
             },
           ],
         },
+        __lines: {
+          $cond: [
+            { $gt: [{ $size: { $ifNull: ["$lines", []] } }, 0] },
+            "$lines",
+            {
+              $cond: [
+                { $gt: [{ $size: { $ifNull: ["$detalle_asientos", []] } }, 0] },
+                "$detalle_asientos",
+                { $ifNull: ["$detalles_asiento", []] },
+              ],
+            },
+          ],
+        },
       },
     },
-    { $unwind: "$lines" },
+    { $unwind: "$__lines" },
     {
       $project: {
-        cuenta_codigo: accountCodeExpr(),
-        cuenta_nombre: accountNameExpr(),
+        cuenta_codigo: {
+          $ifNull: [
+            "$__lines.accountCodigo",
+            {
+              $ifNull: [
+                "$__lines.accountCode",
+                {
+                  $ifNull: [
+                    "$__lines.account_codigo",
+                    {
+                      $ifNull: ["$__lines.cuentaCodigo", "$__lines.cuenta_codigo"],
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+        cuenta_nombre: {
+          $ifNull: [
+            "$__lines.accountNombre",
+            {
+              $ifNull: [
+                "$__lines.accountName",
+                {
+                  $ifNull: [
+                    "$__lines.account_nombre",
+                    {
+                      $ifNull: ["$__lines.cuentaNombre", "$__lines.cuenta_nombre"],
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        },
         debit: {
           $convert: {
-            input: { $ifNull: ["$lines.debit", "$lines.debe"] },
+            input: { $ifNull: ["$__lines.debit", "$__lines.debe"] },
             to: "double",
             onError: 0,
             onNull: 0,
@@ -314,7 +361,7 @@ async function aggregateByAccount({ owner, start = null, end = null }) {
         },
         credit: {
           $convert: {
-            input: { $ifNull: ["$lines.credit", "$lines.haber"] },
+            input: { $ifNull: ["$__lines.credit", "$__lines.haber"] },
             to: "double",
             onError: 0,
             onNull: 0,
