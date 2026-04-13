@@ -5,6 +5,10 @@ const ensureAuth = require("../middleware/ensureAuth");
 
 const ExpenseTransaction = require("../models/ExpenseTransaction");
 const ExpenseProduct = require("../models/ExpenseProduct");
+const {
+  prepareCorporateCardCharge,
+  applyCorporateCardCharge,
+} = require("../services/corporateCardChargeService");
 
 let JournalEntry = null;
 try {
@@ -60,6 +64,7 @@ function normalizeMetodoPago(v) {
   const s = asTrim(v).toLowerCase();
   if (!s) return "";
   if (s === "bancos" || s === "transferencia" || s === "tarjeta-transferencia") return "bancos";
+  if (s === "tarjeta_corporativa") return "tarjeta_credito";
   return s;
 }
 
@@ -144,6 +149,7 @@ function mapTxForUI(doc) {
 
     tipo_pago: d.tipoPago ?? d.tipo_pago ?? "",
     metodo_pago: d.metodoPago ?? d.metodo_pago ?? "",
+    financing_id: d.financingId ? String(d.financingId) : d.financing_id ? String(d.financing_id) : null,
 
     monto_pagado: toNum(d.montoPagado ?? d.monto_pagado, 0),
     monto_pendiente: toNum(d.montoPendiente ?? d.monto_pendiente, 0),
@@ -195,6 +201,7 @@ function mapTxForUI(doc) {
   item.precioUnitario = item.precio_unitario;
   item.tipoPago = item.tipo_pago;
   item.metodoPago = item.metodo_pago;
+  item.financingId = item.financing_id;
   item.montoPagado = item.monto_pagado;
   item.montoPendiente = item.monto_pendiente;
   item.fechaVencimiento = item.fecha_vencimiento;
@@ -228,7 +235,33 @@ function resolveCreditAccountByMetodoPago(metodoPago) {
     return { tipo: "credit_card", cuentaCodigo: CC, meta: { tarjetaId: metodoPago.replace("tarjeta_credito_", "") } };
   }
 
+  if (metodoPago === "tarjeta_credito") {
+    const CC = process.env.CTA_TARJETAS_CREDITO || "2101";
+    return { tipo: "credit_card", cuentaCodigo: CC, meta: {} };
+  }
+
   return { tipo: "other", cuentaCodigo: BANK, meta: {} };
+}
+
+function normalizeCorporateCardPayment(input = {}) {
+  const metodoPagoRaw = asTrim(input.metodo_pago ?? input.metodoPago);
+  const metodoPagoNormalized = normalizeMetodoPago(metodoPagoRaw);
+
+  let financingId = asTrim(input.financingId ?? input.financing_id, "");
+  let metodoPago = metodoPagoNormalized;
+
+  if (metodoPagoNormalized.startsWith("tarjeta_credito_")) {
+    financingId = financingId || metodoPagoNormalized.slice("tarjeta_credito_".length);
+    metodoPago = "tarjeta_credito";
+  }
+
+  const isCorporateCard = metodoPago === "tarjeta_credito";
+  return {
+    metodoPago,
+    financingId,
+    isCorporateCard,
+    metodoPagoRaw,
+  };
 }
 
 function isPrecargadosFlow(subtipoEgreso, reqBody) {
@@ -518,7 +551,10 @@ router.post("/", ensureAuth, async (req, res) => {
     }
 
     const tipoPago = normalizeTipoPago(req.body?.tipo_pago ?? req.body?.tipoPago);
-    const metodoPago = normalizeMetodoPago(req.body?.metodo_pago ?? req.body?.metodoPago);
+    const paymentInfo = normalizeCorporateCardPayment(req.body);
+    const metodoPago = paymentInfo.metodoPago;
+    const financingId = paymentInfo.financingId;
+    const isCorporateCardPayment = paymentInfo.isCorporateCard;
     const montoPagado = toNum(req.body?.monto_pagado ?? req.body?.montoPagado, 0);
 
     const fechaVencimiento = parseInputDateSmart(
@@ -584,6 +620,32 @@ router.post("/", ensureAuth, async (req, res) => {
       }
     }
 
+    if (tipoPago === "contado" && montoPagado > montoTotal) {
+      return res.status(400).json({
+        ok: false,
+        error: "VALIDATION",
+        message: "monto_pagado no puede ser mayor al monto total del egreso.",
+      });
+    }
+
+    if (isCorporateCardPayment) {
+      if (!financingId) {
+        return res.status(400).json({
+          ok: false,
+          error: "VALIDATION",
+          message: "financingId es requerido cuando metodo_pago es tarjeta_credito.",
+        });
+      }
+
+      if (!mongoose.Types.ObjectId.isValid(financingId)) {
+        return res.status(400).json({
+          ok: false,
+          error: "VALIDATION",
+          message: "financingId inválido para pago con tarjeta corporativa.",
+        });
+      }
+    }
+
     if (productoEgresoId) {
       const productDoc = await ExpenseProduct.findOne({ _id: productoEgresoId, owner }).lean();
       if (!productDoc) {
@@ -598,6 +660,23 @@ router.post("/", ensureAuth, async (req, res) => {
     const fixedMontoPagado = tipoPago === "contado" ? montoTotal : tipoPago === "parcial" ? montoPagado : 0;
     const fixedMontoPendiente =
       tipoPago === "contado" ? 0 : tipoPago === "parcial" ? Math.max(0, montoTotal - fixedMontoPagado) : montoTotal;
+
+    if (fixedMontoPagado > montoTotal) {
+      return res.status(400).json({
+        ok: false,
+        error: "VALIDATION",
+        message: "monto_pagado no puede exceder el monto total del egreso.",
+      });
+    }
+
+    let corporateCardContext = null;
+    if (isCorporateCardPayment) {
+      corporateCardContext = await prepareCorporateCardCharge({
+        owner,
+        financingId,
+        monto: fixedMontoPagado,
+      });
+    }
 
     const numeroAsiento = genNumeroAsiento(owner);
 
@@ -617,6 +696,7 @@ router.post("/", ensureAuth, async (req, res) => {
 
       tipoPago,
       metodoPago: metodoPago || null,
+      financingId: isCorporateCardPayment ? financingId : null,
 
       montoPagado: fixedMontoPagado,
       montoPendiente: fixedMontoPendiente,
@@ -647,7 +727,13 @@ router.post("/", ensureAuth, async (req, res) => {
       const cuentaPendiente =
         otrosGastos && (tipoPago === "credito" || tipoPago === "parcial") ? OTROS_ACREEDORES_2003 : PROVEEDORES_2001;
 
-      const creditInfo = resolveCreditAccountByMetodoPago(metodoPago);
+      const creditInfo = isCorporateCardPayment
+        ? {
+            tipo: "credit_card",
+            cuentaCodigo: corporateCardContext.liabilityAccountCode,
+            meta: { financingId },
+          }
+        : resolveCreditAccountByMetodoPago(metodoPago);
 
       const lines = [];
       const pushLine = ({ side, cuentaCodigo: code, monto, memo }) => {
@@ -727,6 +813,32 @@ router.post("/", ensureAuth, async (req, res) => {
       created.asientoId = asiento._id;
     }
 
+    let corporateCardCharge = null;
+    if (isCorporateCardPayment && fixedMontoPagado > 0) {
+      corporateCardCharge = await applyCorporateCardCharge({
+        owner,
+        financingId,
+        monto: fixedMontoPagado,
+        source: "egreso",
+        sourceModule: "egresos",
+        sourceId: created._id,
+        journalEntryId: asiento?._id || null,
+        fecha,
+        descripcion: `Egreso pagado con tarjeta corporativa - ${descripcion}`,
+        metodoPago,
+        moneda: "MXN",
+        tipoCambio: 1,
+        meta: {
+          expenseTransactionId: created._id,
+          numeroAsiento,
+          tipoPago,
+          montoTotal,
+          montoPagado: fixedMontoPagado,
+          montoPendiente: fixedMontoPendiente,
+        },
+      });
+    }
+
     const item = mapTxForUI(created);
 
     return res.status(201).json({
@@ -753,6 +865,11 @@ router.post("/", ensureAuth, async (req, res) => {
         otrosGastos,
         forcedCuentaCodigo: otrosGastos ? "5204" : null,
         reglaPendienteOtrosGastos: otrosGastos ? "credito/parcial => 2003" : null,
+        corporateCard: isCorporateCardPayment,
+        financingId: isCorporateCardPayment ? financingId : null,
+        financingMovementId: corporateCardCharge?.movement?._id
+          ? String(corporateCardCharge.movement._id)
+          : null,
         timezoneOffsetMinutes: TZ_OFFSET_MINUTES,
       },
 
@@ -762,7 +879,12 @@ router.post("/", ensureAuth, async (req, res) => {
     });
   } catch (err) {
     console.error("POST /api/egresos/transacciones error:", err);
-    return res.status(500).json({ ok: false, error: "SERVER_ERROR", message: err?.message || "SERVER_ERROR" });
+    const status = err?.statusCode || 500;
+    return res.status(status).json({
+      ok: false,
+      error: status === 404 ? "NOT_FOUND" : status >= 400 && status < 500 ? "VALIDATION" : "SERVER_ERROR",
+      message: err?.message || "SERVER_ERROR",
+    });
   }
 });
 

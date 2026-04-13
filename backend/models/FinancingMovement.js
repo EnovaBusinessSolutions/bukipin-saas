@@ -32,6 +32,7 @@ const financingMovementSchema = new Schema(
       enum: [
         "apertura",
         "disposicion",
+        "cargo_tarjeta",
         "amortizacion",
         "cargo_intereses",
         "pago_intereses",
@@ -154,6 +155,12 @@ const financingMovementSchema = new Schema(
       type: String,
       trim: true,
       default: "financiamiento",
+      index: true,
+    },
+    sourceModule: {
+      type: String,
+      trim: true,
+      default: "",
       index: true,
     },
     sourceId: {

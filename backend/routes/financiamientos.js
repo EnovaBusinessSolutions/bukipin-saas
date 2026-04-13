@@ -142,6 +142,7 @@ function normalizeTipoMovimiento(v) {
     apertura: "apertura",
     disposicion: "disposicion",
     desembolso: "disposicion",
+    cargo_tarjeta: "cargo_tarjeta",
     amortizacion: "amortizacion",
     cargo_intereses: "cargo_intereses",
     cargo_interes: "cargo_intereses",
@@ -365,7 +366,8 @@ function applyMovementToFinancing(financingLike, payload) {
       break;
     }
 
-    case "disposicion": {
+    case "disposicion":
+    case "cargo_tarjeta": {
       const capital = montoCapital || monto;
       f.saldo_dispuesto_actual += capital;
       f.saldo_capital_actual += capital;
@@ -464,6 +466,24 @@ function validateMovementAgainstFinancing(financing, payload) {
     const err = new Error("La disposición solo aplica a créditos revolventes.");
     err.statusCode = 400;
     throw err;
+  }
+
+  if (tipoMov === "cargo_tarjeta" && tipoFin !== "tarjeta_corporativa") {
+    const err = new Error("El cargo_tarjeta solo aplica a financiamientos de tipo tarjeta_credito.");
+    err.statusCode = 400;
+    throw err;
+  }
+
+  if (tipoMov === "cargo_tarjeta") {
+    const linea = Math.max(0, toNum(financing?.linea_credito, 0));
+    const saldoDispuestoActual = Math.max(0, toNum(financing?.saldo_dispuesto_actual, 0));
+    const disponible = Math.max(0, linea - saldoDispuestoActual);
+
+    if (montoCapital > disponible) {
+      const err = new Error("El cargo_tarjeta excede la línea de crédito disponible.");
+      err.statusCode = 400;
+      throw err;
+    }
   }
 
   if (tipoMov === "disposicion") {
@@ -705,6 +725,8 @@ function mapMovementForUI(doc) {
 
     journalEntryId: d.journalEntryId ? String(d.journalEntryId) : "",
     source: d.source || "financiamiento",
+    source_module: d.sourceModule || "",
+    sourceModule: d.sourceModule || "",
     sourceId: d.sourceId ? String(d.sourceId) : "",
 
     snapshot_after: {
@@ -742,6 +764,7 @@ function buildTarjetaTxForUI(m) {
   if (tipo === "amortizacion") tipoUI = "amortizacion";
   else if (tipo === "cargo_intereses") tipoUI = "cargo_interes";
   else if (tipo === "disposicion") tipoUI = "desembolso";
+  else if (tipo === "cargo_tarjeta") tipoUI = "cargo";
   else if (tipo === "egreso" || tipo === "capex") tipoUI = "cargo";
 
   return {
@@ -769,6 +792,7 @@ function buildTarjetaTxForUI(m) {
 function getTipoLabelFromMovement(tipo) {
   const labels = {
     apertura: "Apertura",
+    cargo_tarjeta: "Cargo a Tarjeta",
     disposicion: "Disposición",
     amortizacion: "Amortización",
     cargo_intereses: "Cargo por Intereses",
@@ -952,8 +976,9 @@ async function createMovementAndApply({ owner, financing, payload }) {
     beneficiario: asTrim(payload.beneficiario, ""),
     institucion: asTrim(payload.institucion || financing.institucion || "", ""),
 
-    source: "financiamiento",
-    sourceId: null,
+    source: asTrim(payload.source, "financiamiento"),
+    sourceModule: asTrim(payload.sourceModule ?? payload.source_module, ""),
+    sourceId: asObjectIdOrNull(payload.sourceId ?? payload.source_id),
 
     snapshot_after: {
       saldo_dispuesto_actual: nextState.saldo_dispuesto_actual,
@@ -971,18 +996,20 @@ async function createMovementAndApply({ owner, financing, payload }) {
     meta: payload.meta && typeof payload.meta === "object" ? payload.meta : {},
   });
 
-  const journalEntryId = await createJournalEntryBestEffort({
-    owner,
-    financing,
-    movement,
-    movementId: movement._id,
-  });
+  const journalEntryId =
+    asTrim(payload.journalEntryId ?? payload.journal_entry_id, "") ||
+    (await createJournalEntryBestEffort({
+      owner,
+      financing,
+      movement,
+      movementId: movement._id,
+    }));
 
   const movementUpdated = await FinancingMovement.findOneAndUpdate(
     { _id: movement._id, owner },
     {
       $set: {
-        sourceId: movement._id,
+        sourceId: movement.sourceId || movement._id,
         journalEntryId: journalEntryId ? new mongoose.Types.ObjectId(journalEntryId) : undefined,
       },
     },

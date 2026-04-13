@@ -45,6 +45,7 @@ const ExpenseTransactionSchema = new mongoose.Schema(
     // ✅ Pago
     tipoPago: { type: String, enum: ["contado", "credito", "parcial"], default: "contado", index: true },
     metodoPago: { type: String, default: null, trim: true, index: true },
+    financingId: { type: mongoose.Schema.Types.ObjectId, ref: "Financing", default: null, index: true },
 
     // ✅ Proveedor (opcional)
     proveedorId: { type: mongoose.Schema.Types.ObjectId, ref: "Proveedor", default: null, index: true },
