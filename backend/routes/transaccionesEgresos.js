@@ -264,6 +264,24 @@ function normalizeCorporateCardPayment(input = {}) {
   };
 }
 
+async function safeDeleteJournalEntry({ owner, journalEntryId }) {
+  try {
+    if (!JournalEntry || !journalEntryId) return;
+    await JournalEntry.deleteOne({ _id: journalEntryId, owner });
+  } catch (rollbackErr) {
+    console.error("safeDeleteJournalEntry rollback error:", rollbackErr?.message || rollbackErr);
+  }
+}
+
+async function safeDeleteExpenseTransaction({ owner, expenseTransactionId }) {
+  try {
+    if (!expenseTransactionId) return;
+    await ExpenseTransaction.deleteOne({ _id: expenseTransactionId, owner });
+  } catch (rollbackErr) {
+    console.error("safeDeleteExpenseTransaction rollback error:", rollbackErr?.message || rollbackErr);
+  }
+}
+
 function isPrecargadosFlow(subtipoEgreso, reqBody) {
   const sub = String(subtipoEgreso || "").trim().toLowerCase();
   const src = String(reqBody?.source ?? reqBody?.origen ?? reqBody?.from ?? "").trim().toLowerCase();
@@ -644,6 +662,14 @@ router.post("/", ensureAuth, async (req, res) => {
           message: "financingId inválido para pago con tarjeta corporativa.",
         });
       }
+
+      if (!JournalEntry) {
+        return res.status(500).json({
+          ok: false,
+          error: "SERVER_ERROR",
+          message: "No se puede registrar un egreso con tarjeta corporativa sin JournalEntry disponible.",
+        });
+      }
     }
 
     if (productoEgresoId) {
@@ -717,10 +743,14 @@ router.post("/", ensureAuth, async (req, res) => {
     const txProductField = getTxProductField();
     if (productoEgresoId) txPayload[txProductField] = productoEgresoId;
 
-    const created = await ExpenseTransaction.create(txPayload);
-
+    let created = null;
     let asiento = null;
-    if (JournalEntry) {
+    let corporateCardCharge = null;
+
+    try {
+      created = await ExpenseTransaction.create(txPayload);
+
+      if (JournalEntry) {
       const PROVEEDORES_2001 = process.env.CTA_CXP || "2001";
       const OTROS_ACREEDORES_2003 = process.env.CTA_OTROS_ACREEDORES || "2003";
 
@@ -809,37 +839,54 @@ router.post("/", ensureAuth, async (req, res) => {
         lines,
       });
 
-      await ExpenseTransaction.updateOne({ _id: created._id, owner }, { $set: { asientoId: asiento._id } });
-      created.asientoId = asiento._id;
+        const asientoLinkResult = await ExpenseTransaction.updateOne(
+          { _id: created._id, owner },
+          { $set: { asientoId: asiento._id } }
+        );
+        const asientoLinked =
+          (typeof asientoLinkResult?.matchedCount === "number" && asientoLinkResult.matchedCount > 0) ||
+          (typeof asientoLinkResult?.n === "number" && asientoLinkResult.n > 0);
+        if (!asientoLinked) {
+          const err = new Error("No se pudo ligar el asiento contable al egreso.");
+          err.statusCode = 500;
+          throw err;
+        }
+      }
+
+      if (isCorporateCardPayment && fixedMontoPagado > 0) {
+        corporateCardCharge = await applyCorporateCardCharge({
+          owner,
+          financingId,
+          monto: fixedMontoPagado,
+          source: "egreso",
+          sourceModule: "egresos",
+          sourceId: created._id,
+          journalEntryId: asiento?._id || null,
+          fecha,
+          descripcion: `Egreso pagado con tarjeta corporativa - ${descripcion}`,
+          metodoPago,
+          moneda: "MXN",
+          tipoCambio: 1,
+          meta: {
+            expenseTransactionId: created._id,
+            numeroAsiento,
+            tipoPago,
+            montoTotal,
+            montoPagado: fixedMontoPagado,
+            montoPendiente: fixedMontoPendiente,
+          },
+        });
+      }
+    } catch (flowErr) {
+      if (isCorporateCardPayment) {
+        await safeDeleteJournalEntry({ owner, journalEntryId: asiento?._id || null });
+        await safeDeleteExpenseTransaction({ owner, expenseTransactionId: created?._id || null });
+      }
+      throw flowErr;
     }
 
-    let corporateCardCharge = null;
-    if (isCorporateCardPayment && fixedMontoPagado > 0) {
-      corporateCardCharge = await applyCorporateCardCharge({
-        owner,
-        financingId,
-        monto: fixedMontoPagado,
-        source: "egreso",
-        sourceModule: "egresos",
-        sourceId: created._id,
-        journalEntryId: asiento?._id || null,
-        fecha,
-        descripcion: `Egreso pagado con tarjeta corporativa - ${descripcion}`,
-        metodoPago,
-        moneda: "MXN",
-        tipoCambio: 1,
-        meta: {
-          expenseTransactionId: created._id,
-          numeroAsiento,
-          tipoPago,
-          montoTotal,
-          montoPagado: fixedMontoPagado,
-          montoPendiente: fixedMontoPendiente,
-        },
-      });
-    }
-
-    const item = mapTxForUI(created);
+    const finalTx = (await ExpenseTransaction.findOne({ _id: created._id, owner }).lean()) || created;
+    const item = mapTxForUI(finalTx);
 
     return res.status(201).json({
       ok: true,

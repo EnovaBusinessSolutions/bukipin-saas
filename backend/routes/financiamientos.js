@@ -154,8 +154,6 @@ function normalizeTipoMovimiento(v) {
     ajuste: "ajuste",
     cancelacion: "cancelacion",
     refinanciamiento: "refinanciamiento",
-    egreso: "egreso",
-    capex: "capex",
     otro: "otro",
   };
   return aliases[s] || "otro";
@@ -189,7 +187,9 @@ function getLegacyEstado(doc) {
 }
 
 function getLegacyTipoMovimiento(doc) {
-  return normalizeTipoMovimiento(doc?.tipo || doc?.tipo_transaccion || "otro");
+  const raw = asTrim(doc?.tipo || doc?.tipo_transaccion || "otro", "").toLowerCase();
+  if (raw === "egreso" || raw === "capex") return raw;
+  return normalizeTipoMovimiento(raw || "otro");
 }
 
 function isOpenFacilityType(doc) {
