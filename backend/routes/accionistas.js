@@ -240,7 +240,7 @@ router.post("/redistribucion", ensureAuth, async (req, res) => {
 
   try {
     const owner = req.user._id;
-    const requireExactTotal = req.body?.require_exact_total !== false;
+    const requireExactTotal = req.body?.require_exact_total === true;
     const ajustes = Array.isArray(req.body?.ajustes) ? req.body.ajustes : [];
     const nuevoAccionista = req.body?.nuevoAccionista || null;
 
