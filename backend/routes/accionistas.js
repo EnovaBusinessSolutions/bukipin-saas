@@ -444,15 +444,27 @@ router.delete("/:id", ensureAuth, async (req, res) => {
       });
     }
 
+    const current = await Shareholder.findOne({ _id: id, owner });
+    if (!current) {
+      return res.status(404).json({ ok: false, error: "NOT_FOUND" });
+    }
+
+    const existing = await listOwnerShareholders(owner);
+    const simulated = existing.map((item) => {
+      const plain = item.toObject ? item.toObject() : item;
+      if (String(item._id) !== id) return plain;
+      return {
+        ...plain,
+        activo: false,
+      };
+    });
+    validateShareholderState(simulated);
+
     const updated = await Shareholder.findOneAndUpdate(
       { _id: id, owner },
       { $set: { activo: false } },
       { new: true }
     );
-
-    if (!updated) {
-      return res.status(404).json({ ok: false, error: "NOT_FOUND" });
-    }
 
     const item = normalizeItem(updated);
     return res.json({

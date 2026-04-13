@@ -5,6 +5,7 @@ const ensureAuth = require("../middleware/ensureAuth");
 
 const CapitalTransaction = require("../models/CapitalTransaction");
 const Shareholder = require("../models/Shareholder");
+const { parseInputDateSmart } = require("../utils/datetime");
 
 let JournalEntry = null;
 try {
@@ -30,7 +31,7 @@ function toNum(v, def = 0) {
 
 function asDateOrNull(v) {
   if (!v) return null;
-  const d = new Date(v);
+  const d = parseInputDateSmart(v, new Date());
   return Number.isNaN(d.getTime()) ? null : d;
 }
 
@@ -404,6 +405,16 @@ router.post("/transacciones", ensureAuth, async (req, res) => {
       reversal: false,
     });
 
+    if (JournalEntry && !journalEntryId) {
+      await CapitalTransaction.deleteOne({ _id: tx._id, owner });
+      return res.status(500).json({
+        ok: false,
+        error: "JOURNAL_ENTRY_REQUIRED",
+        message:
+          "No se pudo generar el asiento contable de la transacción de capital. El movimiento no fue guardado.",
+      });
+    }
+
     if (journalEntryId) {
       tx = await CapitalTransaction.findOneAndUpdate(
         { _id: tx._id, owner },
@@ -480,6 +491,15 @@ router.post("/cancelar", ensureAuth, async (req, res) => {
       reversal: true,
       motivoCancelacion,
     });
+
+    if (JournalEntry && !journalEntryId) {
+      return res.status(500).json({
+        ok: false,
+        error: "REVERSAL_JOURNAL_ENTRY_REQUIRED",
+        message:
+          "No se pudo generar el asiento de reversión. La transacción sigue activa y no fue cancelada.",
+      });
+    }
 
     const updated = await CapitalTransaction.findOneAndUpdate(
       { _id: tx._id, owner },

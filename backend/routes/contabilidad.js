@@ -150,6 +150,7 @@ function buildEntryDateOrConditions(start, end) {
     conditions.push({ entryDate: { $gte: start, $lte: end } });
     conditions.push({ asiento_fecha: { $gte: start, $lte: end } });
     conditions.push({ asientoFecha: { $gte: start, $lte: end } });
+    conditions.push({ createdAt: { $gte: start, $lte: end } });
     return conditions;
   }
 
@@ -159,6 +160,7 @@ function buildEntryDateOrConditions(start, end) {
     conditions.push({ entryDate: { $lte: end } });
     conditions.push({ asiento_fecha: { $lte: end } });
     conditions.push({ asientoFecha: { $lte: end } });
+    conditions.push({ createdAt: { $lte: end } });
     return conditions;
   }
 
@@ -168,6 +170,7 @@ function buildEntryDateOrConditions(start, end) {
     conditions.push({ entryDate: { $gte: start } });
     conditions.push({ asiento_fecha: { $gte: start } });
     conditions.push({ asientoFecha: { $gte: start } });
+    conditions.push({ createdAt: { $gte: start } });
     return conditions;
   }
 
