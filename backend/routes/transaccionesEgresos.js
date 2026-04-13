@@ -243,6 +243,38 @@ function resolveCreditAccountByMetodoPago(metodoPago) {
   return { tipo: "other", cuentaCodigo: BANK, meta: {} };
 }
 
+function resolveCorporateCardLiabilityAccountCode(corporateCardContext) {
+  const fallback = String(process.env.CTA_TARJETAS_CREDITO || "2101").trim();
+  const candidate = String(corporateCardContext?.liabilityAccountCode || "").trim();
+  return candidate || fallback;
+}
+
+function validateJournalLinesOrThrow({ lines, context = {} }) {
+  const invalidLine = (Array.isArray(lines) ? lines : []).find((line) => {
+    const accountCodigo = String(
+      line?.accountCodigo || line?.accountCode || line?.cuentaCodigo || line?.cuenta_codigo || ""
+    ).trim();
+    const accountId = line?.accountId ? String(line.accountId).trim() : "";
+    return !accountCodigo && !accountId;
+  });
+
+  if (!invalidLine) return;
+
+  const err = new Error(
+    `Asiento inválido: existe una línea sin accountCodigo/accountId en transaccionesEgresos (${JSON.stringify({
+      tipoPago: context.tipoPago || "",
+      metodoPago: context.metodoPago || "",
+      financingId: context.financingId || "",
+      numeroAsiento: context.numeroAsiento || "",
+      lineMemo: invalidLine?.memo || "",
+      debit: toNum(invalidLine?.debit, 0),
+      credit: toNum(invalidLine?.credit, 0),
+    })})`
+  );
+  err.statusCode = 400;
+  throw err;
+}
+
 function normalizeCorporateCardPayment(input = {}) {
   const metodoPagoRaw = asTrim(input.metodo_pago ?? input.metodoPago);
   const metodoPagoNormalized = normalizeMetodoPago(metodoPagoRaw);
@@ -760,7 +792,7 @@ router.post("/", ensureAuth, async (req, res) => {
       const creditInfo = isCorporateCardPayment
         ? {
             tipo: "credit_card",
-            cuentaCodigo: corporateCardContext.liabilityAccountCode,
+            cuentaCodigo: resolveCorporateCardLiabilityAccountCode(corporateCardContext),
             meta: { financingId },
           }
         : resolveCreditAccountByMetodoPago(metodoPago);
@@ -826,6 +858,16 @@ router.post("/", ensureAuth, async (req, res) => {
       }
 
       const conceptText = `Egreso: ${descripcion}`;
+
+      validateJournalLinesOrThrow({
+        lines,
+        context: {
+          tipoPago,
+          metodoPago,
+          financingId,
+          numeroAsiento,
+        },
+      });
 
       asiento = await JournalEntry.create({
         owner,

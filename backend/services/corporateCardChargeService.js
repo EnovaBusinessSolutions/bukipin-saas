@@ -116,10 +116,10 @@ async function prepareCorporateCardCharge({ owner, financingId, monto }) {
   }
 
   const nextState = buildCorporateCardNextState(current, amount);
-  const liabilityAccountCode = asTrim(
-    current.cuenta_pasivo_codigo,
-    process.env.CTA_TARJETAS_CREDITO || "2101"
-  );
+  const liabilityAccountCode =
+    asTrim(current.cuenta_pasivo_codigo, "") ||
+    asTrim(process.env.CTA_TARJETAS_CREDITO, "") ||
+    "2101";
 
   return {
     financing,
