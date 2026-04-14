@@ -5,6 +5,11 @@ const router = express.Router();
 const mongoose = require("mongoose");
 const ensureAuth = require("../middleware/ensureAuth");
 const { applyEntrada, computeSaleCost, pickAvgCost, pickStock, pickInventoryValue } = require("../services/inventoryCostEngine");
+const ExpenseTransaction = require("../models/ExpenseTransaction");
+const {
+  prepareCorporateCardCharge,
+  applyCorporateCardCharge,
+} = require("../services/corporateCardChargeService");
 
 // Modelos
 let InventoryMovement = null;
@@ -221,6 +226,22 @@ function parseTipoPago(body) {
   return String(raw).toLowerCase().trim();
 }
 
+function normalizeTipoPago(v) {
+  const s = String(v || "").toLowerCase().trim();
+  if (["contado", "total", "pago_total"].includes(s)) return "contado";
+  if (["credito", "crédito", "pendiente"].includes(s)) return "credito";
+  if (["parcial", "parciales"].includes(s)) return "parcial";
+  return s;
+}
+
+function normalizeMetodoPago(v) {
+  const s = String(v || "").toLowerCase().trim();
+  if (!s) return "";
+  if (s === "transferencia" || s === "tarjeta-transferencia") return "bancos";
+  if (s === "tarjeta_corporativa") return "tarjeta_credito";
+  return s;
+}
+
 function isCredito(tipoPago) {
   const t = String(tipoPago || "").toLowerCase();
   return (
@@ -249,6 +270,38 @@ function pickNumeroAsientoFromBody(body) {
   if (!raw) return null;
   const s = String(raw).trim();
   return s || null;
+}
+
+function normalizeCorporateCardPayment(input = {}) {
+  const metodoPagoRaw = String(input?.metodo_pago ?? input?.metodoPago ?? "").trim();
+  const metodoPagoNormalized = normalizeMetodoPago(metodoPagoRaw);
+
+  let financingId = String(input?.financingId ?? input?.financing_id ?? "").trim();
+  let metodoPago = metodoPagoNormalized;
+
+  if (metodoPagoNormalized.startsWith("tarjeta_credito_")) {
+    financingId = financingId || metodoPagoNormalized.slice("tarjeta_credito_".length);
+    metodoPago = "tarjeta_credito";
+  }
+
+  return {
+    metodoPago,
+    financingId,
+    isCorporateCard: metodoPago === "tarjeta_credito",
+    metodoPagoRaw,
+  };
+}
+
+function resolvePaymentAccountByMetodoPago(metodoPago, corporateCardContext = null) {
+  const CASH = process.env.CTA_EFECTIVO || "1001";
+  const BANK = process.env.CTA_BANCOS || "1002";
+  const CC = corporateCardContext?.liabilityAccountCode || process.env.CTA_TARJETAS_CREDITO || "2101";
+
+  if (!metodoPago) return { tipo: "unknown", cuentaCodigo: BANK };
+  if (metodoPago === "efectivo") return { tipo: "cash", cuentaCodigo: CASH };
+  if (metodoPago === "bancos") return { tipo: "bank", cuentaCodigo: BANK };
+  if (metodoPago === "tarjeta_credito") return { tipo: "credit_card", cuentaCodigo: CC };
+  return { tipo: "other", cuentaCodigo: BANK };
 }
 
 // --------------------
@@ -530,6 +583,9 @@ function mapMovementForUI(m) {
 
   const asientoId = m.asientoId || m.asiento_id || m.journalEntryId || m.journal_entry_id || null;
   const numeroAsiento = m.numeroAsiento || m.numero_asiento || null;
+  const financingId = m.financingId || m.financing_id || null;
+  const financingMovementId = m.financingMovementId || m.financing_movement_id || null;
+  const expenseTransactionId = m.expenseTransactionId || m.expense_transaction_id || null;
 
   return {
     id: String(m._id),
@@ -557,6 +613,30 @@ function mapMovementForUI(m) {
 
     descripcion: m.descripcion ?? m.memo ?? m.concepto ?? m.nota ?? "",
     referencia: m.referencia ?? m.ref ?? "",
+
+    tipo_pago: m.tipoPago ?? m.tipo_pago ?? "",
+    tipoPago: m.tipoPago ?? m.tipo_pago ?? "",
+    metodo_pago: m.metodoPago ?? m.metodo_pago ?? "",
+    metodoPago: m.metodoPago ?? m.metodo_pago ?? "",
+    monto_pagado: num(m.montoPagado ?? m.monto_pagado ?? 0, 0),
+    montoPagado: num(m.montoPagado ?? m.monto_pagado ?? 0, 0),
+    monto_pendiente: num(m.montoPendiente ?? m.monto_pendiente ?? 0, 0),
+    montoPendiente: num(m.montoPendiente ?? m.monto_pendiente ?? 0, 0),
+    fecha_vencimiento: m.fechaVencimiento ?? m.fecha_vencimiento ?? null,
+    fechaVencimiento: m.fechaVencimiento ?? m.fecha_vencimiento ?? null,
+
+    proveedor_id: m.proveedorId ? String(m.proveedorId) : m.proveedor_id ? String(m.proveedor_id) : null,
+    proveedor_nombre: m.proveedorNombre ?? m.proveedor_nombre ?? null,
+    proveedor_telefono: m.proveedorTelefono ?? m.proveedor_telefono ?? null,
+    proveedor_email: m.proveedorEmail ?? m.proveedor_email ?? null,
+    proveedor_rfc: m.proveedorRfc ?? m.proveedor_rfc ?? null,
+
+    financingId: financingId ? String(financingId) : null,
+    financing_id: financingId ? String(financingId) : null,
+    financingMovementId: financingMovementId ? String(financingMovementId) : null,
+    financing_movement_id: financingMovementId ? String(financingMovementId) : null,
+    expenseTransactionId: expenseTransactionId ? String(expenseTransactionId) : null,
+    expense_transaction_id: expenseTransactionId ? String(expenseTransactionId) : null,
 
     asientoId: asientoId ? String(asientoId) : null,
     asiento_id: asientoId ? String(asientoId) : null,
@@ -880,6 +960,84 @@ router.post("/", ensureAuth, async (req, res) => {
     const numeroAsientoExterno = pickNumeroAsientoFromBody(req.body) || null;
 
     const prodOid = new mongoose.Types.ObjectId(productoId);
+    const isPurchaseEntry = isEntrada(tipo);
+    const tipoPago = normalizeTipoPago(parseTipoPago(req.body) || (isPurchaseEntry ? "contado" : ""));
+    const paymentInfo = normalizeCorporateCardPayment(req.body || {});
+    const metodoPago = paymentInfo.metodoPago;
+    const financingId = paymentInfo.financingId;
+    const isCorporateCardPayment = paymentInfo.isCorporateCard;
+    const requestedMontoPagado = num(req.body?.montoPagado ?? req.body?.monto_pagado, 0);
+    const fechaVencimiento =
+      req.body?.fechaVencimiento ?? req.body?.fecha_vencimiento
+        ? new Date(req.body?.fechaVencimiento ?? req.body?.fecha_vencimiento)
+        : null;
+
+    const proveedorIdRaw = req.body?.proveedorId ?? req.body?.proveedor_id ?? null;
+    const proveedorId = toObjectId(proveedorIdRaw);
+    const proveedorNombre = String(req.body?.proveedorNombre ?? req.body?.proveedor_nombre ?? "").trim() || null;
+    const proveedorTelefono = String(req.body?.proveedorTelefono ?? req.body?.proveedor_telefono ?? "").trim() || null;
+    const proveedorEmail = String(req.body?.proveedorEmail ?? req.body?.proveedor_email ?? "").trim() || null;
+    const proveedorRfc = String(req.body?.proveedorRfc ?? req.body?.proveedor_rfc ?? "").trim() || null;
+
+    let fixedMontoPagado = 0;
+    let fixedMontoPendiente = 0;
+    if (isPurchaseEntry) {
+      if (!["contado", "credito", "parcial"].includes(tipoPago)) {
+        return res.status(400).json({ ok: false, message: "tipo_pago inválido para compra de inventario." });
+      }
+
+      fixedMontoPagado =
+        tipoPago === "contado" ? costoTotal : tipoPago === "parcial" ? requestedMontoPagado : 0;
+      fixedMontoPendiente =
+        tipoPago === "contado" ? 0 : tipoPago === "parcial" ? Math.max(0, costoTotal - fixedMontoPagado) : costoTotal;
+
+      if ((tipoPago === "contado" || tipoPago === "parcial") && !metodoPago) {
+        return res.status(400).json({ ok: false, message: "metodo_pago es requerido para compras contado/parcial." });
+      }
+
+      if (tipoPago === "parcial" && (!(fixedMontoPagado > 0) || !(fixedMontoPagado < costoTotal))) {
+        return res.status(400).json({
+          ok: false,
+          message: "En pago parcial, monto_pagado debe ser mayor a 0 y menor al total.",
+        });
+      }
+
+      if (tipoPago === "credito" || tipoPago === "parcial") {
+        if (!proveedorId && !proveedorNombre) {
+          return res.status(400).json({
+            ok: false,
+            message: "Proveedor requerido cuando la compra de inventario tiene saldo pendiente.",
+          });
+        }
+        if (fechaVencimiento && Number.isNaN(fechaVencimiento.getTime())) {
+          return res.status(400).json({ ok: false, message: "fecha_vencimiento inválida." });
+        }
+      }
+
+      if (isCorporateCardPayment) {
+        if (!financingId) {
+          return res.status(400).json({
+            ok: false,
+            message: "financingId es requerido cuando metodo_pago es tarjeta_credito.",
+          });
+        }
+        if (!isValidObjectId(financingId)) {
+          return res.status(400).json({
+            ok: false,
+            message: "financingId inválido para pago con tarjeta corporativa.",
+          });
+        }
+      }
+    }
+
+    let corporateCardContext = null;
+    if (isPurchaseEntry && isCorporateCardPayment && fixedMontoPagado > 0) {
+      corporateCardContext = await prepareCorporateCardCharge({
+        owner,
+        financingId,
+        monto: fixedMontoPagado,
+      });
+    }
 
 
     // ✅ Motor CPP: backend como fuente de verdad de stock + costo promedio
@@ -994,6 +1152,19 @@ router.post("/", ensureAuth, async (req, res) => {
       total: costoTotal,
 
       nota: descripcion || "",
+      tipoPago: isPurchaseEntry ? tipoPago : "",
+      metodoPago: isPurchaseEntry ? metodoPago || "" : "",
+      montoPagado: isPurchaseEntry ? fixedMontoPagado : 0,
+      montoPendiente: isPurchaseEntry ? fixedMontoPendiente : 0,
+      fechaVencimiento: isPurchaseEntry && (tipoPago === "credito" || tipoPago === "parcial") ? fechaVencimiento : null,
+      financingId: isPurchaseEntry && isCorporateCardPayment ? financingId : null,
+      financingMovementId: null,
+      proveedorId: isPurchaseEntry ? proveedorId : null,
+      proveedorNombre: isPurchaseEntry ? proveedorNombre : null,
+      proveedorTelefono: isPurchaseEntry ? proveedorTelefono : null,
+      proveedorEmail: isPurchaseEntry ? proveedorEmail : null,
+      proveedorRfc: isPurchaseEntry ? proveedorRfc : null,
+      expenseTransactionId: null,
       source: req.body?.source ? String(req.body.source) : "ui",
       sourceId: req.body?.sourceId ? String(req.body.sourceId) : null,
 
@@ -1011,6 +1182,14 @@ router.post("/", ensureAuth, async (req, res) => {
 
       costoTotal,
       costo_total: costoTotal,
+
+      tipo_pago: isPurchaseEntry ? tipoPago : "",
+      metodo_pago: isPurchaseEntry ? metodoPago || "" : "",
+      monto_pagado: isPurchaseEntry ? fixedMontoPagado : 0,
+      monto_pendiente: isPurchaseEntry ? fixedMontoPendiente : 0,
+      fecha_vencimiento: isPurchaseEntry && (tipoPago === "credito" || tipoPago === "parcial") ? fechaVencimiento : null,
+      financing_id: isPurchaseEntry && isCorporateCardPayment ? financingId : null,
+      financing_movement_id: undefined,
 
       stockAntes: cppSnapshot.stockAntes,
       stockDespues: cppSnapshot.stockDespues,
@@ -1064,21 +1243,12 @@ router.post("/", ensureAuth, async (req, res) => {
 
           // ENTRADA
           if (isEntrada(tipo)) {
-            const metodoPago = parseMetodoPago(req.body);
-            const tipoPago = parseTipoPago(req.body);
+            const paymentAccount = resolvePaymentAccountByMetodoPago(metodoPago, corporateCardContext);
 
-            const usarProveedores = isCredito(tipoPago);
-            const usarBancos =
-              metodoPago.includes("banco") ||
-              metodoPago.includes("transfer") ||
-              metodoPago.includes("tarjeta") ||
-              metodoPago.includes("tdd") ||
-              metodoPago.includes("tdc");
-
-            const contraCode = usarProveedores ? provCode : usarBancos ? bancosCode : cajaCode;
-
-            if (!contraCode) {
-              asientoWarning = "No se pudo generar asiento de compra: falta Caja/Bancos/Proveedores.";
+            if ((tipoPago === "credito" || tipoPago === "parcial") && !provCode) {
+              asientoWarning = "No se pudo generar asiento de compra: falta cuenta de Proveedores.";
+            } else if ((tipoPago === "contado" || tipoPago === "parcial") && !paymentAccount.cuentaCodigo) {
+              asientoWarning = "No se pudo generar asiento de compra: falta cuenta del metodo de pago.";
             } else {
               lines.push(
                 await buildLine(owner, {
@@ -1089,14 +1259,52 @@ router.post("/", ensureAuth, async (req, res) => {
                 })
               );
 
-              lines.push(
-                await buildLine(owner, {
-                  code: contraCode,
-                  debit: 0,
-                  credit: Math.abs(costoTotal),
-                  memo: usarProveedores ? "Compra a crédito (Proveedores)" : "Pago compra inventario",
-                })
-              );
+              if (tipoPago === "contado") {
+                lines.push(
+                  await buildLine(owner, {
+                    code: paymentAccount.cuentaCodigo,
+                    debit: 0,
+                    credit: Math.abs(costoTotal),
+                    memo:
+                      paymentAccount.tipo === "credit_card"
+                        ? "Pago compra inventario con tarjeta corporativa"
+                        : "Pago compra inventario",
+                  })
+                );
+              } else if (tipoPago === "credito") {
+                lines.push(
+                  await buildLine(owner, {
+                    code: provCode,
+                    debit: 0,
+                    credit: Math.abs(costoTotal),
+                    memo: "Compra a credito (Proveedores)",
+                  })
+                );
+              } else if (tipoPago === "parcial") {
+                if (fixedMontoPagado > 0) {
+                  lines.push(
+                    await buildLine(owner, {
+                      code: paymentAccount.cuentaCodigo,
+                      debit: 0,
+                      credit: Math.abs(fixedMontoPagado),
+                      memo:
+                        paymentAccount.tipo === "credit_card"
+                          ? "Pago parcial con tarjeta corporativa"
+                          : "Pago parcial compra inventario",
+                    })
+                  );
+                }
+                if (fixedMontoPendiente > 0) {
+                  lines.push(
+                    await buildLine(owner, {
+                      code: provCode,
+                      debit: 0,
+                      credit: Math.abs(fixedMontoPendiente),
+                      memo: "Saldo pendiente compra inventario (Proveedores)",
+                    })
+                  );
+                }
+              }
             }
           }
 
@@ -1160,6 +1368,75 @@ router.post("/", ensureAuth, async (req, res) => {
       }
     }
 
+    let corporateCardCharge = null;
+    if (isPurchaseEntry && isCorporateCardPayment && fixedMontoPagado > 0) {
+      corporateCardCharge = await applyCorporateCardCharge({
+        owner,
+        financingId,
+        monto: fixedMontoPagado,
+        source: "inventario",
+        sourceModule: "inventario",
+        sourceId: created._id,
+        journalEntryId: asientoId || null,
+        fecha,
+        descripcion:
+          descripcion || `Compra de inventario pagada con tarjeta corporativa (${productDoc?.nombre || "producto"})`,
+        metodoPago,
+        moneda: "MXN",
+        tipoCambio: 1,
+        meta: {
+          inventoryMovementId: created._id,
+          productId: prodOid,
+          quantity: qtyCanon,
+          montoTotal: costoTotal,
+          montoPagado: fixedMontoPagado,
+          montoPendiente: fixedMontoPendiente,
+          numeroAsiento: numeroAsiento || null,
+        },
+      });
+
+      created.financingId = financingId;
+      created.financingMovementId = corporateCardCharge?.movement?._id || null;
+      await created.save();
+    }
+
+    let expenseTransactionId = null;
+    if (isPurchaseEntry && fixedMontoPendiente > 0) {
+      const expenseTx = await ExpenseTransaction.create({
+        owner,
+        tipo: "costo",
+        tipoEgreso: "costo",
+        subtipoEgreso: "inventario",
+        fecha,
+        fechaVencimiento: tipoPago === "parcial" || tipoPago === "credito" ? fechaVencimiento || null : null,
+        cantidad: qtyCanon,
+        precioUnitario: costoUnitario,
+        montoTotal: costoTotal,
+        montoPagado: fixedMontoPagado,
+        montoPendiente: fixedMontoPendiente,
+        total: costoTotal,
+        cuentaCodigo: "1005",
+        subcuentaId: null,
+        numeroAsiento: numeroAsiento || null,
+        asientoId: asientoId || null,
+        tipoPago,
+        metodoPago: metodoPago || null,
+        financingId: isCorporateCardPayment ? financingId : null,
+        proveedorId: proveedorId || null,
+        proveedorNombre,
+        proveedorTelefono,
+        proveedorEmail,
+        proveedorRfc,
+        descripcion:
+          descripcion || `Compra de inventario: ${qtyCanon} unidades de ${productDoc?.nombre || "producto"}`,
+        comentarios: `inventoryMovementId:${String(created._id)}`,
+      });
+
+      expenseTransactionId = String(expenseTx._id);
+      created.expenseTransactionId = expenseTx._id;
+      await created.save();
+    }
+
     const fresh = await InventoryMovement.findOne({ _id: created._id, owner })
       .populate("productId", "nombre name imagen_url imagenUrl image sku codigo code costoCompra costo_compra precio price")
       .lean();
@@ -1169,6 +1446,14 @@ router.post("/", ensureAuth, async (req, res) => {
       data: mapMovementForUI(fresh || created),
       asientoId: asientoId || null,
       numeroAsiento: numeroAsiento || null,
+      meta: {
+        corporateCard: isCorporateCardPayment,
+        financingId: isCorporateCardPayment ? financingId : null,
+        financingMovementId: corporateCardCharge?.movement?._id
+          ? String(corporateCardCharge.movement._id)
+          : null,
+        expenseTransactionId,
+      },
       warning: asientoWarning || null,
     });
   } catch (err) {

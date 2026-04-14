@@ -50,6 +50,33 @@ const inventoryMovementSchema = new mongoose.Schema(
     nota: { type: String, default: "" },
     referencia: { type: String, default: "" },
 
+    // Pago / trazabilidad financiera
+    tipoPago: { type: String, default: "", trim: true, index: true },
+    metodoPago: { type: String, default: "", trim: true, index: true },
+    montoPagado: { type: Number, default: 0 },
+    montoPendiente: { type: Number, default: 0 },
+    fechaVencimiento: { type: Date, default: null, index: true },
+    financingId: { type: mongoose.Schema.Types.ObjectId, ref: "Financing", default: null, index: true },
+    financingMovementId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "FinancingMovement",
+      default: null,
+      index: true,
+    },
+
+    proveedorId: { type: mongoose.Schema.Types.ObjectId, ref: "Proveedor", default: null, index: true },
+    proveedorNombre: { type: String, default: null, trim: true },
+    proveedorTelefono: { type: String, default: null, trim: true },
+    proveedorEmail: { type: String, default: null, trim: true },
+    proveedorRfc: { type: String, default: null, trim: true },
+
+    expenseTransactionId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "ExpenseTransaction",
+      default: null,
+      index: true,
+    },
+
     // Trazabilidad
     source: { type: String, default: "" }, // ui | inventario | venta | compra | etc.
     sourceId: { type: mongoose.Schema.Types.ObjectId, default: null },
@@ -241,6 +268,69 @@ inventoryMovementSchema
   })
   .set(function (v) {
     this.nota = v;
+  });
+
+inventoryMovementSchema
+  .virtual("tipo_pago")
+  .get(function () {
+    return this.tipoPago;
+  })
+  .set(function (v) {
+    this.tipoPago = v;
+  });
+
+inventoryMovementSchema
+  .virtual("metodo_pago")
+  .get(function () {
+    return this.metodoPago;
+  })
+  .set(function (v) {
+    this.metodoPago = v;
+  });
+
+inventoryMovementSchema
+  .virtual("monto_pagado")
+  .get(function () {
+    return this.montoPagado;
+  })
+  .set(function (v) {
+    this.montoPagado = v;
+  });
+
+inventoryMovementSchema
+  .virtual("monto_pendiente")
+  .get(function () {
+    return this.montoPendiente;
+  })
+  .set(function (v) {
+    this.montoPendiente = v;
+  });
+
+inventoryMovementSchema
+  .virtual("fecha_vencimiento")
+  .get(function () {
+    return this.fechaVencimiento;
+  })
+  .set(function (v) {
+    this.fechaVencimiento = v;
+  });
+
+inventoryMovementSchema
+  .virtual("financing_id")
+  .get(function () {
+    return this.financingId;
+  })
+  .set(function (v) {
+    this.financingId = v;
+  });
+
+inventoryMovementSchema
+  .virtual("financing_movement_id")
+  .get(function () {
+    return this.financingMovementId;
+  })
+  .set(function (v) {
+    this.financingMovementId = v;
   });
 
 // ✅ Compat contable: asiento_id / journalEntryId / journal_entry_id -> asientoId

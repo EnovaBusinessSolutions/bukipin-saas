@@ -154,6 +154,26 @@ function normalizeMovement(m) {
     fecha,
     descripcion: m?.descripcion ?? m?.nota ?? "",
     referencia: m?.referencia ?? "",
+    tipo_pago: m?.tipoPago ?? m?.tipo_pago ?? "",
+    tipoPago: m?.tipoPago ?? m?.tipo_pago ?? "",
+    metodo_pago: m?.metodoPago ?? m?.metodo_pago ?? "",
+    metodoPago: m?.metodoPago ?? m?.metodo_pago ?? "",
+    monto_pagado: num(m?.montoPagado ?? m?.monto_pagado ?? 0, 0),
+    montoPagado: num(m?.montoPagado ?? m?.monto_pagado ?? 0, 0),
+    monto_pendiente: num(m?.montoPendiente ?? m?.monto_pendiente ?? 0, 0),
+    montoPendiente: num(m?.montoPendiente ?? m?.monto_pendiente ?? 0, 0),
+    financingId: m?.financingId ? String(m.financingId) : m?.financing_id ? String(m.financing_id) : null,
+    financing_id: m?.financingId ? String(m.financingId) : m?.financing_id ? String(m.financing_id) : null,
+    financingMovementId: m?.financingMovementId
+      ? String(m.financingMovementId)
+      : m?.financing_movement_id
+      ? String(m.financing_movement_id)
+      : null,
+    financing_movement_id: m?.financingMovementId
+      ? String(m.financingMovementId)
+      : m?.financing_movement_id
+      ? String(m.financing_movement_id)
+      : null,
 
     motivo_cancelacion: m?.motivo_cancelacion ?? null,
     fecha_cancelacion: m?.fecha_cancelacion ?? null,
