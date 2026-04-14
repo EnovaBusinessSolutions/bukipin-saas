@@ -3,6 +3,10 @@ const router = express.Router();
 const mongoose = require("mongoose");
 const ensureAuth = require("../middleware/ensureAuth");
 const JournalEntry = require("../models/JournalEntry");
+const {
+  prepareCorporateCardCharge,
+  applyCorporateCardCharge,
+} = require("../services/corporateCardChargeService");
 
 // ✅ Intentar cargar un modelo de CAPEX si existe
 let CapexModel = null;
@@ -67,6 +71,15 @@ function toYMD(v) {
   return `${y}-${m}-${day}`;
 }
 
+function toYMDLocal(v) {
+  const d = new Date(v || new Date());
+  if (Number.isNaN(d.getTime())) return null;
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
 function monthLabelEs(v) {
   if (!v) return "";
   const d = new Date(v);
@@ -110,6 +123,105 @@ function ownerFilter(owner) {
   };
 }
 
+function genNumeroAsiento(ownerId) {
+  const ymd = toYMDLocal(new Date())?.replace(/-/g, "") || "00000000";
+  const rand = Math.random().toString(36).slice(2, 7).toUpperCase();
+  const tail = String(ownerId).slice(-4).toUpperCase();
+  return `INV-${ymd}-${tail}-${rand}`;
+}
+
+function resolveCreditAccountByMetodoPago(metodoPago) {
+  const CASH = process.env.CTA_EFECTIVO || "1001";
+  const BANK = process.env.CTA_BANCOS || "1002";
+
+  if (!metodoPago) return { tipo: "unknown", cuentaCodigo: BANK, meta: {} };
+  if (metodoPago === "efectivo") return { tipo: "cash", cuentaCodigo: CASH, meta: {} };
+  if (metodoPago === "bancos") return { tipo: "bank", cuentaCodigo: BANK, meta: {} };
+
+  if (metodoPago.startsWith("tarjeta_credito_")) {
+    const CC = process.env.CTA_TARJETAS_CREDITO || "2101";
+    return { tipo: "credit_card", cuentaCodigo: CC, meta: { tarjetaId: metodoPago.replace("tarjeta_credito_", "") } };
+  }
+
+  if (metodoPago === "tarjeta_credito") {
+    const CC = process.env.CTA_TARJETAS_CREDITO || "2101";
+    return { tipo: "credit_card", cuentaCodigo: CC, meta: {} };
+  }
+
+  return { tipo: "other", cuentaCodigo: BANK, meta: {} };
+}
+
+function resolveCorporateCardLiabilityAccountCode(corporateCardContext) {
+  const fallback = String(process.env.CTA_TARJETAS_CREDITO || "2101").trim();
+  const candidate = String(corporateCardContext?.liabilityAccountCode || "").trim();
+  return candidate || fallback;
+}
+
+function validateJournalLinesOrThrow({ lines, context = {} }) {
+  const invalidLine = (Array.isArray(lines) ? lines : []).find((line) => {
+    const accountCodigo = String(
+      line?.accountCodigo || line?.accountCode || line?.cuentaCodigo || line?.cuenta_codigo || ""
+    ).trim();
+    const accountId = line?.accountId ? String(line.accountId).trim() : "";
+    return !accountCodigo && !accountId;
+  });
+
+  if (!invalidLine) return;
+
+  const err = new Error(
+    `Asiento inválido: existe una línea sin accountCodigo/accountId en inversiones (${JSON.stringify({
+      tipoPago: context.tipoPago || "",
+      metodoPago: context.metodoPago || "",
+      financingId: context.financingId || "",
+      numeroAsiento: context.numeroAsiento || "",
+      lineMemo: invalidLine?.memo || "",
+      debit: toNum(invalidLine?.debit, 0),
+      credit: toNum(invalidLine?.credit, 0),
+    })})`
+  );
+  err.statusCode = 400;
+  throw err;
+}
+
+function normalizeCorporateCardPayment(input = {}) {
+  const metodoPagoRaw = asTrim(input.metodo_pago ?? input.metodoPago);
+  const metodoPagoNormalized = normalizeMetodoPago(metodoPagoRaw);
+
+  let financingId = asTrim(input.financingId ?? input.financing_id, "");
+  let metodoPago = metodoPagoNormalized;
+
+  if (metodoPagoNormalized.startsWith("tarjeta_credito_")) {
+    financingId = financingId || metodoPagoNormalized.slice("tarjeta_credito_".length);
+    metodoPago = "tarjeta_credito";
+  }
+
+  const isCorporateCard = metodoPago === "tarjeta_credito";
+  return {
+    metodoPago,
+    financingId,
+    isCorporateCard,
+    metodoPagoRaw,
+  };
+}
+
+async function safeDeleteJournalEntry({ owner, journalEntryId }) {
+  try {
+    if (!journalEntryId) return;
+    await JournalEntry.deleteOne({ _id: journalEntryId, owner });
+  } catch (rollbackErr) {
+    console.error("safeDeleteJournalEntry inversion rollback error:", rollbackErr?.message || rollbackErr);
+  }
+}
+
+async function safeDeleteCapex({ owner, capexId }) {
+  try {
+    if (!capexId || !CapexModel) return;
+    await CapexModel.deleteOne({ _id: capexId, ...ownerFilter(owner) });
+  } catch (rollbackErr) {
+    console.error("safeDeleteCapex rollback error:", rollbackErr?.message || rollbackErr);
+  }
+}
+
 function mapCapexForUI(doc) {
   const d = doc?.toObject ? doc.toObject() : doc;
 
@@ -134,6 +246,8 @@ function mapCapexForUI(doc) {
 
     tipo_pago: normalizeTipoPago(d?.tipo_pago ?? d?.tipoPago ?? ""),
     metodo_pago: normalizeMetodoPago(d?.metodo_pago ?? d?.metodoPago ?? d?.metodo ?? ""),
+    financingId: d?.financingId ? String(d.financingId) : d?.financing_id ? String(d.financing_id) : null,
+    financingMovementId: d?.financingMovementId ? String(d.financingMovementId) : null,
 
     anos_depreciacion: parseInt(String(d?.anos_depreciacion ?? d?.anosDepreciacion ?? 0), 10) || 0,
     valor_depreciacion_anual: toNum(d?.valor_depreciacion_anual ?? d?.valorDepreciacionAnual ?? 0, 0),
@@ -192,6 +306,10 @@ function buildCreatePayload(body = {}) {
     tipo_pago: normalizeTipoPago(body.tipo_pago),
     metodo_pago: normalizeMetodoPago(body.metodo_pago),
     fecha_vencimiento: isoDateOrNull(body.fecha_vencimiento),
+    financingId: isObjectId(body.financingId ?? body.financing_id) ? String(body.financingId ?? body.financing_id) : null,
+    financingMovementId: isObjectId(body.financingMovementId ?? body.financing_movement_id)
+      ? String(body.financingMovementId ?? body.financing_movement_id)
+      : null,
 
     anos_depreciacion: parseInt(String(body.anos_depreciacion ?? 0), 10) || 0,
     valor_depreciacion_anual: toNum(body.valor_depreciacion_anual, 0),
@@ -248,6 +366,22 @@ function buildPatchPayload(body = {}) {
   maybeSet("tipo_pago", body.tipo_pago !== undefined ? normalizeTipoPago(body.tipo_pago) : undefined);
   maybeSet("metodo_pago", body.metodo_pago !== undefined ? normalizeMetodoPago(body.metodo_pago) : undefined);
   maybeSet("fecha_vencimiento", body.fecha_vencimiento !== undefined ? isoDateOrNull(body.fecha_vencimiento) : undefined);
+  maybeSet(
+    "financingId",
+    body.financingId !== undefined || body.financing_id !== undefined
+      ? isObjectId(body.financingId ?? body.financing_id)
+        ? String(body.financingId ?? body.financing_id)
+        : null
+      : undefined
+  );
+  maybeSet(
+    "financingMovementId",
+    body.financingMovementId !== undefined || body.financing_movement_id !== undefined
+      ? isObjectId(body.financingMovementId ?? body.financing_movement_id)
+        ? String(body.financingMovementId ?? body.financing_movement_id)
+        : null
+      : undefined
+  );
 
   maybeSet(
     "anos_depreciacion",
@@ -395,6 +529,11 @@ router.post("/", ensureAuth, async (req, res) => {
 
     const owner = req.user._id;
     const payload = buildCreatePayload(req.body || {});
+    const paymentInfo = normalizeCorporateCardPayment(req.body || {});
+    const tipoPago = payload.tipo_pago;
+    const metodoPago = paymentInfo.metodoPago;
+    const financingId = paymentInfo.financingId;
+    const isCorporateCardPayment = paymentInfo.isCorporateCard;
 
     if (!payload.producto_nombre) {
       return res.status(400).json({
@@ -412,18 +551,260 @@ router.post("/", ensureAuth, async (req, res) => {
       });
     }
 
-    const doc = await CapexModel.create({
-      owner,
-      ...payload,
-    });
+    if (!payload.cuenta_codigo) {
+      return res.status(400).json({
+        ok: false,
+        error: "VALIDATION",
+        message: "cuenta_codigo es requerida para registrar la inversión.",
+      });
+    }
 
-    const item = mapCapexForUI(doc);
-    return res.status(201).json({ ok: true, data: item, item });
+    if (!["contado", "credito", "parcial"].includes(tipoPago)) {
+      return res.status(400).json({
+        ok: false,
+        error: "VALIDATION",
+        message: "tipo_pago inválido (contado|credito|parcial).",
+      });
+    }
+
+    if ((tipoPago === "contado" || tipoPago === "parcial") && !metodoPago) {
+      return res.status(400).json({
+        ok: false,
+        error: "VALIDATION",
+        message: "metodo_pago es requerido para contado/parcial.",
+      });
+    }
+
+    const montoTotal = payload.valor_total;
+    const requestedMontoPagado = toNum(payload.monto_pagado, 0);
+    const fixedMontoPagado = tipoPago === "contado" ? montoTotal : tipoPago === "parcial" ? requestedMontoPagado : 0;
+    const fixedMontoPendiente =
+      tipoPago === "contado" ? 0 : tipoPago === "parcial" ? Math.max(0, montoTotal - fixedMontoPagado) : montoTotal;
+
+    if (tipoPago === "parcial" && (!(fixedMontoPagado > 0) || !(fixedMontoPagado < montoTotal))) {
+      return res.status(400).json({
+        ok: false,
+        error: "VALIDATION",
+        message: "En parcial, monto_pagado debe ser > 0 y < valor_total.",
+      });
+    }
+
+    if (tipoPago === "contado" && fixedMontoPagado > montoTotal) {
+      return res.status(400).json({
+        ok: false,
+        error: "VALIDATION",
+        message: "monto_pagado no puede ser mayor al valor total de la inversión.",
+      });
+    }
+
+    if (isCorporateCardPayment) {
+      if (!financingId) {
+        return res.status(400).json({
+          ok: false,
+          error: "VALIDATION",
+          message: "financingId es requerido cuando metodo_pago es tarjeta_credito.",
+        });
+      }
+
+      if (!isObjectId(financingId)) {
+        return res.status(400).json({
+          ok: false,
+          error: "VALIDATION",
+          message: "financingId inválido para pago con tarjeta corporativa.",
+        });
+      }
+    }
+
+    let corporateCardContext = null;
+    if (isCorporateCardPayment && fixedMontoPagado > 0) {
+      corporateCardContext = await prepareCorporateCardCharge({
+        owner,
+        financingId,
+        monto: fixedMontoPagado,
+      });
+    }
+
+    const numeroAsiento = genNumeroAsiento(owner);
+    const fecha = payload.fecha_adquisicion || new Date();
+
+    let created = null;
+    let asiento = null;
+    let corporateCardCharge = null;
+
+    try {
+      created = await CapexModel.create({
+        owner,
+        ...payload,
+        tipo_pago: tipoPago,
+        metodo_pago: metodoPago || null,
+        monto_pagado: fixedMontoPagado,
+        monto_pendiente: fixedMontoPendiente,
+        financingId: isCorporateCardPayment ? financingId : null,
+        financingMovementId: null,
+      });
+
+      const PROVEEDORES_2001 = process.env.CTA_CXP || "2001";
+      const creditInfo = isCorporateCardPayment
+        ? {
+            tipo: "credit_card",
+            cuentaCodigo: resolveCorporateCardLiabilityAccountCode(corporateCardContext),
+            meta: { financingId },
+          }
+        : resolveCreditAccountByMetodoPago(metodoPago);
+
+      const lines = [];
+      const pushLine = ({ side, cuentaCodigo: code, monto, memo }) => {
+        const m = toNum(monto, 0);
+        const s = String(side || "").toLowerCase().trim();
+        lines.push({
+          accountCodigo: String(code || "").trim(),
+          debit: s === "debit" ? m : 0,
+          credit: s === "credit" ? m : 0,
+          memo: memo || "",
+        });
+      };
+
+      pushLine({
+        side: "debit",
+        cuentaCodigo: payload.cuenta_codigo,
+        monto: montoTotal,
+        memo: `Alta de inversión - ${payload.producto_nombre}`,
+      });
+
+      if (tipoPago === "contado") {
+        pushLine({
+          side: "credit",
+          cuentaCodigo: creditInfo.cuentaCodigo,
+          monto: montoTotal,
+          memo: `Pago contado (${creditInfo.tipo})`,
+        });
+      } else if (tipoPago === "credito") {
+        pushLine({
+          side: "credit",
+          cuentaCodigo: PROVEEDORES_2001,
+          monto: montoTotal,
+          memo: `A crédito - Proveedores (${PROVEEDORES_2001})`,
+        });
+      } else if (tipoPago === "parcial") {
+        if (fixedMontoPagado > 0) {
+          pushLine({
+            side: "credit",
+            cuentaCodigo: creditInfo.cuentaCodigo,
+            monto: fixedMontoPagado,
+            memo: `Pago parcial (${creditInfo.tipo})`,
+          });
+        }
+        if (fixedMontoPendiente > 0) {
+          pushLine({
+            side: "credit",
+            cuentaCodigo: PROVEEDORES_2001,
+            monto: fixedMontoPendiente,
+            memo: `Saldo pendiente - Proveedores (${PROVEEDORES_2001})`,
+          });
+        }
+      }
+
+      validateJournalLinesOrThrow({
+        lines,
+        context: {
+          tipoPago,
+          metodoPago,
+          financingId,
+          numeroAsiento,
+        },
+      });
+
+      asiento = await JournalEntry.create({
+        owner,
+        date: fecha,
+        concept: `Inversión: ${payload.producto_nombre}`,
+        numeroAsiento,
+        source: "inversion",
+        sourceId: created._id,
+        transaccionId: created._id,
+        source_id: created._id,
+        references: [
+          { source: "inversion", id: String(created._id), numero: numeroAsiento },
+          { source: "capex", id: String(created._id), numero: numeroAsiento },
+        ],
+        lines,
+      });
+
+      const capexLinkResult = await CapexModel.updateOne(
+        { _id: created._id, ...ownerFilter(owner) },
+        { $set: { journalEntryId: asiento._id } }
+      );
+      const capexLinked =
+        (typeof capexLinkResult?.matchedCount === "number" && capexLinkResult.matchedCount > 0) ||
+        (typeof capexLinkResult?.n === "number" && capexLinkResult.n > 0);
+
+      if (!capexLinked) {
+        const err = new Error("No se pudo ligar el asiento contable a la inversión.");
+        err.statusCode = 500;
+        throw err;
+      }
+
+      if (isCorporateCardPayment && fixedMontoPagado > 0) {
+        corporateCardCharge = await applyCorporateCardCharge({
+          owner,
+          financingId,
+          monto: fixedMontoPagado,
+          source: "inversion",
+          sourceModule: "inversiones",
+          sourceId: created._id,
+          journalEntryId: asiento?._id || null,
+          fecha,
+          descripcion: `Inversión pagada con tarjeta corporativa - ${payload.producto_nombre}`,
+          metodoPago,
+          moneda: "MXN",
+          tipoCambio: 1,
+          meta: {
+            capexId: created._id,
+            numeroAsiento,
+            tipoPago,
+            montoTotal,
+            montoPagado: fixedMontoPagado,
+            montoPendiente: fixedMontoPendiente,
+          },
+        });
+
+        await CapexModel.updateOne(
+          { _id: created._id, ...ownerFilter(owner) },
+          {
+            $set: {
+              financingId,
+              financingMovementId: corporateCardCharge?.movement?._id || null,
+            },
+          }
+        );
+      }
+    } catch (flowErr) {
+      await safeDeleteJournalEntry({ owner, journalEntryId: asiento?._id || null });
+      await safeDeleteCapex({ owner, capexId: created?._id || null });
+      throw flowErr;
+    }
+
+    const finalDoc = (await CapexModel.findOne({ _id: created._id, ...ownerFilter(owner) }).lean()) || created;
+    const item = mapCapexForUI(finalDoc);
+    return res.status(201).json({
+      ok: true,
+      numero_asiento: numeroAsiento,
+      asiento_id: asiento ? String(asiento._id) : item.journalEntryId || null,
+      asientoId: asiento ? String(asiento._id) : item.journalEntryId || null,
+      meta: {
+        corporateCard: isCorporateCardPayment,
+        financingId: isCorporateCardPayment ? financingId : null,
+        financingMovementId: corporateCardCharge?.movement?._id ? String(corporateCardCharge.movement._id) : null,
+      },
+      data: item,
+      item,
+    });
   } catch (err) {
     console.error("POST /api/inversiones error:", err);
-    return res.status(500).json({
+    const status = err?.statusCode || 500;
+    return res.status(status).json({
       ok: false,
-      error: "SERVER_ERROR",
+      error: status === 404 ? "NOT_FOUND" : status >= 400 && status < 500 ? "VALIDATION" : "SERVER_ERROR",
       message: err?.message || "SERVER_ERROR",
     });
   }

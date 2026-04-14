@@ -38,6 +38,13 @@ const capexSchema = new mongoose.Schema(
     tipo_pago: { type: String, trim: true, default: "contado", index: true },
     metodo_pago: { type: String, trim: true, default: "" },
     fecha_vencimiento: { type: Date, default: null },
+    financingId: { type: mongoose.Schema.Types.ObjectId, ref: "Financing", default: null, index: true },
+    financingMovementId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "FinancingMovement",
+      default: null,
+      index: true,
+    },
 
     // =========================
     // Depreciación
@@ -114,6 +121,8 @@ const capexSchema = new mongoose.Schema(
 
         if (ret.subcuenta_id) ret.subcuenta_id = String(ret.subcuenta_id);
         if (ret.journalEntryId) ret.journalEntryId = String(ret.journalEntryId);
+        if (ret.financingId) ret.financingId = String(ret.financingId);
+        if (ret.financingMovementId) ret.financingMovementId = String(ret.financingMovementId);
 
         delete ret._id;
         delete ret.__v;
@@ -139,6 +148,10 @@ capexSchema.pre("validate", function (next) {
 
     doc.tipo_pago = asTrim(doc.tipo_pago || "contado").toLowerCase() || "contado";
     doc.metodo_pago = asTrim(doc.metodo_pago).toLowerCase();
+    if (doc.financingId && !mongoose.Types.ObjectId.isValid(String(doc.financingId))) doc.financingId = null;
+    if (doc.financingMovementId && !mongoose.Types.ObjectId.isValid(String(doc.financingMovementId))) {
+      doc.financingMovementId = null;
+    }
 
     doc.proveedor_nombre = asTrim(doc.proveedor_nombre);
     doc.proveedor_email = asTrim(doc.proveedor_email);
