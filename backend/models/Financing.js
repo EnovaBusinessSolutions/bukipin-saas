@@ -82,6 +82,13 @@ const financingSchema = new Schema(
       ],
       default: "bancario",
     },
+    direccion: {
+      type: String,
+      trim: true,
+      enum: ["recibido", "realizado"],
+      default: "recibido",
+      index: true,
+    },
 
     // Estado del financiamiento
     estatus: {
@@ -117,6 +124,27 @@ const financingSchema = new Schema(
       default: "",
     },
     referencia: {
+      type: String,
+      trim: true,
+      default: "",
+    },
+    deudor_nombre: {
+      type: String,
+      trim: true,
+      default: "",
+    },
+    deudor_rfc: {
+      type: String,
+      trim: true,
+      default: "",
+    },
+    deudor_tipo: {
+      type: String,
+      trim: true,
+      enum: ["persona", "empresa", ""],
+      default: "",
+    },
+    deudor_contacto: {
       type: String,
       trim: true,
       default: "",
@@ -319,6 +347,16 @@ const financingSchema = new Schema(
       trim: true,
       default: "",
     },
+    cuenta_activo_codigo: {
+      type: String,
+      trim: true,
+      default: "",
+    },
+    cuenta_activo_nombre: {
+      type: String,
+      trim: true,
+      default: "",
+    },
 
     cuenta_intereses_codigo: {
       type: String,
@@ -376,7 +414,7 @@ const financingSchema = new Schema(
   }
 );
 
-financingSchema.index({ owner: 1, activo: 1, estatus: 1, tipo: 1 });
+financingSchema.index({ owner: 1, activo: 1, estatus: 1, tipo: 1, direccion: 1 });
 financingSchema.index({ owner: 1, institucion: 1 });
 financingSchema.index({ owner: 1, nombre: 1 });
 financingSchema.index({ owner: 1, fecha_vencimiento: 1 });
@@ -424,6 +462,16 @@ financingSchema.pre("validate", function (next) {
 
   // nombre requerido
   this.nombre = String(this.nombre || "").trim();
+
+  this.direccion = ["recibido", "realizado"].includes(String(this.direccion || "").trim())
+    ? String(this.direccion || "").trim()
+    : "recibido";
+  this.deudor_nombre = String(this.deudor_nombre || "").trim();
+  this.deudor_rfc = String(this.deudor_rfc || "").trim().toUpperCase();
+  this.deudor_tipo = ["persona", "empresa"].includes(String(this.deudor_tipo || "").trim())
+    ? String(this.deudor_tipo || "").trim()
+    : "";
+  this.deudor_contacto = String(this.deudor_contacto || "").trim();
 
   next();
 });

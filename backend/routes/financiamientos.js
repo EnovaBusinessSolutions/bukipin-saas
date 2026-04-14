@@ -136,6 +136,22 @@ function normalizePeriodicidad(v) {
   return allowed.has(s) ? s : "mensual";
 }
 
+function normalizeDireccion(v) {
+  const s = asTrim(v, "").toLowerCase();
+  return s === "realizado" ? "realizado" : "recibido";
+}
+
+function isFinancingRealizado(doc) {
+  return normalizeDireccion(doc?.direccion) === "realizado";
+}
+
+function normalizeMetodoFondos(v) {
+  const s = asTrim(v, "").toLowerCase();
+  if (["efectivo", "caja", "cash"].includes(s)) return "caja";
+  if (["transferencia", "bancos", "banco", "bank"].includes(s)) return "bancos";
+  return "bancos";
+}
+
 function normalizeTipoMovimiento(v) {
   const s = asTrim(v, "").toLowerCase();
   const aliases = {
@@ -198,6 +214,7 @@ function isOpenFacilityType(doc) {
 }
 
 function getTipoLabelFromFinancing(doc) {
+  if (isFinancingRealizado(doc)) return "Capital de Trabajo";
   const tipoUi = getUiTipoFromFinancingLike(doc);
 
   if (tipoUi === "simple") return "Crédito Simple";
@@ -220,6 +237,7 @@ function getEstadoLabelFromFinancing(doc) {
 
 function buildDetailMetrics(doc) {
   const tipoUi = getUiTipoFromFinancingLike(doc);
+  const direccion = normalizeDireccion(doc?.direccion);
   const estado = normalizeEstatusFinanciamiento(doc?.estatus || doc?.estado || "activo");
 
   const lineaCredito = Math.max(0, toNum(doc?.linea_credito, 0));
@@ -234,14 +252,18 @@ function buildDetailMetrics(doc) {
   );
 
   const montoTotalVista =
-    tipoUi === "revolvente" || tipoUi === "tarjeta_corporativa"
-      ? lineaCredito
-      : montoOriginal;
+    direccion === "realizado"
+      ? Math.max(0, toNum(doc?.total_dispuesto, 0))
+      : tipoUi === "revolvente" || tipoUi === "tarjeta_corporativa"
+        ? lineaCredito
+        : montoOriginal;
 
   const saldoActualVista =
-    tipoUi === "revolvente" || tipoUi === "tarjeta_corporativa"
-      ? saldoDispuestoActual
-      : saldoTotalActual;
+    direccion === "realizado"
+      ? saldoCapitalActual
+      : tipoUi === "revolvente" || tipoUi === "tarjeta_corporativa"
+        ? saldoDispuestoActual
+        : saldoTotalActual;
 
   const montoPagadoCapital =
     tipoUi === "simple"
@@ -254,10 +276,14 @@ function buildDetailMetrics(doc) {
       : Math.max(0, saldoDispuestoActual);
 
   const usoLineaPct =
-    lineaCredito > 0 ? Math.min(100, (saldoDispuestoActual / lineaCredito) * 100) : 0;
+    direccion === "realizado"
+      ? 0
+      : lineaCredito > 0
+        ? Math.min(100, (saldoDispuestoActual / lineaCredito) * 100)
+        : 0;
 
   const progresoPagoPct =
-    montoOriginal > 0 ? Math.min(100, (montoPagadoCapital / montoOriginal) * 100) : 0;
+    montoTotalVista > 0 ? Math.min(100, (montoPagadoCapital / montoTotalVista) * 100) : 0;
 
   return {
     tipo_ui: tipoUi,
@@ -301,16 +327,17 @@ function buildDetailMetrics(doc) {
     progreso_pago_pct: progresoPagoPct,
     progresoPagoPct,
 
-    disponible_linea: disponibleActual,
-    disponibleLinea: disponibleActual,
+    disponible_linea: direccion === "realizado" ? 0 : disponibleActual,
+    disponibleLinea: direccion === "realizado" ? 0 : disponibleActual,
 
-    modo_visual: tipoUi === "simple" ? "progreso_pago" : "uso_linea",
-    modoVisual: tipoUi === "simple" ? "progreso_pago" : "uso_linea",
+    modo_visual: direccion === "realizado" || tipoUi === "simple" ? "progreso_pago" : "uso_linea",
+    modoVisual: direccion === "realizado" || tipoUi === "simple" ? "progreso_pago" : "uso_linea",
   };
 }
 
 function recalcFinancingSnapshot(financingLike) {
   const f = financingLike?.toObject ? financingLike.toObject() : { ...(financingLike || {}) };
+  const direccion = normalizeDireccion(f.direccion);
 
   f.linea_credito = Math.max(0, toNum(f.linea_credito, 0));
   f.saldo_dispuesto_actual = Math.max(0, toNum(f.saldo_dispuesto_actual, 0));
@@ -332,7 +359,10 @@ function recalcFinancingSnapshot(financingLike) {
     Math.max(0, toNum(f.saldo_moratorios_actual, 0)) +
     Math.max(0, toNum(f.saldo_comisiones_actual, 0));
 
-  f.disponible_actual = Math.max(0, toNum(f.linea_credito, 0) - toNum(f.saldo_dispuesto_actual, 0));
+  f.disponible_actual =
+    direccion === "realizado"
+      ? 0
+      : Math.max(0, toNum(f.linea_credito, 0) - toNum(f.saldo_dispuesto_actual, 0));
 
   const estatusActual = asTrim(f.estatus, "").toLowerCase();
   const openFacility = isOpenFacilityType(f);
@@ -350,6 +380,7 @@ function recalcFinancingSnapshot(financingLike) {
 
 function applyMovementToFinancing(financingLike, payload) {
   const f = recalcFinancingSnapshot(financingLike);
+  const direccion = normalizeDireccion(f.direccion);
   const tipo = normalizeTipoMovimiento(payload.tipo);
   const monto = Math.max(0, toNum(payload.monto, 0));
   const montoCapital = Math.max(0, toNum(payload.monto_capital, 0));
@@ -403,8 +434,12 @@ function applyMovementToFinancing(financingLike, payload) {
 
     case "cargo_intereses": {
       const intereses = montoIntereses || monto;
-      f.saldo_intereses_actual += intereses;
       f.total_intereses_cargados += intereses;
+      if (direccion === "realizado" && asBool(payload?.interes_pagado_al_momento, false)) {
+        f.total_intereses_pagados += intereses;
+      } else {
+        f.saldo_intereses_actual += intereses;
+      }
       break;
     }
 
@@ -449,6 +484,7 @@ function applyMovementToFinancing(financingLike, payload) {
 
 function validateMovementAgainstFinancing(financing, payload) {
   const tipoFin = getUiTipoFromFinancingLike(financing);
+  const direccion = normalizeDireccion(financing?.direccion);
   const tipoMov = normalizeTipoMovimiento(payload?.tipo || payload?.tipo_transaccion);
 
   const montoCapital = Math.max(
@@ -462,7 +498,7 @@ function validateMovementAgainstFinancing(financing, payload) {
     )
   );
 
-  if (tipoMov === "disposicion" && tipoFin !== "revolvente") {
+  if (tipoMov === "disposicion" && direccion !== "realizado" && tipoFin !== "revolvente") {
     const err = new Error("La disposición solo aplica a créditos revolventes.");
     err.statusCode = 400;
     throw err;
@@ -486,7 +522,7 @@ function validateMovementAgainstFinancing(financing, payload) {
     }
   }
 
-  if (tipoMov === "disposicion") {
+  if (tipoMov === "disposicion" && direccion !== "realizado") {
     const linea = Math.max(0, toNum(financing?.linea_credito, 0));
     const saldoDispuestoActual = Math.max(0, toNum(financing?.saldo_dispuesto_actual, 0));
     const disponible = Math.max(0, linea - saldoDispuestoActual);
@@ -517,6 +553,7 @@ function buildLegacyAliasesForFinancing(doc) {
 
   return {
     user_id: doc.owner ? String(doc.owner) : "",
+    direccion: normalizeDireccion(doc.direccion),
     tipo_credito: tipoUi,
     monto_total: montoTotal,
     tasa_interes: toNum(doc.tasa_interes_anual, 0),
@@ -546,6 +583,7 @@ function mapFinancingForUI(doc) {
     institucionId: institucionId || "",
 
     tipo: d.tipo || "credito_simple",
+    direccion: normalizeDireccion(d.direccion),
     subtipo: d.subtipo || "",
     categoria: d.categoria || "bancario",
 
@@ -557,6 +595,14 @@ function mapFinancingForUI(doc) {
     numero_cuenta: d.numero_cuenta || "",
     numeroCuenta: d.numero_cuenta || "",
     referencia: d.referencia || "",
+    deudor_nombre: d.deudor_nombre || "",
+    deudorNombre: d.deudor_nombre || "",
+    deudor_rfc: d.deudor_rfc || "",
+    deudorRfc: d.deudor_rfc || "",
+    deudor_tipo: d.deudor_tipo || "",
+    deudorTipo: d.deudor_tipo || "",
+    deudor_contacto: d.deudor_contacto || "",
+    deudorContacto: d.deudor_contacto || "",
 
     moneda: d.moneda || "MXN",
     tipo_cambio: toNum(d.tipo_cambio, 1),
@@ -631,6 +677,10 @@ function mapFinancingForUI(doc) {
     cuentaPasivoCodigo: d.cuenta_pasivo_codigo || "",
     cuenta_pasivo_nombre: d.cuenta_pasivo_nombre || "",
     cuentaPasivoNombre: d.cuenta_pasivo_nombre || "",
+    cuenta_activo_codigo: d.cuenta_activo_codigo || "",
+    cuentaActivoCodigo: d.cuenta_activo_codigo || "",
+    cuenta_activo_nombre: d.cuenta_activo_nombre || "",
+    cuentaActivoNombre: d.cuenta_activo_nombre || "",
 
     cuenta_intereses_codigo: d.cuenta_intereses_codigo || "",
     cuentaInteresesCodigo: d.cuenta_intereses_codigo || "",
@@ -808,19 +858,35 @@ function getTipoLabelFromMovement(tipo) {
 
 function buildJournalEntryPayload({ owner, financing, movement, movementId }) {
   const tipo = normalizeTipoMovimiento(movement.tipo);
+  const direccion = normalizeDireccion(financing?.direccion);
   const fecha = movement.fecha || new Date();
 
   const liabilityCode = asTrim(financing.cuenta_pasivo_codigo, "2101");
   const liabilityName = asTrim(financing.cuenta_pasivo_nombre, "Financiamientos");
-  const banksCode = asTrim(financing.cuenta_bancos_codigo, "1002");
-  const banksName = asTrim(financing.cuenta_bancos_nombre, "Bancos");
-  const interestsCode = asTrim(financing.cuenta_intereses_codigo, "5201");
-  const interestsName = asTrim(financing.cuenta_intereses_nombre, "Gastos Financieros");
+  const activeCode = asTrim(financing.cuenta_activo_codigo, "1004");
+  const activeName = asTrim(financing.cuenta_activo_nombre, "Documentos por Cobrar");
+  const banksCode = "1002";
+  const banksName = "Bancos";
+  const cashCode = "1001";
+  const cashName = "Caja";
+  const interestsCode = asTrim(
+    financing.cuenta_intereses_codigo,
+    direccion === "realizado" ? "4101" : "5201"
+  );
+  const interestsName = asTrim(
+    financing.cuenta_intereses_nombre,
+    direccion === "realizado" ? "Productos Financieros" : "Gastos Financieros"
+  );
 
   const monto = Math.max(0, toNum(movement.monto, 0));
   const capital = Math.max(0, toNum(movement.monto_capital, 0));
   const intereses = Math.max(0, toNum(movement.monto_intereses, 0));
   const comisiones = Math.max(0, toNum(movement.monto_comisiones, 0));
+  const fundsMethod = normalizeMetodoFondos(
+    movement.metodo_pago || movement.metodoPago || movement.cuenta_destino || movement.cuentaDestino
+  );
+  const fundsCode = fundsMethod === "caja" ? cashCode : banksCode;
+  const fundsName = fundsMethod === "caja" ? cashName : banksName;
 
   const lines = [];
   const pushDebit = (code, name, amount, memo = "") => {
@@ -848,7 +914,26 @@ function buildJournalEntryPayload({ owner, financing, movement, movementId }) {
     }
   };
 
-  if (tipo === "apertura" || tipo === "disposicion") {
+  if (direccion === "realizado") {
+    if (tipo === "apertura" || tipo === "disposicion") {
+      pushDebit(activeCode, activeName, monto, movement.descripcion || getTipoLabelFromMovement(tipo));
+      pushCredit(fundsCode, fundsName, monto, movement.descripcion || getTipoLabelFromMovement(tipo));
+    } else if (tipo === "amortizacion") {
+      if (capital > 0) pushDebit(fundsCode, fundsName, capital, "Cobranza de capital");
+      if (capital > 0) pushCredit(activeCode, activeName, capital, "Cobranza de capital");
+      if (intereses > 0) pushDebit(fundsCode, fundsName, intereses, "Cobranza de intereses");
+      if (intereses > 0) pushCredit(activeCode, activeName, intereses, "Cobranza de intereses");
+      if (comisiones > 0) pushDebit(fundsCode, fundsName, comisiones, "Cobranza adicional");
+      if (comisiones > 0) pushCredit(activeCode, activeName, comisiones, "Cobranza adicional");
+    } else if (tipo === "cargo_intereses") {
+      if (asBool(movement?.interes_pagado_al_momento ?? movement?.meta?.interes_pagado_al_momento, false)) {
+        pushDebit(fundsCode, fundsName, monto, movement.descripcion || "Intereses cobrados");
+      } else {
+        pushDebit(activeCode, activeName, monto, movement.descripcion || "Intereses por cobrar");
+      }
+      pushCredit(interestsCode, interestsName, monto, movement.descripcion || "Cargo por intereses");
+    }
+  } else if (tipo === "apertura" || tipo === "disposicion") {
     pushDebit(banksCode, banksName, monto, movement.descripcion || getTipoLabelFromMovement(tipo));
     pushCredit(liabilityCode, liabilityName, monto, movement.descripcion || getTipoLabelFromMovement(tipo));
   } else if (tipo === "amortizacion") {
@@ -950,6 +1035,7 @@ async function createMovementAndApply({ owner, financing, payload }) {
     monto_intereses: montoIntereses,
     monto_moratorios: montoMoratorios,
     monto_comisiones: montoComisiones,
+    interes_pagado_al_momento: payload?.interes_pagado_al_momento,
   });
 
   const movement = await FinancingMovement.create({
@@ -993,7 +1079,12 @@ async function createMovementAndApply({ owner, financing, payload }) {
     descripcion: asTrim(payload.descripcion, ""),
     notas: asTrim(payload.notas, ""),
     tags: parseTags(payload.tags ?? payload.etiquetas),
-    meta: payload.meta && typeof payload.meta === "object" ? payload.meta : {},
+    meta: {
+      ...(payload.meta && typeof payload.meta === "object" ? payload.meta : {}),
+      ...(payload?.interes_pagado_al_momento !== undefined
+        ? { interes_pagado_al_momento: asBool(payload.interes_pagado_al_momento, false) }
+        : {}),
+    },
   });
 
   const journalEntryId =
@@ -1142,7 +1233,8 @@ router.post("/tarjetas-credito", ensureAuth, async (req, res) => {
 router.get("/resumen", ensureAuth, async (req, res) => {
   try {
     const owner = req.user._id;
-    const docs = await Financing.find({ owner, activo: true }).lean();
+    const direccion = normalizeDireccion(req.query.direccion);
+    const docs = await Financing.find({ owner, activo: true, direccion }).lean();
     const items = docs.map(mapFinancingForUI);
 
     const resumen = {
@@ -1174,6 +1266,7 @@ router.get("/transacciones", ensureAuth, async (req, res) => {
   try {
     const owner = req.user._id;
     const wrap = asTrim(req.query.wrap) === "1";
+    const direccion = normalizeDireccion(req.query.direccion);
 
     const financingId = asTrim(req.query.financingId || req.query.financiamientoId || req.query.financing_id, "");
     const tipo = asTrim(req.query.tipo || req.query.tipo_transaccion, "");
@@ -1203,6 +1296,13 @@ router.get("/transacciones", ensureAuth, async (req, res) => {
         { institucion: { $regex: q, $options: "i" } },
         { subtipo: { $regex: q, $options: "i" } },
       ];
+    }
+
+    if (direccion) {
+      const financingDocs = await Financing.find({ owner, direccion }).select({ _id: 1 }).lean();
+      filter.financingId = financingId && isValidObjectId(financingId)
+        ? financingId
+        : { $in: financingDocs.map((doc) => doc._id) };
     }
 
     const docs = await FinancingMovement.find(filter).sort({ fecha: -1, createdAt: -1 }).limit(limit).lean();
@@ -1281,7 +1381,7 @@ router.post("/disposiciones", ensureAuth, async (req, res) => {
     if (!financing) return res.status(404).json({ ok: false, error: "NOT_FOUND" });
 
     const tipoFin = getUiTipoFromFinancingLike(financing);
-    if (tipoFin !== "revolvente") {
+    if (!isFinancingRealizado(financing) && tipoFin !== "revolvente") {
       return res.status(400).json({
         ok: false,
         error: "VALIDATION",
@@ -1329,6 +1429,7 @@ router.get("/", ensureAuth, async (req, res) => {
     const activo = asBool(req.query.activo, true);
     const tipo = asTrim(req.query.tipo || req.query.tipo_credito, "");
     const categoria = asTrim(req.query.categoria, "");
+    const direccion = normalizeDireccion(req.query.direccion);
     const estatus = asTrim(req.query.estatus || req.query.estado, "");
     const q = asTrim(req.query.q, "");
     const institucionId = asTrim(req.query.institucion_id || req.query.institucionId || req.query.institucion_financiera_id, "");
@@ -1337,6 +1438,7 @@ router.get("/", ensureAuth, async (req, res) => {
     if (activo !== null) filter.activo = !!activo;
     if (tipo) filter.tipo = normalizeTipoFinanciamiento(tipo);
     if (categoria) filter.categoria = normalizeCategoriaFinanciamiento(categoria);
+    if (direccion) filter.direccion = direccion;
     if (estatus) filter.estatus = normalizeEstatusFinanciamiento(estatus);
     if (institucionId && isValidObjectId(institucionId)) {
       filter.institucion_id = institucionId;
@@ -1366,6 +1468,7 @@ router.get("/", ensureAuth, async (req, res) => {
 router.post("/", ensureAuth, async (req, res) => {
   try {
     const owner = req.user._id;
+    const direccion = normalizeDireccion(req.body?.direccion);
 
     const nombre = asTrim(req.body?.nombre || req.body?.name);
     if (!nombre) {
@@ -1376,7 +1479,10 @@ router.post("/", ensureAuth, async (req, res) => {
       });
     }
 
-    const tipoNormalized = normalizeTipoFinanciamiento(req.body?.tipo || req.body?.tipo_credito);
+    const tipoNormalized =
+      direccion === "realizado"
+        ? "credito_simple"
+        : normalizeTipoFinanciamiento(req.body?.tipo || req.body?.tipo_credito);
     const uiTipo = getUiTipoFromFinancingLike({ tipo: tipoNormalized });
 
     const allowedCreateTypes = new Set(["credito_simple", "linea_credito", "tarjeta_credito"]);
@@ -1426,6 +1532,7 @@ router.post("/", ensureAuth, async (req, res) => {
       ),
 
       tipo: tipoNormalized,
+      direccion,
       subtipo: asTrim(req.body?.subtipo, ""),
       categoria: normalizeCategoriaFinanciamiento(req.body?.categoria),
       estatus: normalizeEstatusFinanciamiento(req.body?.estatus ?? req.body?.estado),
@@ -1434,6 +1541,10 @@ router.post("/", ensureAuth, async (req, res) => {
       numero_contrato: asTrim(req.body?.numero_contrato ?? req.body?.numeroContrato, ""),
       numero_cuenta: asTrim(req.body?.numero_cuenta ?? req.body?.numeroCuenta, ""),
       referencia: asTrim(req.body?.referencia, ""),
+      deudor_nombre: asTrim(req.body?.deudor_nombre ?? req.body?.deudorNombre, ""),
+      deudor_rfc: asTrim(req.body?.deudor_rfc ?? req.body?.deudorRfc, "").toUpperCase(),
+      deudor_tipo: asTrim(req.body?.deudor_tipo ?? req.body?.deudorTipo, ""),
+      deudor_contacto: asTrim(req.body?.deudor_contacto ?? req.body?.deudorContacto, ""),
 
       moneda: asTrim(req.body?.moneda, "MXN").toUpperCase() || "MXN",
       tipo_cambio: Math.max(0, toNum(req.body?.tipo_cambio ?? req.body?.tipoCambio, 1)) || 1,
@@ -1491,8 +1602,22 @@ router.post("/", ensureAuth, async (req, res) => {
 
       cuenta_pasivo_codigo: asTrim(req.body?.cuenta_pasivo_codigo ?? req.body?.cuentaPasivoCodigo, ""),
       cuenta_pasivo_nombre: asTrim(req.body?.cuenta_pasivo_nombre ?? req.body?.cuentaPasivoNombre, ""),
-      cuenta_intereses_codigo: asTrim(req.body?.cuenta_intereses_codigo ?? req.body?.cuentaInteresesCodigo, ""),
-      cuenta_intereses_nombre: asTrim(req.body?.cuenta_intereses_nombre ?? req.body?.cuentaInteresesNombre, ""),
+      cuenta_activo_codigo: asTrim(
+        req.body?.cuenta_activo_codigo ?? req.body?.cuentaActivoCodigo,
+        direccion === "realizado" ? "1004" : ""
+      ),
+      cuenta_activo_nombre: asTrim(
+        req.body?.cuenta_activo_nombre ?? req.body?.cuentaActivoNombre,
+        direccion === "realizado" ? "Documentos por Cobrar" : ""
+      ),
+      cuenta_intereses_codigo: asTrim(
+        req.body?.cuenta_intereses_codigo ?? req.body?.cuentaInteresesCodigo,
+        direccion === "realizado" ? "4101" : ""
+      ),
+      cuenta_intereses_nombre: asTrim(
+        req.body?.cuenta_intereses_nombre ?? req.body?.cuentaInteresesNombre,
+        direccion === "realizado" ? "Productos Financieros" : ""
+      ),
       cuenta_bancos_codigo: asTrim(req.body?.cuenta_bancos_codigo ?? req.body?.cuentaBancosCodigo, ""),
       cuenta_bancos_nombre: asTrim(req.body?.cuenta_bancos_nombre ?? req.body?.cuentaBancosNombre, ""),
 
@@ -1514,6 +1639,7 @@ router.post("/", ensureAuth, async (req, res) => {
           monto_capital: montoDispuestoInicial,
           moneda: payload.moneda,
           tipo_cambio: payload.tipo_cambio,
+          metodo_pago: req.body?.metodo_pago ?? req.body?.metodoPago ?? "",
           referencia: payload.referencia || "",
           descripcion: asTrim(req.body?.descripcion_apertura || "Apertura del financiamiento"),
           notas: asTrim(req.body?.notas_apertura || req.body?.notas || "", ""),
