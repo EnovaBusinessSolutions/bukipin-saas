@@ -412,11 +412,19 @@ async function buildInventoryMetricsMap({ owner, productIds }) {
     const entradas = Number(r.entradasQty || 0);
     const salidas = Number(r.salidasQty || 0);
     const ajustes = Number(r.ajustesQty || 0);
+    const costoQty = Number(r.costQty || 0);
+    const costoSum = Number(r.costSum || 0);
+    const stockCalculado = entradas - salidas + ajustes;
+    const costoPromedioMovimientos = costoQty > 0 ? costoSum / costoQty : 0;
+    const valorTotalMovimientos = stockCalculado * costoPromedioMovimientos;
 
     map.set(String(r._id), {
       cantidad_comprada: entradas,
       cantidad_vendida: salidas,
       ajustes_qty: ajustes,
+      cantidad_stock_calculada: stockCalculado,
+      costo_unitario_movimientos: Number(costoPromedioMovimientos.toFixed(6)),
+      valor_total_movimientos: Number(valorTotalMovimientos.toFixed(2)),
       ultimo_movimiento: r.lastDate ? new Date(r.lastDate).toISOString() : null,
     });
   }
@@ -507,20 +515,41 @@ router.get("/", ensureAuth, async (req, res) => {
         cantidad_comprada: 0,
         cantidad_vendida: 0,
         ajustes_qty: 0,
+        cantidad_stock_calculada: 0,
+        costo_unitario_movimientos: 0,
+        valor_total_movimientos: 0,
         ultimo_movimiento: null,
       };
 
-      const cantidad_stock = numOrNull(base.stockActual) ?? numOrNull(base.stock_actual) ?? numOrNull(base.stock) ?? 0;
-      const costo_unitario =
+      const cantidadStockBase =
+        numOrNull(base.stockActual) ?? numOrNull(base.stock_actual) ?? numOrNull(base.stock) ?? 0;
+      const costoUnitarioBase =
         numOrNull(base.costoPromedio) ??
         numOrNull(base.costo_promedio) ??
         numOrNull(base.costoPromedioPonderado) ??
         0;
-      const valor_total_inventario =
+      const valorTotalBase =
         numOrNull(base.valorInventarioActual) ??
         numOrNull(base.valor_inventario_actual) ??
         numOrNull(base.inventoryValueRunning) ??
-        Number((cantidad_stock * costo_unitario).toFixed(2));
+        0;
+
+      const cantidad_stock =
+        cantidadStockBase === 0 && Number(m.cantidad_stock_calculada || 0) !== 0
+          ? Number(m.cantidad_stock_calculada || 0)
+          : cantidadStockBase;
+
+      const costo_unitario =
+        costoUnitarioBase <= 0 && Number(m.costo_unitario_movimientos || 0) > 0
+          ? Number(m.costo_unitario_movimientos || 0)
+          : costoUnitarioBase;
+
+      const valor_total_inventario =
+        valorTotalBase > 0
+          ? valorTotalBase
+          : Number(m.valor_total_movimientos || 0) > 0 || cantidad_stock !== 0
+          ? Number((cantidad_stock * costo_unitario).toFixed(2))
+          : 0;
 
       return {
         ...base,
@@ -534,6 +563,9 @@ router.get("/", ensureAuth, async (req, res) => {
         cantidad_comprada: m.cantidad_comprada,
         cantidad_vendida: m.cantidad_vendida,
         ajustes_qty: m.ajustes_qty,
+        cantidad_stock_calculada: m.cantidad_stock_calculada,
+        costo_unitario_movimientos: m.costo_unitario_movimientos,
+        valor_total_movimientos: m.valor_total_movimientos,
         ultimo_movimiento: m.ultimo_movimiento,
       };
     });
