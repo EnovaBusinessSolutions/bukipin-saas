@@ -89,6 +89,8 @@ app.use("/api/cxp", require("./routes/cxp"));
 
 app.use("/api/inversiones", require("./routes/inversiones"));
 
+app.use("/api/depreciaciones", require("./routes/depreciaciones"));
+
 app.use("/api", require("./routes/placeholders"));
 
 app.use("/api", (req, res) => {
@@ -122,4 +124,8 @@ app.get("/dashboard*", (req, res) => {
 // Catch-all (no API)
 app.use((req, res) => res.status(404).send("Ruta no encontrada"));
 
-app.listen(PORT, () => console.log(`🚀 Bukipin backend escuchando en puerto ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`🚀 Bukipin backend escuchando en puerto ${PORT}`);
+  const { initCronJobs } = require("./utils/cronJobs");
+  initCronJobs();
+});

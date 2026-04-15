@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git *)",
+      "Bash(npm install *)",
+      "Bash(node -e \"require\\('node-cron'\\); console.log\\('ok'\\)\")"
+    ]
+  }
+}
