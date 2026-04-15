@@ -4,6 +4,7 @@ const router = express.Router();
 
 const ensureAuth = require("../middleware/ensureAuth");
 const JournalEntry = require("../models/JournalEntry");
+const Account = require("../models/Account");
 
 const {
   TZ_OFFSET_MINUTES,
@@ -267,6 +268,50 @@ function flattenDetalles(entries, { cuentaPrefix, cuentaCodigo } = {}) {
   }
 
   return out;
+}
+
+function inferEstadoFinanciero(codigo) {
+  const d = String(codigo || "").charAt(0);
+  if (["1", "2", "3"].includes(d)) return "Balance General";
+  if (["4", "5", "6"].includes(d)) return "Estado de Resultados";
+  return null;
+}
+
+function inferGrupoCodigo(codigo) {
+  const d = String(codigo || "").charAt(0);
+  if (d === "1") return "Activos";
+  if (d === "2") return "Pasivos";
+  if (d === "3") return "Capital Contable";
+  if (d === "4") return "Ingresos";
+  if (d === "5" || d === "6") return "Egresos";
+  return "General";
+}
+
+function inferSubgrupoCodigo(codigo, grupo) {
+  const c = String(codigo || "");
+  if (grupo === "Activos") {
+    if (c.startsWith("10") || c.startsWith("11")) return "Activo Circulante";
+    if (c.startsWith("12")) return "Activo No Circulante";
+    if (c.startsWith("13")) return "Activo Diferido";
+  }
+  if (grupo === "Pasivos") {
+    if (c.startsWith("20")) return "Pasivo Circulante";
+    if (c.startsWith("21")) return "Pasivo No Circulante";
+  }
+  if (grupo === "Capital Contable") {
+    if (c.startsWith("30")) return "Capital Contribuido";
+    if (c.startsWith("31")) return "Capital Ganado";
+    if (c.startsWith("32")) return "Capital Reembolsado";
+  }
+  if (grupo === "Ingresos") return c.startsWith("41") ? "Otros Ingresos" : "Ingresos por Ventas";
+  if (grupo === "Egresos") {
+    if (c.startsWith("50")) return "Costo de Ventas";
+    if (["5109", "5110"].includes(c) || c.startsWith("53")) return "Depreciaciones y Amortizaciones";
+    if (c === "5201" || c.startsWith("54")) return "Gastos Financieros";
+    if (c === "5204" || c.startsWith("55")) return "Otros Gastos";
+    return "Gastos de Operación";
+  }
+  return "General";
 }
 
 // Naturaleza contable para saldos
@@ -568,6 +613,43 @@ async function handleGetAsientos(req, res) {
       saldoInicialTotal += saldo_inicial;
       saldoFinalTotal += saldo_final;
     }
+
+    // ─── Enriquecer saldosPorCuenta con clasificación y nombres ───
+    try {
+      const todosLosCodigos = Object.keys(saldosPorCuenta);
+      if (todosLosCodigos.length > 0) {
+        // Paso 1: clasificación por prefijo (cubre todas las cuentas sin DB lookup)
+        for (const codigo of todosLosCodigos) {
+          const entry = saldosPorCuenta[codigo];
+          if (!entry.estado_financiero) {
+            const grupo = inferGrupoCodigo(codigo);
+            entry.estado_financiero = inferEstadoFinanciero(codigo);
+            entry.grupo = grupo;
+            entry.subgrupo = inferSubgrupoCodigo(codigo, grupo);
+          }
+        }
+
+        // Paso 2: enriquecer nombre desde Account collection (solo si hay doc)
+        const accountDocs = await Account.find({
+          owner,
+          code: { $in: todosLosCodigos },
+        })
+          .select("code name")
+          .lean();
+
+        for (const doc of accountDocs) {
+          const code = String(doc.code || "").trim();
+          if (!code || !saldosPorCuenta[code]) continue;
+          if (doc.name) {
+            saldosPorCuenta[code].cuenta_nombre = String(doc.name).trim();
+          }
+        }
+      }
+    } catch (enrichErr) {
+      // Non-fatal: la balanza igual funciona con nombres vacíos
+      console.warn("⚠️ saldosPorCuenta enrichment error:", enrichErr?.message);
+    }
+    // ─── Fin enriquecimiento ───
 
     return res.json({
       ok: true,
