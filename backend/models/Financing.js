@@ -128,6 +128,12 @@ const financingSchema = new Schema(
       trim: true,
       default: "",
     },
+    deudor_id: {
+      type: Schema.Types.ObjectId,
+      ref: "LoanDebtor",
+      default: null,
+      index: true,
+    },
     deudor_nombre: {
       type: String,
       trim: true,

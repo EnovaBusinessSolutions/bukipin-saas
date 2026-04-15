@@ -5,6 +5,7 @@ const ensureAuth = require("../middleware/ensureAuth");
 
 const Financing = require("../models/Financing");
 const FinancingMovement = require("../models/FinancingMovement");
+const LoanDebtor = require("../models/LoanDebtor");
 
 let JournalEntry = null;
 try {
@@ -595,6 +596,8 @@ function mapFinancingForUI(doc) {
     numero_cuenta: d.numero_cuenta || "",
     numeroCuenta: d.numero_cuenta || "",
     referencia: d.referencia || "",
+    deudor_id: d.deudor_id ? String(d.deudor_id) : "",
+    deudorId: d.deudor_id ? String(d.deudor_id) : "",
     deudor_nombre: d.deudor_nombre || "",
     deudorNombre: d.deudor_nombre || "",
     deudor_rfc: d.deudor_rfc || "",
@@ -1448,6 +1451,8 @@ router.get("/", ensureAuth, async (req, res) => {
         { nombre: { $regex: q, $options: "i" } },
         { alias: { $regex: q, $options: "i" } },
         { institucion: { $regex: q, $options: "i" } },
+        { deudor_nombre: { $regex: q, $options: "i" } },
+        { deudor_rfc: { $regex: q, $options: "i" } },
         { numero_contrato: { $regex: q, $options: "i" } },
         { numero_cuenta: { $regex: q, $options: "i" } },
         { referencia: { $regex: q, $options: "i" } },
@@ -1521,6 +1526,39 @@ router.post("/", ensureAuth, async (req, res) => {
             toNum(req.body?.monto_dispuesto_inicial ?? req.body?.montoDispuestoInicial, 0)
           );
 
+    const debtorId = asTrim(req.body?.deudor_id ?? req.body?.deudorId, "");
+    let debtorDoc = null;
+    if (direccion === "realizado" && debtorId) {
+      if (!isValidObjectId(debtorId)) {
+        return res.status(400).json({ ok: false, error: "VALIDATION", message: "deudor_id inválido." });
+      }
+      debtorDoc = await LoanDebtor.findOne({ _id: debtorId, owner }).lean();
+      if (!debtorDoc) {
+        return res.status(404).json({ ok: false, error: "NOT_FOUND", message: "Deudor no encontrado." });
+      }
+    }
+
+    const debtorNombre = asTrim(
+      req.body?.deudor_nombre ?? req.body?.deudorNombre,
+      debtorDoc?.nombre || ""
+    );
+    const debtorRfc = asTrim(
+      req.body?.deudor_rfc ?? req.body?.deudorRfc,
+      debtorDoc?.rfc || ""
+    ).toUpperCase();
+    const debtorTipo = asTrim(
+      req.body?.deudor_tipo ?? req.body?.deudorTipo,
+      debtorDoc?.tipo || ""
+    );
+    const debtorContacto = asTrim(
+      req.body?.deudor_contacto ?? req.body?.deudorContacto,
+      debtorDoc?.contacto || ""
+    );
+
+    if (direccion === "realizado" && !debtorNombre) {
+      return res.status(400).json({ ok: false, error: "VALIDATION", message: "El deudor es requerido." });
+    }
+
     const payload = {
       owner,
       nombre,
@@ -1541,10 +1579,11 @@ router.post("/", ensureAuth, async (req, res) => {
       numero_contrato: asTrim(req.body?.numero_contrato ?? req.body?.numeroContrato, ""),
       numero_cuenta: asTrim(req.body?.numero_cuenta ?? req.body?.numeroCuenta, ""),
       referencia: asTrim(req.body?.referencia, ""),
-      deudor_nombre: asTrim(req.body?.deudor_nombre ?? req.body?.deudorNombre, ""),
-      deudor_rfc: asTrim(req.body?.deudor_rfc ?? req.body?.deudorRfc, "").toUpperCase(),
-      deudor_tipo: asTrim(req.body?.deudor_tipo ?? req.body?.deudorTipo, ""),
-      deudor_contacto: asTrim(req.body?.deudor_contacto ?? req.body?.deudorContacto, ""),
+      deudor_id: debtorDoc?._id || asObjectIdOrNull(debtorId),
+      deudor_nombre: debtorNombre,
+      deudor_rfc: debtorRfc,
+      deudor_tipo: debtorTipo,
+      deudor_contacto: debtorContacto,
 
       moneda: asTrim(req.body?.moneda, "MXN").toUpperCase() || "MXN",
       tipo_cambio: Math.max(0, toNum(req.body?.tipo_cambio ?? req.body?.tipoCambio, 1)) || 1,
