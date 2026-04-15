@@ -124,8 +124,9 @@ app.get("/dashboard*", (req, res) => {
 // Catch-all (no API)
 app.use((req, res) => res.status(404).send("Ruta no encontrada"));
 
+const { initCronJobs } = require("./utils/cronJobs");
+
 app.listen(PORT, () => {
   console.log(`🚀 Bukipin backend escuchando en puerto ${PORT}`);
-  const { initCronJobs } = require("./utils/cronJobs");
   initCronJobs();
 });
