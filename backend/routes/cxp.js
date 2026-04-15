@@ -13,6 +13,17 @@ try {
   JournalEntry = null;
 }
 
+// Cargar CapexModel dinámicamente (igual que inversiones.js)
+let CapexModel = null;
+const tryModelsCapex = ["Capex", "CAPEX", "Investment", "Inversion", "InversionCapex", "CapexTransaction"];
+for (const modelName of tryModelsCapex) {
+  try {
+    // eslint-disable-next-line global-require, import/no-dynamic-require
+    CapexModel = require(`../models/${modelName}`);
+    if (CapexModel) break;
+  } catch (_) { /* modelo no existe, continuar */ }
+}
+
 const {
   TZ_OFFSET_MINUTES,
   num: dtNum,
@@ -386,8 +397,12 @@ router.post("/pagos", ensureAuth, async (req, res) => {
     if (!mongoose.Types.ObjectId.isValid(facturaId)) {
       return res.status(400).json({ ok: false, error: "VALIDATION", message: "facturaId inválido" });
     }
-    if (source !== "egreso") {
-      return res.status(400).json({ ok: false, error: "NOT_SUPPORTED", message: "Solo soporta source=egreso por ahora." });
+    if (source !== "egreso" && source !== "capex") {
+      return res.status(400).json({
+        ok: false,
+        error: "NOT_SUPPORTED",
+        message: "source debe ser 'egreso' o 'capex'",
+      });
     }
     if (!(monto > 0)) {
       return res.status(400).json({ ok: false, error: "VALIDATION", message: "monto debe ser > 0" });
@@ -398,6 +413,118 @@ router.post("/pagos", ensureAuth, async (req, res) => {
       return res.status(400).json({ ok: false, error: "VALIDATION", message: "metodo es requerido" });
     }
 
+    const PROVEEDORES_2001 = process.env.CTA_CXP || "2001";
+    const OTROS_ACREEDORES_2003 = process.env.CTA_OTROS_ACREEDORES || "2003";
+    const creditInfo = resolveCreditAccountByMetodoPago(metodoPago);
+
+    // ─────────────────────────────────────────────────────────
+    // FLUJO CAPEX (inversiones a crédito)
+    // ─────────────────────────────────────────────────────────
+    if (source === "capex") {
+      if (!CapexModel) {
+        return res.status(500).json({
+          ok: false,
+          error: "MISSING_MODEL",
+          message: "Modelo CAPEX no disponible",
+        });
+      }
+
+      const capex = await CapexModel.findOne({
+        _id: new mongoose.Types.ObjectId(facturaId),
+        $or: [{ owner }, { user: owner }, { userId: owner }],
+      });
+
+      if (!capex) {
+        return res.status(404).json({ ok: false, error: "NOT_FOUND", message: "Inversión no encontrada" });
+      }
+
+      const estadoCapex = String(capex.estado ?? capex.status ?? "activo").toLowerCase();
+      if (["cancelado", "cancelada"].includes(estadoCapex)) {
+        return res.status(400).json({ ok: false, error: "VALIDATION", message: "No se puede pagar una inversión cancelada" });
+      }
+
+      const pendienteActual = toNum(capex.monto_pendiente ?? capex.montoPendiente, 0);
+      if (!(pendienteActual > 0)) {
+        return res.status(400).json({ ok: false, error: "VALIDATION", message: "Esta inversión ya no tiene saldo pendiente" });
+      }
+      if (monto > pendienteActual + 0.01) {
+        return res.status(400).json({ ok: false, error: "VALIDATION", message: "El monto no puede ser mayor al saldo pendiente" });
+      }
+
+      const nombreInversion = String(capex.producto_nombre ?? capex.nombre ?? capex.descripcion ?? "Inversión").trim();
+      const conceptText = `Pago CxP CAPEX: ${nombreInversion} (${metodoPago})`;
+
+      // Asiento: Debit 2001 (cancela pasivo), Credit 1001/1002 (salida de efectivo)
+      const lines = [
+        {
+          accountCodigo: PROVEEDORES_2001,
+          debit: monto,
+          credit: 0,
+          memo: `Liquidación pasivo proveedor - ${nombreInversion}`,
+        },
+        {
+          accountCodigo: String(creditInfo.cuentaCodigo),
+          debit: 0,
+          credit: monto,
+          memo: `Salida por ${creditInfo.tipo} - ${nombreInversion}`,
+        },
+      ];
+
+      const asiento = await JournalEntry.create({
+        owner,
+        date: fechaPago,
+        concept: conceptText,
+        source: "pago_cxp_capex",
+        sourceId: capex._id,
+        transaccionId: capex._id,
+        source_id: capex._id,
+        lines,
+        references: [
+          {
+            source: "capex",
+            id: String(capex._id),
+            numero: String(capex.journalEntryId || ""),
+          },
+        ],
+      });
+
+      // Actualizar CAPEX: monto_pagado y monto_pendiente
+      const nuevoPagado = toNum(capex.monto_pagado ?? capex.montoPagado, 0) + monto;
+      const nuevoTotal = toNum(capex.valor_total ?? capex.monto_total ?? capex.montoTotal, 0);
+      const nuevoPendiente = Math.max(0, nuevoTotal - nuevoPagado);
+
+      await CapexModel.updateOne(
+        { _id: capex._id },
+        {
+          $set: {
+            monto_pagado: nuevoPagado,
+            montoPagado: nuevoPagado,
+            monto_pendiente: nuevoPendiente,
+            montoPendiente: nuevoPendiente,
+            ...(nuevoPendiente <= 0
+              ? { tipo_pago: "contado", tipoPago: "contado", metodo_pago: metodoPago, metodoPago }
+              : { tipo_pago: "parcial", tipoPago: "parcial", metodo_pago: metodoPago, metodoPago }),
+          },
+        }
+      );
+
+      return res.json({
+        ok: true,
+        pago_id: String(asiento._id),
+        asiento_id: String(asiento._id),
+        factura_id: String(capex._id),
+        data: { ok: true },
+        meta: {
+          monto_pagado: nuevoPagado,
+          monto_pendiente: nuevoPendiente,
+          timezoneOffsetMinutes: TZ_OFFSET_MINUTES,
+        },
+      });
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // FLUJO EGRESO (comportamiento original, sin cambios)
+    // ─────────────────────────────────────────────────────────
     const tx = await ExpenseTransaction.findOne({ owner, _id: new mongoose.Types.ObjectId(facturaId) });
     if (!tx) return res.status(404).json({ ok: false, error: "NOT_FOUND", message: "Factura (egreso) no encontrada" });
 
@@ -413,11 +540,7 @@ router.post("/pagos", ensureAuth, async (req, res) => {
       return res.status(400).json({ ok: false, error: "VALIDATION", message: "El monto no puede ser mayor al saldo pendiente" });
     }
 
-    const PROVEEDORES_2001 = process.env.CTA_CXP || "2001";
-    const OTROS_ACREEDORES_2003 = process.env.CTA_OTROS_ACREEDORES || "2003";
     const cuentaPendiente = isOtrosGastosFromTx(tx) ? OTROS_ACREEDORES_2003 : PROVEEDORES_2001;
-
-    const creditInfo = resolveCreditAccountByMetodoPago(metodoPago);
     const conceptText = `Pago CxP: ${tx.descripcion || "Egreso"} (${metodoPago})`;
 
     const lines = [
@@ -444,13 +567,7 @@ router.post("/pagos", ensureAuth, async (req, res) => {
       transaccionId: tx._id,
       source_id: tx._id,
       lines,
-      references: [
-        {
-          source: "egreso",
-          id: String(tx._id),
-          numero: String(tx.numeroAsiento || ""),
-        },
-      ],
+      references: [{ source: "egreso", id: String(tx._id), numero: String(tx.numeroAsiento || "") }],
     });
 
     const nuevoPagado = toNum(tx.montoPagado, 0) + monto;
