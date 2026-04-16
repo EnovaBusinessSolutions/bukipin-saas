@@ -49,6 +49,7 @@ const productSchema = new mongoose.Schema(
     inventoryValueRunning: { type: Number, default: 0 },
 
     activo: { type: Boolean, default: true },
+    imagen_url: { type: String, trim: true, default: "" },
   },
   { timestamps: true }
 );

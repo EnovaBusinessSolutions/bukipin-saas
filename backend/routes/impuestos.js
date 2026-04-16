@@ -654,6 +654,43 @@ router.delete("/autoridades-fiscales/:id", ensureAuth, async (req, res) => {
  * =========================================
  */
 
+// GET /api/impuestos/isr/pendientes
+// Devuelve TaxISRRecords con saldo pendiente > 0 (para CXP)
+router.get("/isr/pendientes", ensureAuth, async (req, res) => {
+  try {
+    const owner = req.user._id;
+    const registros = await TaxISRRecord.find({
+      owner,
+      saldoPendiente: { $gt: 0 },
+      estado: { $ne: "pagado" },
+    })
+      .sort({ ano: -1, mes: -1, createdAt: -1 })
+      .lean();
+
+    const MESES = ["Ene","Feb","Mar","Abr","May","Jun","Jul","Ago","Sep","Oct","Nov","Dic"];
+
+    const data = registros.map((r) => ({
+      id: String(r._id),
+      descripcion: `ISR ${MESES[(r.mes || 1) - 1]} ${r.ano || ""}`.trim(),
+      autoridad_nombre: r.autoridadNombreSnapshot || "Autoridad Fiscal",
+      monto_total: toNum(r.isrRealTotal, 0),
+      monto_pagado: toNum(r.montoPagado, 0),
+      monto_pendiente: toNum(r.saldoPendiente, 0),
+      saldo_pendiente: toNum(r.saldoPendiente, 0),
+      fecha_vencimiento: toYMD(r.fechaVencimiento),
+      tipo_pago: r.tipoPago || "",
+      estado: r.estado || "pendiente",
+      mes: r.mes,
+      ano: r.ano,
+    }));
+
+    return res.json({ ok: true, data });
+  } catch (err) {
+    console.error("GET /api/impuestos/isr/pendientes error:", err);
+    return res.status(500).json({ ok: false, message: "Error al obtener impuestos pendientes" });
+  }
+});
+
 router.get("/isr/registros", ensureAuth, async (req, res) => {
   try {
     const owner = req.user._id;

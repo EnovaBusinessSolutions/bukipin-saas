@@ -42,6 +42,7 @@ app.use("/api/auth", require("./routes/auth"));
 
 
 app.use("/api/uploads/autoridades-fiscales", require("./routes/uploadsAutoridadesFiscales"));
+app.use("/api/uploads", require("./routes/uploadsGeneral"));
 
 app.use("/api/transacciones/egresos", require("./routes/transaccionesEgresos"));
 

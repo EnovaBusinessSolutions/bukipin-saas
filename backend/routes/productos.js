@@ -169,6 +169,7 @@ function normalizeOut(doc) {
     valor_inventario_actual: valorInventarioActual,
     inventoryValueRunning: valorInventarioActual,
 
+    imagen_url: doc?.imagen_url || "",
     cuentaCodigo: doc.cuentaCodigo ?? doc.accountCode ?? null,
     subcuentaId: doc.subcuentaId ? String(doc.subcuentaId) : null,
     activo:
@@ -631,6 +632,7 @@ router.post("/", ensureAuth, async (req, res) => {
     // ✅ nuevos campos inventario
     const precioVenta = readPrecioVenta(req.body);
     const costoCompra = readCostoCompra(req.body);
+    const imagen_url = s(String(req.body?.imagen_url ?? req.body?.imagenUrl ?? ""));
 
     if (!nombre) return res.status(400).json({ ok: false, message: "El nombre es requerido." });
     if (precio === null) return res.status(400).json({ ok: false, message: "Precio inválido." });
@@ -647,6 +649,7 @@ router.post("/", ensureAuth, async (req, res) => {
       cuentaCodigo,
       subcuentaId,
       activo,
+      imagen_url: imagen_url || "",
     };
 
     // Si vienen inventario fields, los guardamos
@@ -716,6 +719,12 @@ router.put("/:id", ensureAuth, async (req, res) => {
     if (typeof incomingCostoCompra !== "undefined") {
       patch.costoCompra = incomingCostoCompra;
       patch.costo_compra = incomingCostoCompra;
+    }
+
+    if (typeof req.body?.imagen_url !== "undefined") {
+      patch.imagen_url = s(String(req.body.imagen_url ?? ""));
+    } else if (typeof req.body?.imagenUrl !== "undefined") {
+      patch.imagen_url = s(String(req.body.imagenUrl ?? ""));
     }
 
     if (typeof patch.nombre !== "undefined") patch.nombre = String(patch.nombre).trim();

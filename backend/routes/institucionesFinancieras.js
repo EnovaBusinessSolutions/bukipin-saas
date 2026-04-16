@@ -134,6 +134,12 @@ function getFinancialInstitutionModel() {
         default: "",
       },
 
+      logo_url: {
+        type: String,
+        trim: true,
+        default: "",
+      },
+
       activo: {
         type: Boolean,
         default: true,
@@ -241,6 +247,7 @@ function mapInstitutionForUI(doc) {
     contactoPuesto: d.contacto_puesto || "",
 
     notas: d.notas || "",
+    logo_url: d.logo_url || "",
 
     activo: !!d.activo,
     scope: d.scope || "user",
@@ -279,6 +286,7 @@ function mapSystemInstitutionForUI(item) {
     contactoPuesto: "",
 
     notas: "",
+    logo_url: "",
 
     activo: true,
     scope: "system",
@@ -513,6 +521,7 @@ router.post("/", ensureAuth, async (req, res) => {
     const contacto_puesto = asTrim(req.body?.contacto_puesto || req.body?.contactoPuesto, "");
     const notas = asTrim(req.body?.notas, "");
     const activo = asBool(req.body?.activo, true);
+    const logo_url = asTrim(req.body?.logo_url || req.body?.logoUrl, "");
 
     if (!nombre) {
       return res.status(400).json({
@@ -538,6 +547,7 @@ router.post("/", ensureAuth, async (req, res) => {
       contacto_nombre,
       contacto_puesto,
       notas,
+      logo_url,
       activo: activo !== null ? activo : true,
     });
 
@@ -602,6 +612,9 @@ router.patch("/:id", ensureAuth, async (req, res) => {
       patch.contacto_puesto = asTrim(req.body?.contacto_puesto || req.body?.contactoPuesto, "");
     }
     if (req.body?.notas !== undefined) patch.notas = asTrim(req.body?.notas, "");
+    if (req.body?.logo_url !== undefined || req.body?.logoUrl !== undefined) {
+      patch.logo_url = asTrim(req.body?.logo_url || req.body?.logoUrl, "");
+    }
     if (req.body?.activo !== undefined) patch.activo = asBool(req.body?.activo, true);
 
     const updated = await FinancialInstitution.findOneAndUpdate(

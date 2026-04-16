@@ -104,6 +104,16 @@ router.post("/", ensureAuth, async (req, res) => {
       });
     }
 
+    // Solo se permiten subcuentas en cuentas de tipo ingreso o gasto
+    const TIPOS_PERMITIDOS = ["ingreso", "gasto"];
+    const parentType = String(parent.type || "").toLowerCase().trim();
+    if (!TIPOS_PERMITIDOS.includes(parentType)) {
+      return res.status(400).json({
+        ok: false,
+        message: `Solo se permiten subcuentas en cuentas de tipo ingreso o gasto. La cuenta '${parentCode}' es de tipo '${parent.type || "desconocido"}'.`,
+      });
+    }
+
     // Si el frontend no manda code (caso real), lo generamos
     const code = incomingCode || (await generateNextSubaccountCode({ owner, parentCode }));
 

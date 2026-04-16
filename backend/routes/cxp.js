@@ -397,12 +397,8 @@ router.post("/pagos", ensureAuth, async (req, res) => {
     if (!mongoose.Types.ObjectId.isValid(facturaId)) {
       return res.status(400).json({ ok: false, error: "VALIDATION", message: "facturaId inválido" });
     }
-    if (source !== "egreso" && source !== "capex") {
-      return res.status(400).json({
-        ok: false,
-        error: "NOT_SUPPORTED",
-        message: "source debe ser 'egreso' o 'capex'",
-      });
+    if (source !== "egreso" && source !== "capex" && source !== "impuesto") {
+      return res.status(400).json({ ok: false, error: "NOT_SUPPORTED", message: "source no soportado." });
     }
     if (!(monto > 0)) {
       return res.status(400).json({ ok: false, error: "VALIDATION", message: "monto debe ser > 0" });
@@ -416,6 +412,79 @@ router.post("/pagos", ensureAuth, async (req, res) => {
     const PROVEEDORES_2001 = process.env.CTA_CXP || "2001";
     const OTROS_ACREEDORES_2003 = process.env.CTA_OTROS_ACREEDORES || "2003";
     const creditInfo = resolveCreditAccountByMetodoPago(metodoPago);
+
+    // ──────────────────────────────────────────────
+    // Flujo IMPUESTO (source === "impuesto")
+    // ──────────────────────────────────────────────
+    if (source === "impuesto") {
+      const TaxISRRecord = (() => {
+        try { return require("../models/TaxISRRecord"); } catch (_) { return null; }
+      })();
+      if (!TaxISRRecord) {
+        return res.status(500).json({ ok: false, message: "Modelo TaxISRRecord no disponible" });
+      }
+
+      const taxRecord = await TaxISRRecord.findOne({ _id: facturaId, owner });
+      if (!taxRecord) {
+        return res.status(404).json({ ok: false, message: "Registro de impuesto no encontrado" });
+      }
+      if (taxRecord.estado === "pagado") {
+        return res.status(400).json({ ok: false, message: "Este impuesto ya está pagado" });
+      }
+      const pendiente = toNum(taxRecord.saldoPendiente, 0);
+      if (pendiente <= 0) {
+        return res.status(400).json({ ok: false, message: "No hay saldo pendiente en este impuesto" });
+      }
+      if (monto > pendiente + 0.01) {
+        return res.status(400).json({ ok: false, message: `Monto excede el saldo pendiente ($${pendiente})` });
+      }
+
+      // Cuenta de pago según método
+      const paymentAccountCodigo = metodoPago === "efectivo" ? "1001" : "1002";
+
+      // Asiento contable: Débito 2005 (Impuestos por Pagar) / Crédito 1001 o 1002
+      const journalLines = [
+        {
+          accountCodigo: "2005",
+          debit: monto,
+          credit: 0,
+          memo: `Pago impuesto ${taxRecord.autoridadNombreSnapshot || ""} | ${metodoPago}`,
+        },
+        {
+          accountCodigo: paymentAccountCodigo,
+          debit: 0,
+          credit: monto,
+          memo: `Pago impuesto ${taxRecord.autoridadNombreSnapshot || ""} | ${metodoPago}`,
+        },
+      ];
+
+      const journalEntry = await JournalEntry.create({
+        owner,
+        date: new Date(),
+        source: "pago_cxp_impuesto",
+        description: `Pago ISR ${metodoPago} $${monto}`,
+        lines: journalLines,
+      });
+
+      // Actualizar TaxISRRecord
+      const nuevoPagado = toNum(taxRecord.montoPagado, 0) + monto;
+      const nuevoPendiente = Math.max(0, toNum(taxRecord.isrRealTotal, 0) - nuevoPagado);
+      taxRecord.montoPagado = nuevoPagado;
+      taxRecord.saldoPendiente = nuevoPendiente;
+      taxRecord.estado = nuevoPendiente <= 0 ? "pagado" : "parcial";
+      await taxRecord.save();
+
+      return res.json({
+        ok: true,
+        pago_id: String(journalEntry._id),
+        asiento_id: String(journalEntry._id),
+        meta: {
+          monto_pagado: nuevoPagado,
+          monto_pendiente: nuevoPendiente,
+        },
+      });
+    }
+    // ──────────────────────────────────────────────
 
     // ─────────────────────────────────────────────────────────
     // FLUJO CAPEX (inversiones a crédito)
