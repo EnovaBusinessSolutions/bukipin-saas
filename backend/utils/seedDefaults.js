@@ -50,6 +50,7 @@ const DEFAULT_ACCOUNTS = [
   { code: "1211", name: "Depreciación Acumulada Equipo Cómputo", type: "activo" },
   { code: "1212", name: "Otros Activos Fijos", type: "activo" },
   { code: "1213", name: "Depreciación Acumulada Otros Activos", type: "activo" },
+  { code: "1241", name: "Depósitos en Garantía Realizados", type: "activo" },
 
   // =======================
   // ACTIVO DIFERIDO
@@ -76,6 +77,7 @@ const DEFAULT_ACCOUNTS = [
   { code: "2101", name: "Préstamos Bancarios Largo Plazo", type: "pasivo" },
   { code: "2102", name: "Hipotecas por Pagar", type: "pasivo" },
   { code: "2103", name: "Documentos por Pagar Largo Plazo", type: "pasivo" },
+  { code: "2104", name: "Depósitos en Garantía Recibidos", type: "pasivo" },
 
   // =======================
   // CAPITAL CONTABLE

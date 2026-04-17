@@ -74,6 +74,7 @@ app.use("/api/flujo-efectivo", require("./routes/flujoEfectivo"));
 app.use("/api/dashboard", require("./routes/dashboard"));
 
 app.use("/api/financiamientos", require("./routes/financiamientos"));
+app.use("/api/depositos-garantia", require("./routes/depositosGarantia"));
 app.use("/api/deudores-financieros", require("./routes/deudoresFinancieros"));
 
 app.use("/api/instituciones-financieras", require("./routes/institucionesFinancieras"));
