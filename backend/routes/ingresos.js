@@ -1711,6 +1711,12 @@ if (rawFechaLimite && !fechaLimiteParsed) {
     if (descuento < 0) {
       return res.status(400).json({ ok: false, message: "montoDescuento no puede ser negativo." });
     }
+    if (descuento > 0 && descuento >= total) {
+      return res.status(400).json({
+        ok: false,
+        message: `El descuento ($${descuento}) no puede ser igual o mayor al total ($${total}). Si es una devolución total, cancela la transacción.`,
+      });
+    }
 
     if (!["efectivo", "bancos"].includes(metodoPago)) {
       return res.status(400).json({ ok: false, message: "metodoPago inválido (efectivo|bancos)." });
@@ -1741,7 +1747,7 @@ const fechaLimiteFinal = saldoPendiente > 0 ? fechaLimiteParsed : null;
 const COD_BANCOS = "1002";
 const COD_CXC = "1003"; // CxC Clientes
 const COD_DEUDORES = "1009"; // ✅ NUEVO: Deudores Diversos (solo para "Otros ingresos")
-const COD_DESCUENTOS = "4002";
+const COD_DESCUENTOS = "4003";
     const codCobro = metodoPago === "bancos" ? COD_BANCOS : COD_CAJA;
 
     const isOtrosIngreso =
